@@ -59,21 +59,7 @@ How the changes were verified: the fast keyframe path was compared against the l
 
 ### Usage notes
 
-These are real problems hit in practice, worth checking before and after import or export.
-
-Always tick `chk_uniform_scale` when exporting animations, so scale is written as one component per bone. Across all 2698 vanilla `.anim` files the initial scale vector length is 1 for every bone, and the number of files using a 3-component layout is zero. The 3-component form is the CK3 layout; if used by mistake the engine advances its read pointer by only a third per frame, shifting all scale values, which shows up as the model suddenly changing size late in the animation while the early part looks fine.
-
-Use unique bone names for new skeletons of your own. When editing vanilla models that contain duplicate bone names, make sure the duplicate-name matching is in effect; the giveaway is a `.001` suffix on imported bone names.
-
-Import the mesh first to create the armature, then import the animation. Bone names and order in the animation file must match the armature in the scene; doing it the other way around reports `Missing unique armature`.
-
-Animation length is not a source of trouble. The vanilla `base_star_idle.anim` runs 10002 frames, about 666 seconds, and 158 vanilla files exceed 900 frames.
-
-Overall movement belongs on a torso bone that carries skin weights, not on the object itself and not on the root bone alone. The engine's skinning ignores translation on the root bone, so movement added there leaves the mesh in place in game. The movement must also land in the per-frame translation sample stream of the `.anim`; changing only the initial translation in the info section, or writing it as a constant location keyframe in Blender, gets compressed on export into "this bone has no translation channel", which looks correct in Blender but has no effect in game.
-
-When an animation misbehaves in game, check the mapping chain in `error.log` first and suspect the animation data last. `.asset` files are replaced whole, so a same-named `.asset` in a mod knocks out every animation the vanilla file registered. The symptom is a twitching model that no longer triggers its abilities, which resembles a data problem but has a completely different cause. Look for `Failed to find animation` and for entries from `pdxmeshtype.cpp` and `pdx_entity.cpp` in `error.log`.
-
-Coordinate mapping: Blender's Z axis corresponds to the model's Y axis, since PDX is Y-up. The add-on swaps `(x, z, y)` internally, so to make something move upward in game the translation must be written on Blender's +Z; writing it on +Y sends it sideways.
+Uniform scale on export, bone naming, import order, writing translation, coordinate mapping, and the order to debug an animation that misbehaves in game are covered in [使用注意事项.md](使用注意事项.md) (Chinese).
 
 ### License and credits
 
