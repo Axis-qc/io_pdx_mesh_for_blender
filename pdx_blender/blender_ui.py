@@ -428,16 +428,27 @@ class IOPDX_OT_import_anim(Operator, ImportHelper):
         description="Start frame",
         default=1,
     )
+    chk_legacy_keys: BoolProperty(
+        name="Legacy keyframe method",
+        description="Write keyframes the slow way (frame by frame, forcing a scene update). "
+        "Only tick this if the default fast method gives a wrong result on this rig",
+        default=False,
+    )
     # fmt:on
 
     def draw(self, context):
         box = self.layout.box()
         box.label(text="Settings:", icon="IMPORT")
         box.prop(self, "int_start")
+        box.prop(self, "chk_legacy_keys")
 
     def execute(self, context):
         try:
-            import_animfile(self.filepath, frame_start=self.int_start)
+            import_animfile(
+                self.filepath,
+                frame_start=self.int_start,
+                keyframe_mode="legacy" if self.chk_legacy_keys else "fast",
+            )
             self.report({"INFO"}, "[io_pdx_mesh] Finsihed importing {}".format(self.filepath))
             IO_PDX_SETTINGS.last_import_anim = self.filepath
 
@@ -751,9 +762,12 @@ class IOPDX_PT_PDXblender_info(PDXUI, Panel):
             split = col1.split(factor=0.4, align=True)
             col1, col2 = split.column(align=True), split.column(align=True)
             btn_txt = "UPDATE - v{}".format(github.LATEST_VERSION)
-            col2.operator("wm.url_open", icon="OUTLINER_OB_LIGHT", text=btn_txt).url = str(
-                github.LATEST_URL.get("blender", github.LATEST_RELEASE)
-            )
+            # 修复Python 3.13兼容性：检查github.LATEST_URL类型
+            if hasattr(github, 'LATEST_URL') and isinstance(github.LATEST_URL, dict):
+                update_url = github.LATEST_URL.get("blender", github.LATEST_RELEASE)
+            else:
+                update_url = github.LATEST_RELEASE
+            col2.operator("wm.url_open", icon="OUTLINER_OB_LIGHT", text=btn_txt).url = str(update_url)
         col1.operator("wm.url_open", icon="FUND", text="Donate").url = str(IO_PDX_INFO["sponsor_url"])
         popup = col3.operator("io_pdx_mesh.popup_message", icon="INFO", text="")
         popup.msg_text = github.LATEST_NOTES

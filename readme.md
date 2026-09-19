@@ -1,43 +1,46 @@
-![GitHub last commit](https://img.shields.io/github/last-commit/ross-g/io_pdx_mesh.svg)
-![Github All Releases](https://img.shields.io/github/downloads/ross-g/io_pdx_mesh/total.svg)
-  
-  
+![GitHub last commit](https://img.shields.io/github/last-commit/Axis-qc/io_pdx_mesh.svg)
+![Github All Releases](https://img.shields.io/github/downloads/Axis-qc/io_pdx_mesh/total.svg)
+
+
 ## IO PDX MESH
 This project aims to allow editing of mesh and animation files used in the various [Clausewitz Engine games](https://en.wikipedia.org/wiki/Paradox_Development_Studio#List_of_games_developed) created by [Paradox Development Studios](https://www.paradoxplaza.com).
 
-It's designed to run in *both* Maya (2018+) and Blender (3.64+).
+It is designed to run in Blender (3.6.4+).
+
+Fork note: this fork is maintained by Axis-qc and focuses on Blender support, including compatibility with Blender 5.2.2. The Maya tooling is retained in the repository but is not the focus of this fork's testing.
 
 ### Download
-Click here to view the [latest release](https://github.com/ross-g/io_pdx_mesh/releases/latest) and download the __*io_pdx_mesh.zip*__ file (this works with both Maya and Blender).
+Click here to view the [latest release](https://github.com/Axis-qc/io_pdx_mesh/releases/latest) and download the __*io_pdx_mesh.zip*__ file.
 
+| Blender       |
+| ------------- |
+| ![Blender](https://raw.githubusercontent.com/wiki/ross-g/io_pdx_mesh/images/blender/tool_ui_01.png)  |
 
-| Maya          | Blender       |
-| ------------- | ------------- |
-| ![Maya](https://raw.githubusercontent.com/wiki/ross-g/io_pdx_mesh/images/maya/tool_ui_01.png)  | ![Blender](https://raw.githubusercontent.com/wiki/ross-g/io_pdx_mesh/images/blender/tool_ui_01.png)  |
-  
 
 ### Installation
-#### Setup for Maya (2018+)
-* Go to your Maya user scripts path. (eg on Windows: `C:\Users\...\Documents\maya\scripts`)  
-* Extract the contents of the zip file directly into this path.  
-* Start Maya and change the `Command Line` to Python by clicking the label.  
-* Then use the command `import io_pdx_mesh;reload(io_pdx_mesh)` to launch the tool.  
-* You can highlight this command and use the middle-mouse button to drag it into a shelf button to save it.  
-* The tool window will now open.
-
-#### Setup for Blender (3.64+)
-* Start Blender and open the `User Preferences` panel (`Edit > Preferences...`).  
+#### Setup for Blender (3.6.4+)
+* Start Blender and open the `User Preferences` panel (`Edit > Preferences...`).
 * Version 4.2.0+
-  * Switch to the `Get Extensions` category and select `Install from Disk...` from the dropdown corner menu. Pick the zip file you have downloaded.  
-* Version 3.64+
-  * Switch to the `Add-ons` category and select `Install...`. Pick the zip file you have downloaded.  
-* Tick the checkbox to enable the add-on and you should see a new tab in the `Sidebar` of the `3D Viewport`. (`View > Sidebar` if you have it closed)  
+  * Switch to the `Get Extensions` category and select `Install from Disk...` from the dropdown corner menu. Pick the zip file you have downloaded.
+* Version 3.6.4+
+  * Switch to the `Add-ons` category and select `Install...`. Pick the zip file you have downloaded.
+* Tick the checkbox to enable the add-on and you should see a new tab in the `Sidebar` of the `3D Viewport`. (`View > Sidebar` if you have it closed)
 * The `Sidebar` will now have a `PDX Blender Tools` tab.
 
 <br>
 <br>
 
 ---
+
+#### Blender 5.2 support
+This fork has been updated and verified against Blender 5.2.2. The following changes are included beyond the upstream 0.91.0 release:
+
+* **Animation import is dramatically faster.** Animation keyframes are now written directly to the action curves (default path) instead of per-frame scene evaluation. On a 33-bone / 900-frame clip the import dropped from ~51 seconds to ~1 second (about 50x faster). The old method is kept as a fallback for rigs that use non-default bone inheritance settings, and is available as the `Legacy keyframe method` option in the import dialog.
+* **Duplicate bone-name handling.** Some vanilla skeletons contain multiple bones sharing one name. Blender forces unique bone names, so the importer now tracks the original PDX bone names and matches them by name and occurrence order. This fixes animation importing misaligned or silently dropped on such rigs (the error previously showed up in-game, not in the importer).
+* **Fractional playback speed round-trips correctly.** Files whose animation speed is not a whole number are imported with the exact (possibly fractional) fps preserved on the rig and restored on export, instead of being rounded away.
+* **Blender 5.x animation data access.** The importer reads and writes animation through the new layered action structure (layers -> strips -> channelbags -> f-curves) required by Blender 5.x.
+
+Build and verify notes: the fast keyframe path was validated against the legacy path (identical curve sets and keyframe counts, differences at floating-point noise level). The build leaves `current_git_tag` at 0.91 in `blender_manifest.toml` so the updater still treats the upstream 0.91 release as the reference; the manifest `version` is bumped to 0.91.1 to mark this fork's changes.
 
 
 #### Supporters

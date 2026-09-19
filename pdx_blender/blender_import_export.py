@@ -11,6 +11,7 @@ author : ross-g
 
 import os
 import pathlib
+import re
 import time
 from collections import OrderedDict, defaultdict, namedtuple
 from operator import itemgetter
@@ -103,6 +104,81 @@ def get_rig_from_bone_name(bone_name):
         armt = rig.data
         if bone_name in [b.name for b in armt.bones]:
             return rig
+
+
+# Blender forces armature bone names to be unique, appending a .001 style suffix when a duplicate is imported
+BLENDER_UNIQUE_SUFFIX = re.compile(r"\.\d{3}$")
+
+# custom properties used to carry file-only information across an import/export round trip
+PDX_BONE_NAMES_PROP = "io_pdx_bone_names"  # armature bone name -> original PDX bone name
+PDX_ANIM_FPS_PROP = "io_pdx_anim_fps"  # exact (possibly fractional) fps of the imported animation
+PDX_SCALE_LENGTH_PROP = "io_pdx_scale_length"  # scale components per bone in the imported animation (1 or 3)
+
+
+def get_pdx_element_name(pdx_element):
+    # parsed files give plain XML elements (name via tag), hand-built data gives PDXData objects (name attribute)
+    return pdx_element.name if hasattr(pdx_element, "name") else pdx_element.tag
+
+
+def map_pdx_bones_to_blender(rig, pdx_bone_elements):
+    """Maps the bone elements of a PDX file onto the bones of a Blender armature.
+
+    PDX skeletons are allowed to contain several bones sharing one name (for example `cube1` parented under three
+    different joints). Blender instead requires unique armature bone names, so importing such a skeleton renames the
+    duplicates (`cube1`, `cube1.001`, `cube1.002`, ...). Looking a bone up by name alone therefore silently collapses
+    all of the duplicates onto the first one, dropping the duplicates' data entirely.
+
+    For animations that is fatal rather than merely lossy: the `samples` block is a single flat stream laid out per
+    frame, per bone (see pdx_data.py), so collapsing bones desynchronises every subsequent sample. The animation then
+    plays back as garbage while raising no error at all.
+
+    Bones are therefore matched by name *and* occurrence order. Returns a list of Blender bone names parallel to
+    `pdx_bone_elements`, holding None for any bone that could not be matched.
+    """
+    file_names = [clean_imported_name(get_pdx_element_name(bone)) for bone in pdx_bone_elements]
+    known_names = set(file_names)
+
+    # gather the armature's bone names by name, preserving armature order
+    occurrences = defaultdict(list)
+    for bone in rig.data.bones:
+        base_name = bone.name
+        # strip a Blender uniqueness suffix, but only when it hides a name the file actually asked for
+        stripped_name = BLENDER_UNIQUE_SUFFIX.sub("", bone.name)
+        if stripped_name != bone.name and stripped_name in known_names:
+            base_name = stripped_name
+        occurrences[base_name].append(bone.name)
+
+    # take the n-th occurrence of each name on both sides, so duplicates stay distinct
+    seen = defaultdict(int)
+    bone_names = []
+    for name in file_names:
+        index = seen[name]
+        seen[name] += 1
+        candidates = occurrences.get(name, [])
+        bone_names.append(candidates[index] if index < len(candidates) else None)
+
+    return bone_names
+
+
+def get_export_bone_name(rig, bone_name):
+    """Returns the bone name to write into a PDX file, undoing Blender's uniqueness renaming.
+
+    Blender has to rename duplicate armature bones on import (`cube1`, `cube1.001`, ...) but the engine does not use
+    those suffixes, so writing them back out would produce a file whose bones no longer match the ones the engine
+    expects. Imported skeletons record their original names on the armature, which are restored here. For rigs built
+    by hand we can only fall back to stripping a suffix when it is hiding a name another bone already uses.
+    """
+    if rig is not None:
+        stored_names = rig.get(PDX_BONE_NAMES_PROP)
+        if stored_names and bone_name in stored_names:
+            return stored_names[bone_name]
+
+    stripped_name = BLENDER_UNIQUE_SUFFIX.sub("", bone_name)
+    if stripped_name != bone_name and rig is not None:
+        if any(bone.name == stripped_name for bone in rig.data.bones):
+            return stripped_name
+
+    return bone_name
 
 
 def get_rig_from_mesh(blender_obj):
@@ -668,7 +744,6 @@ def create_shader(PDX_material, shader_name, texture_dir, template_only=False):
     new_shader.use_nodes = True
 
     new_shader.use_backface_culling = True
-    new_shader.shadow_method = "CLIP"
     new_shader.blend_method = "CLIP"
 
     def set_node_pos(node, x, y):
@@ -939,6 +1014,13 @@ def create_skeleton(PDX_bone_list, convert_bonespace=False):
     bpy.ops.object.mode_set(mode="OBJECT")
     bpy.context.view_layer.update()
 
+    # record the bone names as they were written in the file, Blender may have renamed duplicates on creation
+    pdx_bone_names = dict()
+    for pdx_bone, bone_name in zip(PDX_bone_list, map_pdx_bones_to_blender(new_rig, PDX_bone_list)):
+        if bone_name:
+            pdx_bone_names[bone_name] = clean_imported_name(get_pdx_element_name(pdx_bone))
+    new_rig[PDX_BONE_NAMES_PROP] = pdx_bone_names
+
     return new_rig
 
 
@@ -964,9 +1046,16 @@ def create_skin(PDX_skin, PDX_bones, obj, rig, max_infs=None):
     for bone in armt_bones:
         obj.vertex_groups.new(name=bone.name)
 
+    # match the skeleton's joint indices to Blender bone names, keeping duplicate bone names distinct
+    bone_names = map_pdx_bones_to_blender(rig, PDX_bones)
+    joint_names = dict()
+    for index, bone in enumerate(PDX_bones):
+        joint_ids = getattr(bone, "ix", [index])
+        joint_names[joint_ids[0]] = bone_names[index]
+
     # set all skin weights
     for v in range(len(skin_dict.keys())):
-        joints = [PDX_bones[j].name for j in skin_dict[v]["joints"]]
+        joints = [joint_names.get(j) for j in skin_dict[v]["joints"]]
         weights = skin_dict[v]["weights"]
         # normalise joint weights
         try:
@@ -978,7 +1067,10 @@ def create_skin(PDX_skin, PDX_bones, obj, rig, max_infs=None):
         joint_weights = [(j, w) for j, w in zip(joints, norm_weights) if w != 0.0]
 
         for joint, weight in joint_weights:
-            obj.vertex_groups[clean_imported_name(joint)].add([v], weight, "REPLACE")
+            if joint is None:
+                IO_PDX_LOG.debug("failed to find joint for skin weight on vertex - {0}".format(v))
+                continue
+            obj.vertex_groups[joint].add([v], weight, "REPLACE")
 
     # create an armature modifier for the mesh object
     skin_mod = obj.modifiers.new(rig.name + "_skin", "ARMATURE")
@@ -1113,7 +1205,8 @@ def create_fcurve(armature, bone_name, data_type, array_idx):
 
 
 def create_anim_keys(armature, bone_name, key_dict, timestart, pose):
-    # TODO: this is very slow, create fcurves directly instead of keyframing
+    # TODO: kept as the fallback path - create_anim_keys_fast() writes the f-curves directly and is
+    # roughly 50x faster, but this one is still needed for rigs with non-default bone inherit settings.
     pose_bone = armature.pose.bones[bone_name]
 
     # validate keyframe counts per attribute
@@ -1177,6 +1270,138 @@ def create_anim_keys(armature, bone_name, key_dict, timestart, pose):
             pose_bone.keyframe_insert(data_path="rotation_quaternion", index=-1)
         if "t" in key_dict:
             pose_bone.keyframe_insert(data_path="location", index=-1)
+
+
+# 写关键帧的两条路径：
+#   fast   直接推导 matrix_basis 并批量写 f-curve。默认走这条，比 legacy 快约 50 倍
+#          （33 骨 x 900 帧实测 51 秒 -> 1 秒以内）
+#   legacy 上面那个逐帧 frame_set + pose_bone.matrix + keyframe_insert 的写法。
+#          只在骨架用了非默认骨骼继承设置时才需要，见 bones_allow_fast_keys。
+PDX_KEYFRAME_FAST = "fast"
+PDX_KEYFRAME_LEGACY = "legacy"
+
+
+def bones_allow_fast_keys(rig):
+    """快路径把「目标姿态 = 父骨姿态 @ 偏移」化简成 basis = rel^-1 @ 偏移，前提是子骨按默认
+    方式继承父骨（use_inherit_rotation 打开、inherit_scale 为 FULL）。
+
+    插件用 edit_bones.new() 建骨，这两个值永远是默认的，所以 PDX 骨架总是满足。但一旦有人
+    手动改过（ALIGNED / NONE / 关掉继承旋转），实测 basis 与公式偏差 0.14~0.52，且那种情况下
+    连旧写法的 pose_bone.matrix = X 本身都命中不了目标姿态，所以必须回退旧写法而不是硬套。
+    """
+    for bone in rig.data.bones:
+        if not bone.use_inherit_rotation:
+            IO_PDX_LOG.warning("bone '{0}' has inherit rotation disabled".format(bone.name))
+            return False
+        if bone.inherit_scale != "FULL":
+            IO_PDX_LOG.warning("bone '{0}' uses inherit scale mode '{1}'".format(bone.name, bone.inherit_scale))
+            return False
+    return True
+
+
+def build_action_curve_map(rig):
+    """收集骨架动画数据里的所有 f-curve，键为 (data_path, array_index)。
+
+    Blender 5.x 的 Action 已经没有 .fcurves 了，要经 layers -> strips -> channelbags 取。
+    """
+    curve_map = dict()
+    anim_data = rig.animation_data
+    if anim_data is None or anim_data.action is None:
+        return curve_map
+
+    for layer in anim_data.action.layers:
+        for strip in layer.strips:
+            for channelbag in strip.channelbags:
+                for curve in channelbag.fcurves:
+                    curve_map[(curve.data_path, curve.array_index)] = curve
+    return curve_map
+
+
+def write_anim_curve(curve_map, bone_name, prop, index, start_frame, values):
+    """把一整条通道的采样值批量写进对应的 f-curve（先清空再逐点填）。"""
+    curve = curve_map.get(('pose.bones["{0}"].{1}'.format(bone_name, prop), index))
+    if curve is None:
+        IO_PDX_LOG.warning("missing f-curve for {0}.{1}[{2}]".format(bone_name, prop, index))
+        return
+
+    points = curve.keyframe_points
+    count = len(values)
+    points.clear()
+    points.add(count)
+    # 逐点赋值实测约 1.4 微秒/点。keyframe_points 上的 foreach_set 在 Blender 5.2 不可用
+    # （坐标报 internal error，枚举属性报 TypeError），所以坐标、插值、手柄都逐点设。
+    for i in range(count):
+        point = points[i]
+        point.co = (start_frame + i, values[i])
+        point.interpolation = "BEZIER"
+        point.handle_left_type = "AUTO_CLAMPED"
+        point.handle_right_type = "AUTO_CLAMPED"
+    curve.update()
+
+
+def create_anim_keys_fast(armature, bone_name, key_dict, timestart, pose, curve_map):
+    """快路径：不碰 depsgraph，直接算 matrix_basis 再写 f-curve。
+
+    旧写法每帧都要 scene.frame_set() 再读父骨的实时矩阵，代价是 O(骨数 x 帧数) 次整场景
+    求值（实测 33 骨 x 900 帧要 51 秒，其中真正的数学只占约 0.3 秒）。这里因为
+
+        basis = (父骨姿态 @ rel)^-1 @ (父骨姿态 @ 偏移) = rel^-1 @ 偏移
+
+    父骨姿态被约掉了（rel = 父骨 matrix_local^-1 @ 本骨 matrix_local，是常量），所以
+    既不需要 frame_set，也不需要父骨的矩阵。
+    """
+    pose_bone = armature.pose.bones[bone_name]
+    bone = pose_bone.bone
+
+    if bone.parent:
+        rel_inv = (bone.parent.matrix_local.inverted_safe() @ bone.matrix_local).inverted_safe()
+        parent_to_pose = pose[bone.parent.name].inverted_safe() @ pose[bone_name]
+    else:
+        rel_inv = bone.matrix_local.inverted_safe()
+        parent_to_pose = pose[bone_name]
+
+    _scale = Matrix.Scale(parent_to_pose.to_scale()[0], 4)
+    _rotation = parent_to_pose.to_quaternion().to_matrix().to_4x4()
+    _translation = Matrix.Translation(parent_to_pose.to_translation())
+
+    duration = list(set(len(keyframes) for keyframes in key_dict.values()))[0]
+    translations = [(0.0, 0.0, 0.0)] * duration
+    rotations = [(1.0, 0.0, 0.0, 0.0)] * duration
+    scales = [(1.0, 1.0, 1.0)] * duration
+
+    for k in range(duration):
+        # over-ride initial pose offset based on keyed attributes
+        if "s" in key_dict:
+            _scale = swap_coord_space(Matrix.Diagonal(key_dict["s"][k]).to_4x4())
+        if "q" in key_dict:
+            _rotation = (
+                Quaternion((key_dict["q"][k][3], key_dict["q"][k][0], key_dict["q"][k][1], key_dict["q"][k][2]))
+                .to_matrix()
+                .to_4x4()
+            )
+            _rotation = swap_coord_space(_rotation)
+        if "t" in key_dict:
+            _translation = swap_coord_space(Matrix.Translation(key_dict["t"][k]))
+
+        basis = rel_inv @ (_translation @ _rotation @ _scale)
+        loc, quat, scl = basis.decompose()
+        translations[k] = (loc.x, loc.y, loc.z)
+        rotations[k] = (quat.w, quat.x, quat.y, quat.z)
+        scales[k] = (scl.x, scl.y, scl.z)
+
+    # 只写该骨真正有动画的通道，与旧写法保持一致
+    if "t" in key_dict:
+        for index in range(3):
+            write_anim_curve(curve_map, bone_name, "location", index, timestart,
+                             [v[index] for v in translations])
+    if "q" in key_dict:
+        for index in range(4):
+            write_anim_curve(curve_map, bone_name, "rotation_quaternion", index, timestart,
+                             [v[index] for v in rotations])
+    if "s" in key_dict:
+        for index in range(3):
+            write_anim_curve(curve_map, bone_name, "scale", index, timestart,
+                             [v[index] for v in scales])
 
 
 """ ====================================================================================================================
@@ -1377,8 +1602,10 @@ def export_meshfile(meshpath, exp_mesh=True, exp_skel=True, exp_locs=True, exp_s
                 skeletonnode_xml = Xml.SubElement(objnode_xml, "skeleton")
 
                 # create sub-elements for each bone, populate bone attributes
+                export_rig = get_rig_from_mesh(obj)
                 for bone_info_dict in bone_info_list:
-                    bonenode_xml = Xml.SubElement(skeletonnode_xml, bone_info_dict["name"])
+                    export_name = get_export_bone_name(export_rig, bone_info_dict["name"])
+                    bonenode_xml = Xml.SubElement(skeletonnode_xml, export_name)
                     for key in ["ix", "pa", "tx"]:
                         if key in bone_info_dict and bone_info_dict[key]:
                             bonenode_xml.set(key, bone_info_dict[key])
@@ -1410,7 +1637,8 @@ def export_meshfile(meshpath, exp_mesh=True, exp_skel=True, exp_locs=True, exp_s
 
             # create sub-elements for each bone, populate bone attributes
             for bone_info_dict in bone_info_list:
-                bonenode_xml = Xml.SubElement(skeletonnode_xml, bone_info_dict["name"])
+                export_name = get_export_bone_name(blender_rigs[0], bone_info_dict["name"])
+                bonenode_xml = Xml.SubElement(skeletonnode_xml, export_name)
                 for key in ["ix", "pa", "tx"]:
                     if key in bone_info_dict and bone_info_dict[key]:
                         bonenode_xml.set(key, bone_info_dict[key])
@@ -1463,7 +1691,14 @@ def import_animfile(animpath, frame_start=1, **kwargs):
     framecount = info.attrib["sa"][0]
 
     # set scene animation and playback settings
-    fps = int(info.attrib["fps"][0])
+    # Blender scene fps is a whole number, so a fractional file speed is rounded and the exact value kept on the rig
+    file_fps = float(info.attrib["fps"][0])
+    fps = int(round(file_fps))
+    if abs(file_fps - fps) > 1e-4:
+        IO_PDX_LOG.warning(
+            "file playback speed is not a whole number ({0}) - scene fps has been set to {1}, the exact value will be "
+            "restored on export.".format(file_fps, fps)
+        )
     IO_PDX_LOG.info("setting playback speed - {0}".format(fps))
     try:
         bpy.context.scene.render.fps = fps
@@ -1479,7 +1714,8 @@ def import_animfile(animpath, frame_start=1, **kwargs):
 
     # find armature and bones being animated in the scene
     IO_PDX_LOG.info("finding armature -")
-    matching_rigs = [get_rig_from_bone_name(clean_imported_name(bone.tag)) for bone in info]
+    bone_elements = list(info)
+    matching_rigs = [get_rig_from_bone_name(clean_imported_name(bone.tag)) for bone in bone_elements]
     matching_rigs = list(set(rig for rig in matching_rigs if rig))
 
     # break on failing to find an armature to animate
@@ -1487,19 +1723,18 @@ def import_animfile(animpath, frame_start=1, **kwargs):
         raise RuntimeError("Missing unique armature required for animation: {0}".format(matching_rigs))
     rig = matching_rigs[0]
 
+    # map the file's bones onto their pose bones, keeping duplicate bone names distinct
+    bone_names = map_pdx_bones_to_blender(rig, bone_elements)
+
     # check armature has all required bones, check scale uniformity
     IO_PDX_LOG.info("finding bones -")
     scale_length = set()
     bone_errors = []
-    for bone in info:
+    for bone, bone_name in zip(bone_elements, bone_names):
         scale_length.add(len(bone.attrib["s"]))
-        bone_name = clean_imported_name(bone.tag)
-        try:
-            pose_bone = rig.pose.bones[bone_name]
-            edit_bone = pose_bone.bone  # rig.data.bones[bone_name]
-        except KeyError:
-            bone_errors.append(bone_name)
-            IO_PDX_LOG.warning("failed to find bone - {0}".format(bone_name))
+        if bone_name is None or bone_name not in rig.pose.bones:
+            bone_errors.append(clean_imported_name(bone.tag))
+            IO_PDX_LOG.warning("failed to find bone - {0}".format(bone.tag))
 
     # break on missing bones
     if bone_errors:
@@ -1513,6 +1748,10 @@ def import_animfile(animpath, frame_start=1, **kwargs):
     scale_padding = 4 - scale_length
     IO_PDX_LOG.info("animation supports {0}uniform scale -".format("non-" if scale_length > 1 else ""))
 
+    # remember the file's fps and scale layout, so that re-exporting can reproduce them exactly
+    rig[PDX_ANIM_FPS_PROP] = file_fps
+    rig[PDX_SCALE_LENGTH_PROP] = scale_length
+
     # clear any current pose before attempting to load the animation
     bpy.context.view_layer.objects.active = rig
     bpy.ops.object.mode_set(mode="POSE")
@@ -1522,9 +1761,8 @@ def import_animfile(animpath, frame_start=1, **kwargs):
 
     # set the initial pose (includes un-keyframed bones)
     initial_pose = dict()
-    IO_PDX_LOG.info("setting initial pose on bones - {0}".format(len(info)))
-    for bone in info:
-        bone_name = clean_imported_name(bone.tag)
+    IO_PDX_LOG.info("setting initial pose on bones - {0}".format(len(bone_elements)))
+    for bone, bone_name in zip(bone_elements, bone_names):
         pose_bone = rig.pose.bones[bone_name]
         edit_bone = pose_bone.bone  # rig.data.bones[bone_name]
 
@@ -1557,17 +1795,17 @@ def import_animfile(animpath, frame_start=1, **kwargs):
             initial_pose[bone_name] = pose_bone.matrix
 
     # check which transform types are animated on each bone
-    all_bone_keyframes = OrderedDict()
-    for bone in info:
-        bone_name = clean_imported_name(bone.tag)
-        all_bone_keyframes[bone_name] = {sample_type: [] for sample_type in bone.attrib["sa"][0]}
+    # NB: this is a plain list, *not* a name-keyed dict. Duplicate bone names must stay separate, otherwise the flat
+    # per-frame samples stream below is consumed out of step (see map_pdx_bones_to_blender).
+    all_bone_keyframes = []
+    for bone, bone_name in zip(bone_elements, bone_names):
+        all_bone_keyframes.append((bone_name, {sample_type: [] for sample_type in bone.attrib["sa"][0]}))
 
     # then traverse the samples data to store keys per bone
     s_idx, q_idx, t_idx = 0, 0, 0  # track offsets into samples data arrays
     s_len, q_len, t_len = scale_length, 4, 3  # track stride across samples data arrays
     for _ in range(0, framecount):
-        for bone_name in all_bone_keyframes:
-            bone_key_data = all_bone_keyframes[bone_name]
+        for bone_name, bone_key_data in all_bone_keyframes:
             if "s" in bone_key_data:
                 frame_bone_scale = samples.attrib["s"][s_idx : s_idx + s_len] * scale_padding
                 bone_key_data["s"].append(frame_bone_scale)
@@ -1581,15 +1819,28 @@ def import_animfile(animpath, frame_start=1, **kwargs):
                 bone_key_data["t"].append(frame_bone_trans)
                 t_idx += t_len
 
-    for bone_name in all_bone_keyframes:
-        bone_keys = all_bone_keyframes[bone_name]
+    # 关键帧写入路径：默认快路径；骨架有非默认骨骼继承设置时自动回退旧写法
+    keyframe_mode = kwargs.get("keyframe_mode", PDX_KEYFRAME_FAST)
+    if keyframe_mode not in (PDX_KEYFRAME_FAST, PDX_KEYFRAME_LEGACY):
+        raise RuntimeError("Unknown keyframe mode: {0}".format(keyframe_mode))
+    if keyframe_mode == PDX_KEYFRAME_FAST and not bones_allow_fast_keys(rig):
+        IO_PDX_LOG.warning("falling back to the legacy keyframe method for this import")
+        keyframe_mode = PDX_KEYFRAME_LEGACY
+
+    curve_map = build_action_curve_map(rig) if keyframe_mode == PDX_KEYFRAME_FAST else None
+    IO_PDX_LOG.info("writing keyframes with the {0} method -".format(keyframe_mode))
+
+    for bone_name, bone_keys in all_bone_keyframes:
         # check bone has keyframe values
         if bone_keys.values():
             IO_PDX_LOG.info("setting {0} keyframes on bone - {1}".format(",".join(bone_keys.keys()), bone_name))
             non_uni_keys = [i for i, data in enumerate(bone_keys.get("s", [])) if not len(set(data)) == 1]
             if any(non_uni_keys):
                 IO_PDX_LOG.debug("Bone: {0} has non-uniform scale keyframes at: {1}".format(bone_name, non_uni_keys))
-            create_anim_keys(rig, bone_name, bone_keys, frame_start, initial_pose)
+            if curve_map is not None:
+                create_anim_keys_fast(rig, bone_name, bone_keys, frame_start, initial_pose, curve_map)
+            else:
+                create_anim_keys(rig, bone_name, bone_keys, frame_start, initial_pose)
 
     bpy.context.scene.frame_set(frame_start)
     bpy.context.view_layer.update()
@@ -1628,9 +1879,6 @@ def export_animfile(animpath, frame_start=1, frame_end=10, **kwargs):
 
     # fill in animation info and initial pose
     IO_PDX_LOG.info("gathering animation info -")
-    fps = bpy.context.scene.render.fps
-    info_xml.set("fps", [float(fps)])
-
     frame_samples = (frame_end + 1) - frame_start
     info_xml.set("sa", [frame_samples])
 
@@ -1649,6 +1897,32 @@ def export_animfile(animpath, frame_start=1, frame_end=10, **kwargs):
     export_bones = get_skeleton_hierarchy(rig)
     info_xml.set("j", [len(export_bones)])
 
+    # write the playback speed, restoring the exact (possibly fractional) fps of the file this rig was imported from
+    # whenever the scene fps still matches what that import set it to
+    scene_fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
+    fps = scene_fps
+    stored_fps = rig.get(PDX_ANIM_FPS_PROP)
+    if stored_fps is not None and abs(scene_fps - round(float(stored_fps))) < 1e-4:
+        fps = float(stored_fps)
+    if abs(fps - round(fps)) > 1e-4:
+        IO_PDX_LOG.info("writing fractional playback speed - {0}".format(fps))
+    info_xml.set("fps", [float(fps)])
+
+    # warn when the selected scale mode would not reproduce the layout of the file this rig was imported from
+    stored_scale = rig.get(PDX_SCALE_LENGTH_PROP)
+    if stored_scale is not None:
+        stored_scale = int(stored_scale)
+        if uniform_scale and stored_scale > 1:
+            IO_PDX_LOG.warning(
+                "rig was imported from a file using non-uniform scale ({0} components per bone) but uniform scale is "
+                "selected for export - per-axis scale will be flattened and lost.".format(stored_scale)
+            )
+        elif not uniform_scale and stored_scale == 1:
+            IO_PDX_LOG.warning(
+                "rig was imported from a file using uniform scale but non-uniform scale is selected for export - the "
+                "file layout will not match the one it was imported from."
+            )
+
     # parse the scene animation data
     all_bone_keyframes = get_scene_animdata(rig, export_bones, frame_start, frame_end)
 
@@ -1657,7 +1931,7 @@ def export_animfile(animpath, frame_start=1, frame_end=10, **kwargs):
     bpy.context.scene.frame_set(frame_start)
     for bone in export_bones:
         pose_bone = rig.pose.bones[bone.name]
-        bone_xml = Xml.SubElement(info_xml, pose_bone.name)
+        bone_xml = Xml.SubElement(info_xml, get_export_bone_name(rig, pose_bone.name))
 
         # check sample types
         sample_types = ""

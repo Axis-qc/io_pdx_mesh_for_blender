@@ -10,7 +10,7 @@ import os
 import sys
 import webbrowser
 from functools import partial
-from imp import reload
+from importlib import reload
 from textwrap import wrap
 
 import maya.api.OpenMaya as OpenMayaAPI

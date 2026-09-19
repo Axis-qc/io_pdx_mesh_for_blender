@@ -15,7 +15,7 @@ import sys
 import traceback
 import zipfile
 from collections import OrderedDict
-from imp import reload
+from importlib import reload
 
 # vendored package imports
 from .external import tomllib
