@@ -12,7 +12,7 @@ license = ["SPDX:GPL-3.0-or-later"]
 
 # Optional
 tags = ["Import-Export", "Mesh", "Animation"]
-website = "https://github.com/Axis-qc/io_pdx_mesh"
+website = "https://github.com/Axis-qc/io_pdx_mesh_for_blender"
 current_git_tag = 0.91
 blender_support_min = [3, 6, 4]
 sponsor_url = "https://www.paypal.me/rossg85"
