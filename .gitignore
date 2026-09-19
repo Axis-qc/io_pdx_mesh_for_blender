@@ -51,4 +51,6 @@ Temporary Items
 external/numpy_maya/
 test files/
 *.pyc
+__pycache__/
+*.bak
 .vscode/
