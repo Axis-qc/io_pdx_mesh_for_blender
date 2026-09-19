@@ -14,7 +14,6 @@ license = ["SPDX:GPL-3.0-or-later"]
 tags = ["Import-Export", "Mesh", "Animation"]
 website = "https://github.com/Axis-qc/io_pdx_mesh"
 current_git_tag = 0.91
-maya_support_min = [2018]
 blender_support_min = [3, 6, 4]
 sponsor_url = "https://www.paypal.me/rossg85"
 doc_url = "https://github.com/ross-g/io_pdx_mesh/wiki"

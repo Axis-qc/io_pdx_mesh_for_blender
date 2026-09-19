@@ -1,6 +1,6 @@
 """
 IO PDX Mesh Python module.
-Supports Maya 2018 and up, supports Blender 2.83 and up.
+Blender-only fork: supports Blender 3.6.4 and up (tested on 5.2.2). Maya support has been removed.
 
 author : ross-g
 """
