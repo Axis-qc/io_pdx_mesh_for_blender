@@ -47,9 +47,13 @@ Fractional playback speed is no longer rounded away (such as 15.06), and is rest
 
 Locator export no longer depends on the rig's current pose. Previously, exporting a `.mesh` from a rig that was not in its rest pose baked that pose into any locator parented to a bone.
 
+Fixed two import crashes. A `.mesh` that holds only locators and no geometry (the various `_frame.mesh` files) used to abort because no `<object>` element was found, and joining several meshes into one material object used the pre-2.8 context-passing form, which always fails on 5.x. Locator-only files now import as such, and the join uses `temp_override`, keeping separate objects instead of aborting the whole import if it fails.
+
+Fixed missing textures. The texture filenames stored inside a `.mesh` are not necessarily next to the file itself; plenty of vanilla models keep their textures in a sibling style directory. The importer previously looked only in the mesh's own directory and left magenta textures behind. It now falls back to searching the asset root's `gfx` tree by filename, preferring the match whose directory corresponds to the model when several share a name.
+
 Adapted for Blender 5.x animation data access, and `imp` replaced with `importlib` (the old module was removed in Python 3.12).
 
-`version` is 0.91.2, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
+`version` is 0.91.3, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
 
 ### Usage notes
 

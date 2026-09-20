@@ -710,6 +710,95 @@ def swap_coord_space(data, space_mat=SPACE_MATRIX, space_mat_inv=SPACE_MATRIX_IN
 """
 
 
+"""Texture path resolution.
+
+A .mesh stores bare texture filenames, and those files are NOT necessarily stored
+alongside the .mesh itself. Paradox keeps e.g. gfx/models/ships/starbases/*.mesh
+while the textures they reference live under gfx/models/ships/<style>/. The original
+implementation only ever looked in the .mesh's own directory, so every texture kept
+elsewhere silently failed to load and showed up as magenta.
+
+We keep that first lookup (it is correct for the common case) and then fall back to
+an index of every .dds under the 'gfx' tree of the game/mod root the mesh belongs to.
+The index is built once per root and cached for the session.
+"""
+
+_TEXTURE_INDEX_CACHE = {}
+
+
+def infer_asset_root(meshpath):
+    """Walk up from the mesh file to the root directory that owns a 'gfx' folder."""
+    if not meshpath:
+        return None
+    directory = os.path.dirname(os.path.abspath(meshpath))
+    while True:
+        if os.path.isdir(os.path.join(directory, "gfx")):
+            return directory
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return None
+        directory = parent
+
+
+def get_texture_index(meshpath):
+    """basename(lower) -> [full paths] for every .dds under <root>/gfx. Cached per root."""
+    root = infer_asset_root(meshpath)
+    if root is None:
+        return {}
+    cached = _TEXTURE_INDEX_CACHE.get(root)
+    if cached is not None:
+        return cached
+    index = {}
+    for dirpath, _dirnames, filenames in os.walk(os.path.join(root, "gfx")):
+        for filename in filenames:
+            if filename.lower().endswith(".dds"):
+                index.setdefault(filename.lower(), []).append(os.path.join(dirpath, filename))
+    _TEXTURE_INDEX_CACHE[root] = index
+    IO_PDX_LOG.debug("indexed {0} textures under {1}".format(len(index), root))
+    return index
+
+
+def pick_best_texture(candidates, meshpath):
+    """Several .dds can share a basename. Prefer the one in a directory named after
+    the model, e.g. ai_01_outpost.mesh should take gfx/models/ships/ai_01/*.dds."""
+    if len(candidates) == 1:
+        return candidates[0]
+    stem = os.path.splitext(os.path.basename(meshpath or ""))[0].lower()
+    mesh_dir = os.path.dirname(os.path.abspath(meshpath)) if meshpath else ""
+
+    def score(path):
+        parent = os.path.basename(os.path.dirname(path)).lower()
+        named = 0 if parent and (stem.startswith(parent) or parent in stem) else 1
+        try:
+            distance = len(os.path.relpath(path, mesh_dir).split(os.sep))
+        except ValueError:
+            distance = 99
+        return (named, distance, path)
+
+    return sorted(candidates, key=score)[0]
+
+
+def resolve_texture_file(texture_dir, texture_name, meshpath, texture_index=None):
+    """Locate a texture referenced by a .mesh. Returns the best path available.
+
+    Paradox stores bare filenames inside the .mesh and the files themselves are
+    often not next to the mesh (ship meshes live in .../starbases/ while their
+    textures live in .../ships/<style>/), so fall back to the whole gfx tree.
+    """
+    if not texture_name:
+        return None
+    local = os.path.join(texture_dir, texture_name)
+    if os.path.isfile(local):
+        return local
+    if texture_index is None:
+        texture_index = get_texture_index(meshpath)
+    candidates = texture_index.get(os.path.basename(texture_name).lower())
+    if candidates:
+        return pick_best_texture(candidates, meshpath)
+    # nothing matched, hand back the original guess so the caller still warns
+    return local
+
+
 def create_node_texture(node_tree, tex_filepath, as_data=False):
     teximage_node = node_tree.nodes.new("ShaderNodeTexImage")
 
@@ -744,7 +833,7 @@ def create_node_texture(node_tree, tex_filepath, as_data=False):
     return teximage_node
 
 
-def create_shader(PDX_material, shader_name, texture_dir, template_only=False):
+def create_shader(PDX_material, shader_name, texture_dir, template_only=False, meshpath=None, texture_index=None):
     """A number of nodes were deprecated and Principled BSDF inputs renamed:
     See - https://wiki.blender.org/wiki/Reference/Release_Notes/4.0/Python_API#Breaking_changes
     """
@@ -774,7 +863,7 @@ def create_shader(PDX_material, shader_name, texture_dir, template_only=False):
 
     # link up diffuse texture to base-color slot
     if getattr(PDX_material, "diff", None) or template_only:
-        texture_path = None if template_only else os.path.join(texture_dir, PDX_material.diff[0])
+        texture_path = None if template_only else resolve_texture_file(texture_dir, PDX_material.diff[0], meshpath, texture_index)
 
         albedo_texture = create_node_texture(node_tree, texture_path)
         set_node_pos(albedo_texture, -5, 0)
@@ -784,7 +873,7 @@ def create_shader(PDX_material, shader_name, texture_dir, template_only=False):
 
     # link up specular texture to roughness, metallic and specular slots
     if getattr(PDX_material, "spec", None) or template_only:
-        texture_path = None if template_only else os.path.join(texture_dir, PDX_material.spec[0])
+        texture_path = None if template_only else resolve_texture_file(texture_dir, PDX_material.spec[0], meshpath, texture_index)
 
         material_texture = create_node_texture(node_tree, texture_path, as_data=True)
         set_node_pos(material_texture, -5, 1)
@@ -805,7 +894,7 @@ def create_shader(PDX_material, shader_name, texture_dir, template_only=False):
 
     # link up normal texture to normal slot
     if getattr(PDX_material, "n", None) or template_only:
-        texture_path = None if template_only else os.path.join(texture_dir, PDX_material.n[0])
+        texture_path = None if template_only else resolve_texture_file(texture_dir, PDX_material.n[0], meshpath, texture_index)
 
         normal_texture = create_node_texture(node_tree, texture_path, as_data=True)
         set_node_pos(normal_texture, -5, 2)
@@ -831,9 +920,10 @@ def create_shader(PDX_material, shader_name, texture_dir, template_only=False):
     return new_shader
 
 
-def create_material(PDX_material, mesh, texture_path):
+def create_material(PDX_material, mesh, texture_path, meshpath=None, texture_index=None):
     shader_name = "PDXmat_" + mesh.name
-    shader = create_shader(PDX_material, shader_name, texture_path)
+    shader = create_shader(PDX_material, shader_name, texture_path,
+                           meshpath=meshpath, texture_index=texture_index)
 
     mesh.materials.append(shader)
 
@@ -1436,6 +1526,15 @@ def import_meshfile(meshpath, imp_mesh=True, imp_skel=True, imp_locs=True, join_
     shapes = asset_elem.find("object")
     locators = asset_elem.find("locator")
 
+    # a .mesh may legitimately hold only locators and no geometry at all
+    # (every *_frame.mesh is like this); iterating None would crash the import
+    if shapes is None:
+        IO_PDX_LOG.info("no <object> element in this file, importing locators only")
+        shapes = []
+
+    # index textures below the asset root once, then reuse for every material
+    texture_index = get_texture_index(meshpath)
+
     # store all bone transforms, irrespective of skin association
     scene_bone_dict = dict()
 
@@ -1481,7 +1580,8 @@ def import_meshfile(meshpath, imp_mesh=True, imp_skel=True, imp_locs=True, join_
                 # create the material
                 if pdx_material:
                     IO_PDX_LOG.info("creating material - {0}".format(pdx_material.shader[0]))
-                    create_material(pdx_material, mesh, os.path.split(meshpath)[0])
+                    create_material(pdx_material, mesh, os.path.split(meshpath)[0],
+                                    meshpath=meshpath, texture_index=texture_index)
 
                 # create the vertex group skin
                 if rig and pdx_skin:
@@ -1489,11 +1589,32 @@ def import_meshfile(meshpath, imp_mesh=True, imp_skel=True, imp_locs=True, join_
                     create_skin(pdx_skin, pdx_bone_list, obj, rig)
 
             if join_materials and len(created) > 1:
-                ctx = bpy.context.copy()
-                ctx["active_object"] = created[0]
-                ctx["selected_editable_objects"] = created
-                bpy.ops.object.join(ctx)
-                ctx.clear()
+                # bpy.context.copy() only yields the RNA subset and is no longer a
+                # valid operator override; Blender 2.8+ raises
+                # "1-2 args execution context is supported". Use temp_override.
+                win = bpy.context.window
+                area = None
+                if win and win.screen:
+                    area = next((a for a in win.screen.areas if a.type == "VIEW_3D"), None)
+                    if area is None and len(win.screen.areas):
+                        area = win.screen.areas[0]
+                override = {
+                    "window": win,
+                    "scene": bpy.context.scene,
+                    "view_layer": bpy.context.view_layer,
+                    "active_object": created[0],
+                    "object": created[0],
+                    "selected_objects": created,
+                    "selected_editable_objects": created,
+                }
+                if area:
+                    override["area"] = area
+                try:
+                    with bpy.context.temp_override(**override):
+                        bpy.ops.object.join()
+                except Exception:
+                    # joining is cosmetic; keep the separate objects instead of failing
+                    IO_PDX_LOG.warning("could not join materials, kept objects separate", exc_info=True)
 
     # go through locators
     if imp_locs and locators:
