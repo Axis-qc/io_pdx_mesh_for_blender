@@ -6,7 +6,7 @@ name = "IO PDX Mesh"
 maintainer = "ross-g"
 tagline = "Import/Export Paradox asset files for the Clausewitz game engine"
 type = "add-on"
-version = "0.91.1"
+version = "0.91.2"
 blender_version_min = "4.2.0"
 license = ["SPDX:GPL-3.0-or-later"]
 

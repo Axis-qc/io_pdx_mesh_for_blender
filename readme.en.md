@@ -11,7 +11,7 @@ Chinese version: [readme.md](readme.md).
 
 ### Tested version
 
-This fork has only been tested on **Blender 5.2.2 LTS**. Other versions (including 4.2.x and 3.6.x) have not been tested and may or may not work. Use at your own risk on anything other than 5.2.2.
+This fork has only been tested on **Blender 5.2.2 LTS**. Other versions are untested and may not work: Blender's Python API changes between major releases, and this fork targets the 5.2 API. It is not backward compatible, so use other versions at your own risk.
 
 The manifest declares a minimum of Blender 4.2.0, but that only makes the add-on installable; it does not mean it works.
 
@@ -39,23 +39,17 @@ Restart Blender after installing for the first time.
 
 ### Changes since upstream 0.91.0
 
-The complete list of changes in this fork.
+Animation import is dramatically faster. Keyframes go straight to the action curves instead of forcing a full scene evaluation per frame; a 33-bone / 900-frame clip dropped from about 51 seconds to about 1 second. The old method is kept as a fallback and is used automatically for rigs with non-default bone inheritance settings.
 
-Animation import is dramatically faster. Keyframes are now written directly to the action curves instead of forcing a full scene evaluation per frame. Measured on a 33-bone / 900-frame clip the import dropped from about 51 seconds to about 1 second, and an 18-bone / 251-frame clip from 2.3 seconds to 0.07 seconds. The old method is kept as a fallback and is exposed as the `Legacy keyframe method` checkbox in the import dialog. Rigs that use non-default bone inheritance settings (`use_inherit_rotation` false, or `inherit_scale` other than `FULL`) automatically fall back to the old path, so no manual switch is needed.
+Duplicate bone names no longer break animations. Some vanilla skeletons share one name across several bones, and Blender forces unique bone names by adding a suffix on import. The importer used to index bones by name and collapse duplicates. It now matches by name plus occurrence order and restores the original names on export. When making your own models, avoid duplicate bone names in the skeleton so this cannot come up in the first place.
 
-Duplicate bone names are handled. Some vanilla skeletons contain several bones sharing one name, and Blender forces unique bone names, renaming them with a `.001` style suffix on import. The importer previously indexed bones by name, which collapsed duplicates into one bone, misaligning the animation sample stream and piling skin weights onto a single bone. The importer now records the original PDX bone names and matches them by name plus occurrence order, then restores the original names on export.
+Fractional playback speed is no longer rounded away (such as 15.06), and is restored on export when the scene fps was not changed.
 
-Fractional playback speed round-trips correctly. Files whose animation speed is not a whole number (such as 15.06 or 15.10) are imported with the scene fps rounded to an integer, while the exact value is stored on the rig as `io_pdx_anim_fps` and restored on export when the scene fps was not changed.
+Locator export no longer depends on the rig's current pose. Previously, exporting a `.mesh` from a rig that was not in its rest pose baked that pose into any locator parented to a bone.
 
-Animation data access for Blender 5.x. Actions in Blender 5.x no longer expose `.fcurves`, so the importer reads and writes animation by walking the new layered structure (layers, strips, channelbags, f-curves).
+Adapted for Blender 5.x animation data access, and `imp` replaced with `importlib` (the old module was removed in Python 3.12).
 
-`imp` to `importlib`. The module reload helper changed from `imp.reload` to `importlib.reload`, because the old `imp` module was removed in Python 3.12, which Blender 5.x uses.
-
-There is also a small UI compatibility patch: the update-check button now tests `LATEST_URL` with `hasattr` plus `isinstance`, so it does not fail on Python 3.13 when the value is a string.
-
-The manifest keeps `current_git_tag` at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference, while `version` is bumped to 0.91.1 to mark this fork's changes.
-
-How the changes were verified: the fast keyframe path was compared against the legacy path channel by channel. The curve sets, keyframe counts and frame numbers are identical, and the numeric differences are 3.9 / 2.6 / 10.9 ulp, or 4.6e-7 / 3.1e-7 / 1.3e-6 relative to model scale. That is floating-point noise rather than bit-identical output; the difference comes from the legacy path making an extra float32 round trip through the depsgraph.
+`version` is 0.91.2, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
 
 ### Usage notes
 

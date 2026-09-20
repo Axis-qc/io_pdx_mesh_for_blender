@@ -567,8 +567,18 @@ def get_locators_info(blender_empties):
         if obj.parent and obj.parent_type == "BONE":
             locator_list[i]["pa"] = [obj.parent_bone]
             rig = obj.parent
-            bone_matrix = rig.matrix_world @ rig.data.bones[obj.parent_bone].matrix_local
-            # TODO: test if this should be .matrix_world or .matrix_local
+            # Use the bone's POSE matrix, not its rest matrix.
+            #
+            # The locator is rigidly parented to the bone, so it follows the bone
+            # whenever the rig is posed. The value the file format stores is the
+            # constant bone-local offset, which is `bone_world^-1 @ obj.matrix_world`
+            # only when `bone_world` is the SAME pose the object currently reflects.
+            # Taking the rest matrix here while the object carries the posed world
+            # matrix mixes two different poses, baking the current pose into the
+            # locator: the locator is then written shifted by however far the bone
+            # has moved from its bind pose. Using the pose matrix makes the result
+            # independent of the rig's current pose, which is what we want.
+            bone_matrix = rig.matrix_world @ rig.pose.bones[obj.parent_bone].matrix
             _transform = bone_matrix.inverted_safe() @ obj.matrix_world
 
         _position, _rotation, _scale = swap_coord_space(_transform).decompose()
