@@ -15,7 +15,7 @@ tags = ["Import-Export", "Mesh", "Animation"]
 website = "https://github.com/Axis-qc/io_pdx_mesh_for_blender"
 current_git_tag = 0.91
 blender_support_min = [3, 6, 4]
-sponsor_url = "https://www.paypal.me/rossg85"
+sponsor_url = "https://github.com/Axis-qc"
 doc_url = "https://github.com/ross-g/io_pdx_mesh/wiki"
 forum_url = "https://forum.paradoxplaza.com/forum/index.php?forums/clausewitz-maya-exporter-modding-tool.935/"
 
