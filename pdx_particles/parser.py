@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import re
+import sys
 
 DATA_LOG = logging.getLogger("io_pdx.particles.parser")
 
@@ -289,7 +290,7 @@ class PdxForce:
 
 class PdxSubsystem:
     __slots__ = (
-        "name", "max_amount", "emitter_type", "box_x", "box_y",
+        "name", "max_amount", "emitter_type", "box_x", "box_y", "box_z",
         "sphere_radius", "sphere_yaw", "sphere_pitch",
         "texture_file", "texture_shader", "sheet_x", "sheet_y", "sheet_anim", "sheet_loop",
         "color", "alpha", "position",
@@ -308,6 +309,9 @@ class PdxSubsystem:
         self.emitter_type = str(et.value).strip('"') if et is not None and et.value is not None else "point"
         self.box_x = _pair(node.child("box_emitter_x"))
         self.box_y = _pair(node.child("box_emitter_y"))
+        # box_emitter_z 原先没解析，直接进 unknown_keys 被丢掉，模拟里 pz 写死 0，
+        # 于是所有 box 发射器塌成一个平面矩形。原版有 748 个子系统用到它。
+        self.box_z = _pair(node.child("box_emitter_z"))
         self.sphere_radius = _pair(node.child("sphere_emitter_radius"))
         self.sphere_yaw = _pair(node.child("sphere_emitter_yaw"))
         self.sphere_pitch = _pair(node.child("sphere_emitter_pitch"))
@@ -368,6 +372,7 @@ class PdxSubsystem:
 
         known = {
             "name", "max_amount", "slave_particles", "emitter_type", "box_emitter_x", "box_emitter_y",
+            "box_emitter_z",
             "sphere_emitter_radius", "sphere_emitter_yaw", "sphere_emitter_pitch",
             "invert", "trail", "spritesheet_animation", "spritesheet_animation_loop", "local_space",
             "billboard", "hide", "texture", "color", "position", "start", "duration",
@@ -456,22 +461,242 @@ def parse_entity_events(path):
 # Library：多文件系统索引与贴图路径解析
 # ----------------------------------------------------------------------------------------------------------------------
 
+_SKIP_DIRS = {"__pycache__", ".git", ".svn"}
+
+# Paradox 引擎各游戏在 Steam 上的 appid；用于在库里按 appmanifest 认游戏目录。
+STEAM_APPIDS = {
+    "281990": "Stellaris",
+    "236850": "Europa Universalis IV",
+    "394360": "Hearts of Iron IV",
+    "1158310": "Crusader Kings III",
+    "529340": "Victoria 3",
+    "949230": "Cities: Skylines II",
+}
+
+
+def _steam_root_candidates():
+    """各平台的 Steam 安装根（只给候选，不保证存在）。"""
+    home = os.path.expanduser("~")
+    if os.name == "nt":
+        try:
+            import winreg  # noqa: PLC0415
+        except ImportError:
+            winreg = None
+        if winreg is not None:
+            for hive, key in (
+                (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
+            ):
+                try:
+                    with winreg.OpenKey(hive, key) as k:
+                        val, _ = winreg.QueryValueEx(k, "SteamPath")
+                        yield val.replace("/", os.sep)
+                except OSError:
+                    pass
+        yield os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Steam")
+        yield os.path.join(home, "AppData", "Local", "Steam")
+    elif sys.platform == "darwin":
+        yield os.path.join(home, "Library", "Application Support", "Steam")
+    else:
+        yield os.path.join(home, ".steam", "steam")
+        yield os.path.join(home, ".local", "share", "Steam")
+        yield os.path.join(home, ".var", "app", "com.valvesoftware.Steam", "data", "Steam")
+
+
+def _parse_vdf_paths(text):
+    """从 libraryfolders.vdf 粗取所有库路径（"path" "X:\\\\...")。"""
+    out = []
+    for m in re.finditer(r'"path"\s*"([^"]+)"', text):
+        p = m.group(1).replace("\\\\", "\\")
+        if p:
+            out.append(p)
+    return out
+
+
+def find_steam_libraries():
+    """返回所有存在的 Steam 库目录（含 Steam 安装根本身），按路径大小写不敏感去重。"""
+    libs = []
+    seen = set()
+
+    def add(p):
+        if not p or not os.path.isdir(p):
+            return
+        key = os.path.normcase(os.path.normpath(p))
+        if key in seen:
+            return
+        seen.add(key)
+        libs.append(p)
+
+    for root in _steam_root_candidates():
+        if not os.path.isdir(root):
+            continue
+        add(root)
+        steamapps = os.path.join(root, "steamapps")
+        for name in ("libraryfolders.vdf", "libraryfolders.vdf.bak"):
+            vdf = os.path.join(steamapps, name)
+            if not os.path.isfile(vdf):
+                continue
+            try:
+                with open(vdf, "r", encoding="utf-8", errors="replace") as fh:
+                    for p in _parse_vdf_paths(fh.read()):
+                        add(p)
+            except OSError:
+                pass
+    return libs
+
+
+def find_game_roots(appids=None):
+    """在各 Steam 库里按 appmanifest 找游戏安装目录 → {appid: [目录]}。
+
+    不写死任何本机路径：库位置来自 Steam 自己的配置，游戏目录来自 acf 里的
+    installdir。非 Steam 版（GOG / 微软商店）查不到，此时返回空，由用户手填。
+    """
+    want = set(appids) if appids is not None else set(STEAM_APPIDS)
+    found = {}
+    for lib in find_steam_libraries():
+        steamapps = os.path.join(lib, "steamapps")
+        if not os.path.isdir(steamapps):
+            continue
+        try:
+            names = os.listdir(steamapps)
+        except OSError:
+            continue
+        for fn in names:
+            if not (fn.startswith("appmanifest_") and fn.endswith(".acf")):
+                continue
+            appid = fn[len("appmanifest_"):-len(".acf")]
+            if appid not in want:
+                continue
+            try:
+                with open(os.path.join(steamapps, fn), "r", encoding="utf-8",
+                          errors="replace") as fh:
+                    txt = fh.read()
+            except OSError:
+                continue
+            m = re.search(r'"installdir"\s*"([^"]+)"', txt)
+            if not m:
+                continue
+            game = os.path.join(steamapps, "common", m.group(1))
+            if os.path.isdir(game):
+                found.setdefault(appid, []).append(game)
+    return found
+
+
+def detect_game_roots():
+    """自动检测到的游戏根目录，优先返回确实能用的（有 gfx/particles 或 gfx/models）。
+
+    Paradox 各游戏目录布局不同：Stellaris 是 <root>/gfx，Victoria 3 是
+    <root>/game/gfx，所以只认 Steam 的 installdir 会拿到一批对粒子无用的路径。
+    排序把「能用的」放前面，但仍全部返回，由调用方与用户决定。
+    """
+    found = find_game_roots()
+    usable, rest = [], []
+    for appid in STEAM_APPIDS:
+        for p in found.get(appid, []):
+            if p in usable or p in rest:
+                continue
+            (usable if looks_like_game_root(p) else rest).append(p)
+    return usable + rest
+
+
+def looks_like_game_root(path):
+    """目录是否像个 Paradox 游戏根：有 gfx 且 gfx 下有 particles 或 models。"""
+    if not path or not os.path.isdir(path):
+        return False
+    gfx = os.path.join(path, "gfx")
+    if not os.path.isdir(gfx):
+        return False
+    return any(os.path.isdir(os.path.join(gfx, sub))
+               for sub in ("particles", "models"))
+
+
+def iter_files(root, subdir, exts):
+    """递归列出 root/subdir 下后缀命中的文件，排序输出，跳过缓存目录。
+
+    原版的粒子本体大量放在 gfx/particles 的子目录里（combat / ships /
+    stars_and_planets / misc / cosmic_storms_assets），只扫顶层会漏掉约三分之二。
+    """
+    base = os.path.join(root, *subdir.split("/")) if subdir else root
+    if not os.path.isdir(base):
+        return
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+        for fn in sorted(filenames):
+            if os.path.splitext(fn)[1].lower() in exts:
+                yield os.path.join(dirpath, fn)
+
+
+class ParticleCatalogEntry:
+    """一条可选中的粒子：.gfx 注册项（name/type/scale）+ 它指向的本体。
+
+    列表按注册名展示——那才是实体事件里写的名字。同一个注册名在多个 .gfx 里
+    重复出现时不去重，各留一条并带来源文件，便于区分。
+    """
+
+    __slots__ = ("name", "type", "scale", "source_file", "system", "system_file")
+
+    def __init__(self, name, type_, scale, source_file, system, system_file):
+        self.name = name
+        self.type = type_
+        self.scale = scale
+        self.source_file = source_file
+        self.system = system          # 解析到的本体（PdxParticleSystem），没有则 None
+        self.system_file = system_file
+
+    @property
+    def resolved(self):
+        return self.system is not None
+
+
+def build_catalog(roots, library=None, roots_for_index=None):
+    """收集 roots 下所有 pdxparticle 注册项 → [ParticleCatalogEntry]。
+
+    只扫 gfx/**/*.gfx（注册所在处），不碰 gfx/particles 下的 .asset 本体——
+    本体由 ParticleLibrary 索引。返回列表按注册名排序，同名保持来源文件次序。
+
+    roots_for_index 用于索引本体与贴图（可含原版根）：列表仍只列 roots 里的注册
+    项，但 mod 的粒子常引用原版贴图、继承原版本体，索引范围要更宽。
+    """
+    index_roots = roots_for_index if roots_for_index is not None else roots
+    lib = library if library is not None else ParticleLibrary(index_roots).scan()
+    out = []
+    for root in lib.roots:
+        if root not in roots:
+            continue          # 原版根只用来解析，不往列表里添条目
+        for path in iter_files(root, "gfx", {".gfx"}):
+            try:
+                regs = parse_gfx_registrations(path)
+            except Exception as err:  # noqa: BLE001
+                DATA_LOG.error("gfx registration parse failed: %s (%s)", path, err)
+                continue
+            for reg in regs:
+                if not reg["name"]:
+                    continue
+                system = lib.systems.get(reg["type"])
+                out.append(ParticleCatalogEntry(
+                    reg["name"], reg["type"], reg["scale"], path,
+                    system, lib.file_of.get(reg["type"])))
+    out.sort(key=lambda e: (e.name.lower(), e.source_file))
+    return out, lib
+
+
 class ParticleLibrary:
-    """扫多个根目录（mod / 原版）的 gfx/particles/*.asset 建立系统名索引，并解析贴图绝对路径。"""
+    """扫多个根目录（mod / 原版）的 gfx/particles/**/*.asset 建立系统名索引，并解析贴图绝对路径。
+
+    扫描是递归的：本体在子目录里同样收进来。同名本体后扫到的覆盖先扫到的，
+    因此把优先级高的根（mod）放在 roots 前面。
+    """
 
     def __init__(self, roots):
         self.roots = [r for r in roots if r and os.path.isdir(r)]
         self.systems = {}
+        self.file_of = {}
         self.files_scanned = 0
 
     def scan(self, extra_files=()):
         for root in self.roots:
-            pdir = os.path.join(root, "gfx", "particles")
-            if not os.path.isdir(pdir):
-                continue
-            for fn in sorted(os.listdir(pdir)):
-                if fn.lower().endswith(".asset"):
-                    self._scan_file(os.path.join(pdir, fn))
+            for path in iter_files(root, "gfx/particles", {".asset"}):
+                self._scan_file(path)
         for f in extra_files:
             if os.path.isfile(f):
                 self._scan_file(f)
@@ -485,6 +710,7 @@ class ParticleLibrary:
                     system = PdxParticleSystem(top, path)
                     if system.name:
                         self.systems[system.name] = system
+                        self.file_of[system.name] = path
         except Exception as err:  # noqa: BLE001
             DATA_LOG.error("parsing failed: %s (%s)", path, err)
 

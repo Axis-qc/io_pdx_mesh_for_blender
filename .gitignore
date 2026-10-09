@@ -54,3 +54,4 @@ test files/
 __pycache__/
 *.bak
 .vscode/
+AGENTS.md

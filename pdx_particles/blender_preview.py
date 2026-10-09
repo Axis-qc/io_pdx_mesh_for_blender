@@ -20,7 +20,8 @@ import math
 
 import bpy  # type: ignore
 
-from .simulator import SystemSim
+from .parser import sph_to_dir
+from .simulator import PARTICLE_FPS, SystemSim
 
 IO_LOG = logging.getLogger("io_pdx.particles")
 
@@ -37,9 +38,8 @@ def _set_input(node, names, value):
 
 
 class SubsystemPreview:
-    def __init__(self, sub_sim, collection, display_scale, library):
+    def __init__(self, sub_sim, collection, library):
         self.sub_sim = sub_sim
-        self.display_scale = display_scale
         self.library = library
         self.obj = None
         self.mesh = None
@@ -82,6 +82,13 @@ class SubsystemPreview:
         if sub.texture_file and self.library is not None:
             tex_path = self.library.resolve_texture(
                 sub.texture_file, self.sub_sim.system.source_file or "")
+            if tex_path is None:
+                # 找不到贴图多半是原版根没配（mod 粒子常引用原版贴图）。不报错
+                # 而是留下没有纹理的材质，用户只会看到一片光斑，很难定位。
+                IO_LOG.warning(
+                    "particle texture not found: %s (subsystem %s); "
+                    "add the Stellaris install folder as Vanilla root",
+                    sub.texture_file, self.sub_sim.name)
         additive = sub.texture_shader != "ParticleAlphaBlend"
 
         mat = bpy.data.materials.new("pdx_mat_{0}".format(self.sub_sim.name))
@@ -98,8 +105,14 @@ class SubsystemPreview:
         nt = mat.node_tree
         nodes = nt.nodes
         links = nt.links
-        out = nodes.get("Material Output")
-        bsdf = nodes.get("Principled BSDF")
+        # 节点按 type 查，不按名字：Blender 界面语言非英文时节点名会被翻译成
+        # 本地语言（中文界面下出力节点叫「材质输出」、BSDF 叫「原理化 BSDF」），
+        # 而 nodes.get("Material Output") 这种英文名查找会全部落空。落空的后果
+        # 不是报错而是静默错接：会新建第二个 BSDF 接顶点色，但它从不连到输出，
+        # 真正出图的仍是默认空 BSDF，看起来就是「着色没绑上」。
+        # 插槽名（Base Color / Alpha / Emission Color 等）不随界面语言变化，可照用。
+        out = next((n for n in nodes if n.type == "OUTPUT_MATERIAL"), None)
+        bsdf = next((n for n in nodes if n.type == "BSDF_PRINCIPLED"), None)
         if bsdf is None:
             bsdf = nodes.new("ShaderNodeBsdfPrincipled")
 
@@ -156,24 +169,43 @@ class SubsystemPreview:
     def refresh(self, camera_inv=None):
         sim = self.sub_sim
         sub = sim.sub
-        ds = self.display_scale
         snap = sim.snapshot()
         cap = self.capacity
         if cap <= 0:
             return 0
 
-        # 相机立牌基向量：世界矩阵的列 0/列 1 = 相机局部 X/Y 轴在世界中的方向
-        if camera_inv is not None:
+        # 立牌基向量三选一，按粒子自身的朝向声明决定：
+        # - particle_pitch≈90：水平环（冲击波），平铺在水平面上；
+        # - billboard=no：固定朝向，不跟随相机。这类粒子朝向写在 particle_yaw /
+        #   particle_pitch 里，用它们构造面片基向量；
+        # - 其余（billboard=yes）：面向活动相机，取相机世界矩阵的列 0/列 1。
+        # billboard 字段原先解析了却从未被读取，导致 1630 个明确写了
+        # billboard=no 的子系统（占 31.8%）被当成立牌渲染——飞船尾焰、定向火舌
+        # 这类本该固定朝向的粒子会随视角转动，方向是错的。
+        flat = abs(sub.particle_pitch[0] - 90.0) < 1.0 and sub.particle_pitch[1] < 1.0
+        if flat:
+            right, up = (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)
+        elif not sub.billboard:
+            # 固定朝向：面片法线由 particle 的 yaw/pitch 决定（与球坐标同源）
+            d = sph_to_dir(sub.particle_pitch[0], sub.particle_yaw[0])
+            up = (0.0, 1.0, 0.0)
+            # 取一个与 d 不平行的参考向量，叉乘得到面内右向量
+            ref = (0.0, 0.0, 1.0) if abs(d[1]) > 0.9 else (0.0, 1.0, 0.0)
+            right = (d[1] * ref[2] - d[2] * ref[1],
+                     d[2] * ref[0] - d[0] * ref[2],
+                     d[0] * ref[1] - d[1] * ref[0])
+            ln = math.sqrt(right[0] ** 2 + right[1] ** 2 + right[2] ** 2) or 1.0
+            right = (right[0] / ln, right[1] / ln, right[2] / ln)
+            up = (d[1] * right[2] - d[2] * right[1],
+                  d[2] * right[0] - d[0] * right[2],
+                  d[0] * right[1] - d[1] * right[0])
+        elif camera_inv is not None:
             m = camera_inv
             right = (m[0][0], m[1][0], m[2][0])
             up = (m[0][1], m[1][1], m[2][1])
         else:
-            right, up = (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)
-
-        # pitch≈90 的粒子是水平环（冲击波），平铺在水平面上
-        flat = abs(sub.particle_pitch[0] - 90.0) < 1.0 and sub.particle_pitch[1] < 1.0
-        if flat:
-            right, up = (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)
+            # 无相机：面向 -Y 立起（Blender 默认视向），up 取世界 +Z
+            right, up = (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)
 
         sheet_x = max(sub.sheet_x, 1)
         sheet_y = max(sub.sheet_y, 1)
@@ -189,10 +221,11 @@ class SubsystemPreview:
             c, s = math.cos(ang), math.sin(ang)
             r2 = (right[0] * c - up[0] * s, right[1] * c - up[1] * s, right[2] * c - up[2] * s)
             u2 = (right[0] * s + up[0] * c, right[1] * s + up[1] * c, right[2] * s + up[2] * c)
-            half = size * 0.5 * ds
-            bx = x * ds
-            by = -z * ds
-            bz = y * ds
+            # 1 局部单位 = 1 Blender 米：size 直读，size=1 即 1x1 标准面片
+            half = size * 0.5
+            bx = x
+            by = -z
+            bz = y
             vbase = i * 12
             for (su, sv), k in (((-1.0, -1.0), 0), ((1.0, -1.0), 1), ((1.0, 1.0), 2), ((-1.0, 1.0), 3)):
                 o = vbase + k * 3
@@ -232,14 +265,14 @@ class SubsystemPreview:
 class PreviewScene:
     """一个粒子系统的完整预览（collection + 各子系统对象 + 参照球）。"""
 
-    def __init__(self, system, library, display_scale=0.02, time_offset=0.0):
+    def __init__(self, system, library, time_offset=0.0):
         self.system = system
         self.library = library
         self.sim = SystemSim(system, time_offset)
-        self.display_scale = display_scale
         self.collection = None
         self.sub_previews = []
         self.ref_sphere = None
+        self.last_count = 0
         self._build()
 
     def _build(self):
@@ -248,7 +281,7 @@ class PreviewScene:
         bpy.context.scene.collection.children.link(coll)
         self.collection = coll
         for sub_sim in self.sim.subs:
-            self.sub_previews.append(SubsystemPreview(sub_sim, coll, self.display_scale, self.library))
+            self.sub_previews.append(SubsystemPreview(sub_sim, coll, self.library))
         # 参照球（线框，半径 30 局部单位 = 星球量级中值）
         mesh = bpy.data.meshes.new("pdx_ref_sphere")
         verts, faces = _uv_sphere(30.0, 24, 12)
@@ -266,10 +299,14 @@ class PreviewScene:
         self.ref_sphere.hide_render = not show
 
     def refresh(self):
-        """按当前场景帧驱动模拟并刷新所有网格。"""
+        """按当前场景帧驱动模拟并刷新所有网格。
+
+        帧 → 秒 用固定的 PARTICLE_FPS（60），不用场景 render.fps：粒子数据里
+        的时间量全部以秒为单位，拿可变的场景 fps 换算会让同一份数据在不同
+        fps 的场景里跑出不同速度。
+        """
         scene = bpy.context.scene
-        fps = (scene.render.fps or 24) * max(scene.render.fps_base, 1e-6)
-        t = (scene.frame_current - scene.frame_start) / fps
+        t = (scene.frame_current - scene.frame_start) / PARTICLE_FPS
         self.sim.advance(max(t, 0.0))
         camera_inv = None
         cam = scene.camera
@@ -278,6 +315,7 @@ class PreviewScene:
         total = 0
         for sp in self.sub_previews:
             total += sp.refresh(camera_inv)
+        self.last_count = total
         return total
 
     def set_subsystem_enabled(self, name, enabled):

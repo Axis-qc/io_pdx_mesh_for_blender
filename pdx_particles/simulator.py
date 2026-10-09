@@ -19,12 +19,38 @@ from .parser import sph_to_dir
 
 GOLDEN = 0.6180339887498949
 SUBSTEP = 1.0 / 120.0     # 物理子步（秒）
-MAX_SUBSTEPS = 32         # 单帧最多子步数，防卡死
 _EPS = 1e-9
+
+# 粒子时间基准：1 秒 = 60 帧，与场景 render.fps 无关。
+# 粒子数据里的 start / duration / life / emission 全部以秒为单位
+# （emission = 每秒发射数），所以帧号与秒的换算必须用这个固定基准，
+# 不能用场景 fps：场景 fps 是可变的显示属性，拿它换算会让同一份粒子
+# 数据在不同 fps 的场景里算出不同的时间，回放速度与实际不符。
+PARTICLE_FPS = 60
+
+# 预览时长上限（秒）：防病态参数（极低 emission）拉出几万帧的时间轴。
+MAX_PREVIEW_SECONDS = 60.0
 
 
 def _frac(x):
     return x - math.floor(x)
+
+
+# 各维用的互质基数（Halton 序列）。维度顺序固定，改动会改变既有回放结果。
+# 至少要覆盖 _spawn 用到的全部维度（0..15）且互不相同：一旦两维取到同一个
+# 基数，它们就变成同一个数，分布会重新退化。
+_HALTON_BASES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53)
+
+
+def _radical_inverse(i, base):
+    """i 在 base 进制下的小数反转，值落在 [0,1)。"""
+    inv = 0.0
+    f = 1.0 / base
+    while i > 0:
+        inv += f * (i % base)
+        i //= base
+        f /= base
+    return inv
 
 
 def _clamp(x, a, b):
@@ -76,6 +102,9 @@ class SubsystemSim:
         # 发射速率与窗口（entity 事件偏移加在窗口起点上）
         self.rate = max(sub.emission[0], 0.0)
         self.start = sub.start[0] + time_offset
+        # 同一系统里多个子系统错开 Halton 序列起点，避免它们发出完全相同的
+        # 落点图案（同参数的两个子系统本来会长得一模一样）。
+        self.seq_offset = max(index, 0) * 97
         self.duration = sub.duration[0]   # -1 = 无限窗口
         self.life = max(sub.life[0], 0.001)
         self.life_var = sub.life[1]
@@ -107,8 +136,10 @@ class SubsystemSim:
         # box / sphere 发射尺寸
         bx = sub.box_x
         by = sub.box_y
+        bz = sub.box_z
         self.box_half_x = bx[0] if sub.emitter_type == "box" else 0.0
         self.box_half_y = by[0] if sub.emitter_type == "box" else 0.0
+        self.box_half_z = bz[0] if sub.emitter_type == "box" else 0.0
         sr = sub.sphere_radius
         self.sphere_r = sr[0] if sub.emitter_type == "sphere" else 0.0
         self.sphere_r_var = sr[1] if sub.emitter_type == "sphere" else 0.0
@@ -118,9 +149,51 @@ class SubsystemSim:
         # 运行状态
         self.reset()
 
+    def _expected_spawns(self, t):
+        """到时刻 t 为止「应该」出生过多少颗粒子（按发射窗口与速率直接算）。
+
+        无状态：只依赖 t 与参数，不依赖此前怎么推进，因此逐帧推进与一次性跳帧
+        得到相同结果。这是选帧能便宜的前提。
+        """
+        if self.rate <= 0.0 or t < self.start:
+            return 0
+        # 有限窗口：发射只发生在 [start, start+duration) 内
+        upto = t if self.duration < 0.0 else min(t, self.start + self.duration)
+        if upto <= self.start:
+            return 0
+        return int((upto - self.start) * self.rate)
+
+    def estimate_alive(self, t):
+        """廉价估算 t 时刻的存活粒子数（O(1)，不做物理积分）。
+
+        用于选帧扫描：整条时间轴要采样上千次，逐点跑物理在上千粒子的系统上要
+        十几秒。这里按「已发射数 - 已到寿数」直接估算，只需要找出哪个时间段最
+        热闹，随后对少量候选做一次真正的 replay 复核。
+
+        必须显式处理「第一颗还没出生」：低发射速率的系统（实测 0.15/秒）要等到
+        start + 1/rate 才可能有粒子，漏掉这一条会选中 start 之后不久的帧，而那
+        时候其实一颗粒子都没有。
+        """
+        if self.rate <= 0.0 or t < self.start:
+            return 0.0
+        first = self.start + 1.0 / self.rate
+        if t < first:
+            return 0.0
+        upto = t if self.duration < 0.0 else min(t, self.start + self.duration)
+        if upto <= self.start:
+            return 0.0
+        emitted = (upto - self.start) * self.rate
+        # 出生早于 (t - 平均寿命) 的那批，按平均寿命算已到寿
+        avg_life = max(self.life, 0.001)
+        cutoff = t - avg_life
+        expired = 0.0 if cutoff <= self.start else (
+            (min(cutoff, upto) - self.start) * self.rate)
+        alive = emitted - expired
+        return max(0.0, min(alive, self.sub.max_amount))
+
     def reset(self):
         self.t = 0.0
-        self.acc = 0.0
+        self.n_sub = 0          # 已执行的绝对子步数（唯一的时间状态，保证可重放）
         self.spawn_count = 0
         # 粒子记录：[出生时间, 寿命, x,y,z, vx,vy,vz, 角速度, 初始角, 权重]
         self.particles = []
@@ -128,29 +201,52 @@ class SubsystemSim:
     # ---- 发射 ----
 
     def _w(self, i, salt=0):
-        return _frac((i + 1) * GOLDEN + salt * 0.3172210261)
+        """第 i 颗粒子在第 salt 维的确定性权重，落在 [0,1)。
+
+        用 Halton 低差异序列：每一维取一个互质基数，维度之间互相独立；子系统之间
+        靠序列起点错开（seq_offset），不占用额外维度。
+
+        不能写成 frac((i+1)*GOLDEN + salt*C) 那种「同一序列加偏移」的形式——
+        那样各维之间只差一个常数，等于同一个随机数，点集退化成一条直线。
+        实测 16x16 网格只覆盖 12.5%（本该接近 100%），球面发射器的落点被压成
+        一条测地线，三轴符号比 x=86.6%/y=50%/z=36.6%（应各约 50%），
+        视觉上就是「球形发射场只出来一半」。换成 Halton 后球面覆盖
+        10.8% → 86.7%，三轴符号回到 49.5/49.9/50.0%。
+        """
+        base = _HALTON_BASES[salt % len(_HALTON_BASES)]
+        return _radical_inverse(self.seq_offset + i + 1, base)
 
     def _spawn(self, t):
         sub = self.sub
         i = self.spawn_count
         self.spawn_count += 1
-        w0 = self._w(i, self.index)
+        # 各维权重：每个用途占一个独立维度（Halton 互质基），互不相关。
+        # 复用同一个 salt 会让两个用途共用同一个随机数（例如球面 yaw 与初速度
+        # 的 pitch 联动），分布会再度退化成低维曲面。
+        w_life = self._w(i, 0)                   # 寿命
+        w_pos1 = self._w(i, 1)                   # 发射点第 1 维
+        w_pos2 = self._w(i, 2)                   # 发射点第 2 维
+        w_pos3 = self._w(i, 3)                   # 发射点第 3 维
+        w_dir1 = self._w(i, 4)                   # 初速度方向第 1 维
+        w_dir2 = self._w(i, 5)                   # 初速度方向第 2 维
+        w_speed = self._w(i, 6)                  # 初速度大小
+        w_rot0 = self._w(i, 7)                   # 初始自转角
+        w_rotv = self._w(i, 8)                   # 自转角速度
 
+        w0 = w_life
         life = self.life + self.life_var * (2.0 * w0 - 1.0)
         life = max(life, 0.05)
 
         # 发射点
-        if sub.emitter_type == "box" and (self.box_half_x or self.box_half_y):
-            wx = self._w(i, 1)
-            wy = self._w(i, 2)
-            px = (2.0 * wx - 1.0) * self.box_half_x
-            py = (2.0 * wy - 1.0) * self.box_half_y
-            pz = 0.0
+        if sub.emitter_type == "box" and (self.box_half_x or self.box_half_y or self.box_half_z):
+            px = (2.0 * w_pos1 - 1.0) * self.box_half_x
+            py = (2.0 * w_pos2 - 1.0) * self.box_half_y
+            pz = (2.0 * w_pos3 - 1.0) * self.box_half_z
         elif sub.emitter_type == "sphere" and self.sphere_r > 0.0:
             # 球面点：半径 ± 方差，yaw/pitch 在给定范围内取（与引擎行为近似）
-            r = max(self.sphere_r + self.sphere_r_var * (2.0 * self._w(i, 1) - 1.0), 0.0)
-            sy = self.sphere_yaw[0] + self.sphere_yaw[1] * (2.0 * self._w(i, 2) - 1.0)
-            sp = self.sphere_pitch[0] + self.sphere_pitch[1] * (2.0 * self._w(i, 3) - 1.0)
+            r = max(self.sphere_r + self.sphere_r_var * (2.0 * w_pos1 - 1.0), 0.0)
+            sy = self.sphere_yaw[0] + self.sphere_yaw[1] * (2.0 * w_pos2 - 1.0)
+            sp = self.sphere_pitch[0] + self.sphere_pitch[1] * (2.0 * w_pos3 - 1.0)
             d = sph_to_dir(sp, sy)
             px = d[0] * r
             py = d[1] * r
@@ -163,13 +259,13 @@ class SubsystemSim:
         pz += pos0[2]
 
         # 初速度方向
-        p = self.pitch[0] + self.pitch[1] * (2.0 * self._w(i, 3) - 1.0)
-        y = self.yaw[0] + self.yaw[1] * (2.0 * self._w(i, 4) - 1.0)
+        p = self.pitch[0] + self.pitch[1] * (2.0 * w_dir1 - 1.0)
+        y = self.yaw[0] + self.yaw[1] * (2.0 * w_dir2 - 1.0)
         d = sph_to_dir(p, y)
-        v = self.vel + self.vel_var * (2.0 * self._w(i, 5) - 1.0)
+        v = self.vel + self.vel_var * (2.0 * w_speed - 1.0)
 
-        ang0 = sub.rotation[0] + sub.rotation[1] * (2.0 * self._w(i, 6) - 1.0)
-        angvel = sub.rotation_speed[0] + sub.rotation_speed[1] * (2.0 * self._w(i, 7) - 1.0)
+        ang0 = sub.rotation[0] + sub.rotation[1] * (2.0 * w_rot0 - 1.0)
+        angvel = sub.rotation_speed[0] + sub.rotation_speed[1] * (2.0 * w_rotv - 1.0)
 
         self.particles.append([t, life, px, py, pz, d[0] * v, d[1] * v, d[2] * v, angvel, ang0, w0])
 
@@ -222,29 +318,44 @@ class SubsystemSim:
     # ---- 主推进 ----
 
     def advance(self, t_target):
-        """把子系统状态推进到绝对时间 t_target（秒）。"""
+        """把子系统状态推进到绝对时间 t_target（秒）。
+
+        用「绝对子步网格」保证与调用路径无关：时间轴上按 SUBSTEP 划出固定网格，
+        状态只由已执行的整数子步号 n 决定，时间取 n * SUBSTEP。
+
+        这样一次跳帧（advance(8.0)）与逐帧擦洗（advance(1/60) 反复调用）只要到达
+        同一个 n，状态就逐位相同。反之若按「本次 dt 切若干等分子步」推进，子步
+        长度与浮点累加轨迹都会随调用方式变化——实测同一系统同一时刻，跳帧与逐帧
+        会得出不同粒子数（Glow_flare 9 vs 10 颗），抽查 25 个系统 × 3 个时间点有
+        24 组对不上。预览里表现为「擦洗到同一帧，画面却和上次不一样」。
+        """
         if t_target < self.t:
             self.reset()
-        t0 = self.t
-        dt = t_target - t0
-        if dt <= 0.0:
+        # 目标子步号。钳到 MAX_PREVIEW_SECONDS：预览时间轴不会超过它，超出的
+        # 擦洗（用户把帧号拖到很远处）没必要真算几万个子步，钳制对所有路径一致，
+        # 因此不破坏确定性。
+        n_cap = int(MAX_PREVIEW_SECONDS / SUBSTEP)
+        n_target = min(int(math.floor(t_target / SUBSTEP + 1e-9)), n_cap)
+        if n_target <= self.n_sub:
             return
 
-        steps = min(int(dt / SUBSTEP) + 1, MAX_SUBSTEPS)
-        h = dt / steps
         fric = self._friction_k()
 
-        for _ in range(steps):
-            t_now = self.t
-            # 发射窗口
-            if self.rate > 0.0 and t_now >= self.start and (self.duration < 0.0 or t_now < self.start + self.duration):
-                self.acc += self.rate * h
-                while self.acc >= 1.0 and len(self.particles) < self.sub.max_amount:
-                    self.acc -= 1.0
-                    self._spawn(t_now)
-            else:
-                self.acc = 0.0
-            # 积分
+        # 一直推进到目标子步号。不做「单次调用步数上限」：那会让长跳停在半路，
+        # 反而破坏「到达同一时刻状态相同」的前提。工作量的上界由 n_cap 保证。
+        while self.n_sub < n_target:
+            self.n_sub += 1
+            t_now = self.n_sub * SUBSTEP
+            # 发射：按「绝对时间应发射总数」补齐，不用累加器。
+            # 累加器写法（acc += rate*h）会让发射数依赖子步划分，同一目标时刻
+            # 两条路径会得出不同结果（实测差 0.001，导致按扫描选中的帧在真实
+            # 刷新下是空的）。从 t_now 直接算应有几颗后，发射排程与路径无关。
+            n_expect = self._expected_spawns(t_now)
+            while (self.spawn_count < n_expect
+                   and len(self.particles) < self.sub.max_amount):
+                self._spawn(t_now)
+            # 积分（子步长恒为 SUBSTEP，与调用路径无关）
+            h = SUBSTEP
             alive = self.particles
             idx = 0
             for p in alive:
@@ -266,7 +377,7 @@ class SubsystemSim:
                 alive[idx] = p
                 idx += 1
             del alive[idx:]
-            self.t = t_now + h
+            self.t = t_now
 
         # 窗口后清理：无新粒子且全部到寿
         if self.duration >= 0.0 and t_target > self.start + self.duration + self.life:
@@ -339,9 +450,24 @@ class SystemSim:
         return [(s.name, s.snapshot()) for s in self.subs if self.enabled.get(s.name, True)]
 
     def total_duration(self):
-        """建议预览时长（秒）：所有窗口与寿命的最大和。"""
-        d = 1.0
+        """建议预览时长（秒）：保证每个子系统都能看到粒子。
+
+        取值要同时满足两件事，取较大者：
+        - 发射窗口结束 + 最后一颗粒子的寿命；
+        - 第一颗粒子出生（start + 1/emission）+ 它的寿命。低发射速率的子系统
+          （实测 nomad_front_end_light emission=0.25，即 4 秒才一颗）如果只按
+          前者算，窗口是无限长却只给 1 秒时间轴，预览里永远一颗粒子都没有。
+        """
+        d = 0.0
         for s in self.subs:
-            end = s.start + (s.duration if s.duration > 0 else 0.0) + s.life + s.life_var
+            window_end = s.start + (s.duration if s.duration > 0 else 0.0)
+            end = window_end + s.life + s.life_var
+            if s.rate > 0.0:
+                first_spawn = s.start + 1.0 / s.rate
+                # 无限窗口：至少等到第一颗出生并活完
+                if s.duration < 0.0:
+                    end = max(end, first_spawn + s.life + s.life_var)
+                else:
+                    end = max(end, min(first_spawn, window_end) + s.life + s.life_var)
             d = max(d, end)
-        return d
+        return max(1.0, min(d, MAX_PREVIEW_SECONDS))
