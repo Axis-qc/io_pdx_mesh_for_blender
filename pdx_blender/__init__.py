@@ -20,9 +20,11 @@ from bpy.types import PropertyGroup  # type: ignore
 
 from .. import ENGINE_SETTINGS, IO_PDX_LOG, IO_PDX_SETTINGS
 from . import blender_import_export, blender_ui
+from .. import pdx_particles
 
 importlib.reload(blender_import_export)
 importlib.reload(blender_ui)
+importlib.reload(pdx_particles)
 
 
 """ ====================================================================================================================
@@ -115,8 +117,12 @@ def register():
     bpy.types.Scene.io_pdx_group = PointerProperty(type=PDXObject_Group)
     bpy.types.Scene.io_pdx_export = PointerProperty(type=PDXExport_settings)
 
+    # particle preview subpackage
+    pdx_particles.register()
+
 
 def unregister():
+    pdx_particles.unregister()
     for cls in classes:
         bpy.utils.unregister_class(cls)
 

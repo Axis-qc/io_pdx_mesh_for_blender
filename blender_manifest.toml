@@ -6,12 +6,12 @@ name = "IO PDX Mesh"
 maintainer = "ross-g"
 tagline = "Import/Export Paradox asset files for the Clausewitz game engine"
 type = "add-on"
-version = "0.91.3"
+version = "0.92.0"
 blender_version_min = "4.2.0"
 license = ["SPDX:GPL-3.0-or-later"]
 
 # Optional
-tags = ["Import-Export", "Mesh", "Animation"]
+tags = ["Import-Export", "Mesh", "Animation", "Particles"]
 website = "https://github.com/Axis-qc/io_pdx_mesh_for_blender"
 current_git_tag = 0.91
 blender_support_min = [3, 6, 4]
