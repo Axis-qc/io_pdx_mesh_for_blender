@@ -20,12 +20,130 @@ import math
 
 import bpy  # type: ignore
 
+# numpy 是可选加速项：Blender 自带 numpy，但插件被裁剪过的环境可能没有。
+# 缺失时退回纯 Python 实现（结果完全一致，只是慢），不影响可用性。
+try:
+    import numpy as _NP  # type: ignore
+except Exception:  # noqa: BLE001
+    _NP = None
+
 from .parser import sph_to_dir
 from .simulator import PARTICLE_FPS, SystemSim
 
 IO_LOG = logging.getLogger("io_pdx.particles")
 
 MAX_QUADS = 4000
+
+# 面片四个角的 (su, sv)，与纯 Python 版保持同序，避免顶点绕序变化
+_CORNERS = ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0))
+_UV_CORNERS = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+
+
+def _build_arrays_py(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
+    """纯 Python 组数组（numpy 不可用时的回退，逻辑与向量化版逐项对应）。"""
+    coords = [0.0] * (cap * 12)
+    colors = [0.0] * (cap * 16)
+    uvs = [0.0] * (cap * 8)
+    for i in range(n):
+        x, y, z, size, r, g, b, a, ang, cell = snap[i]
+        c, s = math.cos(ang), math.sin(ang)
+        r2 = (right[0] * c - up[0] * s, right[1] * c - up[1] * s, right[2] * c - up[2] * s)
+        u2 = (right[0] * s + up[0] * c, right[1] * s + up[1] * c, right[2] * s + up[2] * c)
+        # 1 局部单位 = 1 Blender 米：size 直读，size=1 即 1x1 标准面片
+        half = size * 0.5
+        bx, by, bz = x, -z, y
+        vbase = i * 12
+        for (su, sv), k in zip(_CORNERS, range(4)):
+            o = vbase + k * 3
+            coords[o] = bx + (r2[0] * su + u2[0] * sv) * half
+            coords[o + 1] = by + (r2[1] * su + u2[1] * sv) * half
+            coords[o + 2] = bz + (r2[2] * su + u2[2] * sv) * half
+        cbase = i * 16
+        for k in range(4):
+            o = cbase + k * 4
+            colors[o] = r
+            colors[o + 1] = g
+            colors[o + 2] = b
+            colors[o + 3] = a
+        ubase = i * 8
+        if do_sheet and cell >= 0:
+            cx = cell % sheet_x
+            cy = cell // sheet_x
+            u0 = cx / sheet_x
+            v0 = 1.0 - (cy + 1) / sheet_y
+            du = 1.0 / sheet_x
+            dv = 1.0 / sheet_y
+        else:
+            u0, v0, du, dv = 0.0, 0.0, 1.0, 1.0
+        for (su, sv), k in zip(_UV_CORNERS, range(4)):
+            o = ubase + k * 2
+            uvs[o] = u0 + su * du
+            uvs[o + 1] = v0 + sv * dv
+    return coords, colors, uvs
+
+
+def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
+    """numpy 向量化组数组。
+
+    与纯 Python 版逐位等价（perf-tester 对照实测 maxdiff=0.00e+00）。改动只针对
+    「怎么拼数组」：原先是每颗粒子跑一次 Python 循环写 3 个 list，粒子上万时这
+    一步比 foreach_set 本身还贵。
+    """
+    np = _NP
+    # snap 是 list[tuple]，转成 (n,10) 一次成型；多余容量留 0（与纯 Python 版
+    # 初始化为 0 的语义一致——mesh 顶点数固定为 cap，未用到的槽位保持原值/0）。
+    arr = np.array(snap[:n], dtype=np.float64).reshape(n, 10)
+    px, py, pz = arr[:, 0], arr[:, 1], arr[:, 2]
+    size = arr[:, 3]
+    r, g, b, a = arr[:, 4], arr[:, 5], arr[:, 6], arr[:, 7]
+    ang, cell = arr[:, 8], arr[:, 9]
+
+    coords = np.zeros((cap, 4, 3), dtype=np.float32)
+    colors = np.zeros((cap, 4, 4), dtype=np.float32)
+    uvs = np.zeros((cap, 4, 2), dtype=np.float32)
+
+    c = np.cos(ang)
+    s = np.sin(ang)
+    R = np.asarray(right, dtype=np.float64)
+    U = np.asarray(up, dtype=np.float64)
+    r2 = R[None, :] * c[:, None] - U[None, :] * s[:, None]     # (n,3)
+    u2 = R[None, :] * s[:, None] + U[None, :] * c[:, None]     # (n,3)
+
+    half = size * 0.5
+    # 坐标系换算：局部 y 轴取 -z，局部 z 轴取 y（与纯 Python 版一致）
+    base = np.stack([px, -pz, py], axis=1)                      # (n,3)
+    su = np.asarray([c0 for c0, _ in _CORNERS], dtype=np.float64)[None, :, None]
+    sv = np.asarray([c1 for _, c1 in _CORNERS], dtype=np.float64)[None, :, None]
+    off = (r2[:, None, :] * su + u2[:, None, :] * sv) * half[:, None, None]
+    coords[:n] = base[:, None, :] + off
+
+    colors[:n, :, 0] = r[:, None]
+    colors[:n, :, 1] = g[:, None]
+    colors[:n, :, 2] = b[:, None]
+    colors[:n, :, 3] = a[:, None]
+
+    if do_sheet:
+        cell_i = cell.astype(np.int64)
+        ok = cell_i >= 0
+        safe = np.where(ok, cell_i, 0)
+        cx = safe % sheet_x
+        cy = safe // sheet_x
+        u0 = np.where(ok, cx / float(sheet_x), 0.0)
+        v0 = np.where(ok, 1.0 - (cy + 1) / float(sheet_y), 0.0)
+        du = np.where(ok, 1.0 / float(sheet_x), 1.0)
+        dv = np.where(ok, 1.0 / float(sheet_y), 1.0)
+    else:
+        u0 = np.zeros(n, dtype=np.float64)
+        v0 = np.zeros(n, dtype=np.float64)
+        du = np.ones(n, dtype=np.float64)
+        dv = np.ones(n, dtype=np.float64)
+
+    usu = np.asarray([u for u, _ in _UV_CORNERS], dtype=np.float64)[None, :]
+    vsv = np.asarray([v for _, v in _UV_CORNERS], dtype=np.float64)[None, :]
+    uvs[:n, :, 0] = u0[:, None] + usu * du[:, None]
+    uvs[:n, :, 1] = v0[:, None] + vsv * dv[:, None]
+
+    return coords.reshape(-1), colors.reshape(-1), uvs.reshape(-1)
 
 
 def _set_input(node, names, value):
@@ -216,43 +334,16 @@ class SubsystemPreview:
         uvs = [0.0] * (cap * 8)
         n = min(len(snap), cap)
 
-        for i in range(n):
-            x, y, z, size, r, g, b, a, ang, cell = snap[i]
-            c, s = math.cos(ang), math.sin(ang)
-            r2 = (right[0] * c - up[0] * s, right[1] * c - up[1] * s, right[2] * c - up[2] * s)
-            u2 = (right[0] * s + up[0] * c, right[1] * s + up[1] * c, right[2] * s + up[2] * c)
-            # 1 局部单位 = 1 Blender 米：size 直读，size=1 即 1x1 标准面片
-            half = size * 0.5
-            bx = x
-            by = -z
-            bz = y
-            vbase = i * 12
-            for (su, sv), k in (((-1.0, -1.0), 0), ((1.0, -1.0), 1), ((1.0, 1.0), 2), ((-1.0, 1.0), 3)):
-                o = vbase + k * 3
-                coords[o] = bx + (r2[0] * su + u2[0] * sv) * half
-                coords[o + 1] = by + (r2[1] * su + u2[1] * sv) * half
-                coords[o + 2] = bz + (r2[2] * su + u2[2] * sv) * half
-            cbase = i * 16
-            for k in range(4):
-                o = cbase + k * 4
-                colors[o] = r
-                colors[o + 1] = g
-                colors[o + 2] = b
-                colors[o + 3] = a
-            ubase = i * 8
-            if do_sheet and cell >= 0:
-                cx = cell % sheet_x
-                cy = cell // sheet_x
-                u0 = cx / sheet_x
-                v0 = 1.0 - (cy + 1) / sheet_y
-                du = 1.0 / sheet_x
-                dv = 1.0 / sheet_y
-            else:
-                u0, v0, du, dv = 0.0, 0.0, 1.0, 1.0
-            for (su, sv), k in (((0.0, 0.0), 0), ((1.0, 0.0), 1), ((1.0, 1.0), 2), ((0.0, 1.0), 3)):
-                o = ubase + k * 2
-                uvs[o] = u0 + su * du
-                uvs[o + 1] = v0 + sv * dv
+        # 组数组：numpy 向量化，无 numpy 时回退纯 Python。
+        # 实测（perf-tester，10011 粒子，f=3601）写网格占 refresh 的 77%，
+        # 而写网格里绝大部分时间花在「逐粒子拼 coords/colors/uvs 三个 list」上，
+        # 不是 foreach_set 本身。10007 粒子的系统向量化后模拟+组数组合计约 24×。
+        if _NP is not None and n > 0:
+            coords, colors, uvs = _build_arrays_np(
+                snap, n, cap, right, up, sheet_x, sheet_y, do_sheet)
+        else:
+            coords, colors, uvs = _build_arrays_py(
+                snap, n, cap, right, up, sheet_x, sheet_y, do_sheet)
 
         mesh = self.mesh
         mesh.vertices.foreach_set("co", coords)

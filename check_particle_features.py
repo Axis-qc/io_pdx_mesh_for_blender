@@ -404,6 +404,114 @@ if fixed_pick:
 else:
     check("找到 billboard=no 样本", False)
 
+print()
+print("=" * 78)
+print("B4. 发射体旋转 emitter_yaw / emitter_pitch")
+print("=" * 78)
+
+# 真值样本：fallen_empire_*_colossus_energy_effect 把三个球按等边三角形摆在 XZ
+# 平面，emitter_yaw 恰好等于各球「朝心方向」的方位角（ball_1 -120.96→-120、
+# ball_2 0.00→0、ball_3 120.96→120），velocity 恒为 -100。这是唯一能把
+# 「emitter 系基准是 +X」证死的样本，故用它当断言。
+colossus = [n for n in sorted(lib.systems) if "colossus_energy_effect" in n]
+check("找到 colossus 真值样本", bool(colossus), "{0} 个".format(len(colossus)))
+
+if colossus:
+    nmm = colossus[0]
+    sim = S.SystemSim(lib.systems[nmm])
+    ok = tot = 0
+    detail = []
+    for want in ("ball_1", "ball_2", "ball_3"):
+        st = next((s for s in sim.subs if s.name == want), None)
+        if st is None:
+            continue
+        for i in range(8):
+            st.spawn_count = i
+            st._spawn(0.0)
+        if not st.particles:
+            continue
+        p = st.particles[0]
+        pos = (p[2], p[3], p[4])
+        vel = (p[5], p[6], p[7])
+        Lc = math.hypot(pos[0], pos[2]) or 1e-9
+        outward = (pos[0] / Lc, 0.0, pos[2] / Lc)
+        Lv = math.sqrt(sum(c * c for c in vel)) or 1e-9
+        ang = math.degrees(math.acos(max(-1.0, min(1.0,
+            sum(vel[i] * outward[i] for i in range(3)) / Lv))))
+        tot += 1
+        if ang < 1.5:
+            ok += 1
+        detail.append("{0}={1:.2f}度".format(want, ang))
+    print("  样本: {0}".format(nmm))
+    print("    三球速度与径向朝外夹角: {0}".format(", ".join(detail)))
+    check("colossus 三球全部径向朝外（emitter 系基准为 +X）", ok == tot and tot == 3,
+          "{0}/{1}".format(ok, tot))
+
+    # 显式写 0 必须等价于「转到 +X」，不能当作不旋转
+    yaw0 = [sb for sy in lib.systems.values() for sb in sy.subsystems
+            if sb.has_emitter_rot and not (sb.emitter_yaw[0] or sb.emitter_pitch[0])]
+    check("存在显式写 0 的子系统（与「没写」区分开）", len(yaw0) > 0,
+          "{0} 个".format(len(yaw0)))
+    nokey = [sb for sy in lib.systems.values() for sb in sy.subsystems
+             if not sb.has_emitter_rot]
+    check("存在完全没写 emitter 键的子系统", len(nokey) > 0,
+          "{0} 个".format(len(nokey)))
+
+    # 带方差的发射体必须逐粒子取角。
+    # 曾有个不可达分支 `m is None and self.emit_var`：__init__ 的条件是
+    # `has_emitter_rot or emit_var`，emit_var 为真时矩阵已建好，于是 m is None
+    # 蕴含 not emit_var，该分支永不进入，9 个带方差的子系统方差被静默忽略。
+    var_subs = [(sy, sb) for sy in lib.systems.values() for sb in sy.subsystems
+                if (sb.emitter_yaw[1] or sb.emitter_pitch[1])]
+    check("存在带方差的发射体样本", len(var_subs) > 0, "{0} 个".format(len(var_subs)))
+    if var_subs:
+        # 方差作用于「形状偏移」与「初速度方向」的旋转，两者取其中非退化的那个来验：
+        # 烟雾类粒子 velocity=0，只能看位置散开；有的发射体没有体积，就看方向。
+        checked_any = False
+        for sy, sb in var_subs:
+            st = next((s for s in S.SystemSim(sy).subs if s.sub.name == sb.name), None)
+            if st is None:
+                continue
+            N = 40
+            for i in range(N):
+                st.spawn_count = i
+                st._spawn(0.0)
+            if len(st.particles) < 2:
+                continue
+            dirs = set()
+            poss = set()
+            for p in st.particles:
+                v = (p[5], p[6], p[7])
+                L = math.sqrt(sum(c * c for c in v))
+                if L > 1e-9:
+                    dirs.add((round(v[0] / L, 3), round(v[1] / L, 3), round(v[2] / L, 3)))
+                poss.add((round(p[2], 3), round(p[3], 3), round(p[4], 3)))
+            spread = max(len(dirs), len(poss))
+            print("  样本: {0} / {1}".format(sy.name[:34], sb.name))
+            print("    方差 yaw={0} pitch={1}".format(sb.emitter_yaw, sb.emitter_pitch))
+            print("    {0} 颗粒子 -> {1} 个不同方向, {2} 个不同位置".format(
+                N, len(dirs), len(poss)))
+            if spread > 1:
+                check("带方差的发射体逐粒子散开（非单一方向/位置）", True,
+                      "方向 {0} / 位置 {1}".format(len(dirs), len(poss)))
+                checked_any = True
+                break
+        if not checked_any:
+            check("带方差的发射体逐粒子散开（非单一方向/位置）", False,
+                  "所有带方差样本都退化")
+
+    # 没写键的必须保持原 +Y 基准（不受影响）
+    kept = 0
+    tot2 = 0
+    for sy in lib.systems.values():
+        for s in S.SystemSim(sy).subs:
+            if not s.sub.has_emitter_rot:
+                tot2 += 1
+                if s.emit_rot is None:
+                    kept += 1
+    check("没写键的子系统不被旋转（保持 +Y）", kept == tot2,
+          "{0}/{1}".format(kept, tot2))
+
 bpy.data.objects.remove(cam, do_unlink=True)
 
 print()

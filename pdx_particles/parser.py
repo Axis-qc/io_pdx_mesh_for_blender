@@ -292,6 +292,7 @@ class PdxSubsystem:
     __slots__ = (
         "name", "max_amount", "emitter_type", "box_x", "box_y", "box_z",
         "sphere_radius", "sphere_yaw", "sphere_pitch",
+        "emitter_yaw", "emitter_pitch", "has_emitter_rot",
         "texture_file", "texture_shader", "sheet_x", "sheet_y", "sheet_anim", "sheet_loop",
         "color", "alpha", "position",
         "start", "duration", "velocity_pitch", "velocity_yaw", "velocity",
@@ -315,6 +316,19 @@ class PdxSubsystem:
         self.sphere_radius = _pair(node.child("sphere_emitter_radius"))
         self.sphere_yaw = _pair(node.child("sphere_emitter_yaw"))
         self.sphere_pitch = _pair(node.child("sphere_emitter_pitch"))
+        # emitter_yaw / emitter_pitch：整个发射体相对子系统原点的旋转。
+        # 这两个键原先在 known 集合里，所以既不生效也不进 unknown_keys——属于
+        # 「静默丢弃」，比未解析更难发现（没有任何诊断痕迹）。
+        # 用量（口径：仅原版，不含 mod）：写了键 2790，其中显式写 0 有 2376、
+        # 非零 414；完全没写 2332。含 mod 时分别为 2801 / 2387 / 414 / 2369。
+        #
+        # has_emitter_rot 区分「显式写 0」与「根本没写」：实测两者语义不同
+        # （见 simulator._emit_rot_matrix 的推导），必须分开记录。
+        ey_node = node.child("emitter_yaw")
+        ep_node = node.child("emitter_pitch")
+        self.emitter_yaw = _pair(ey_node)
+        self.emitter_pitch = _pair(ep_node)
+        self.has_emitter_rot = ey_node is not None or ep_node is not None
         tex = node.child("texture")
         if tex is not None and tex.value is None:
             f = tex.child("file")

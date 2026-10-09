@@ -36,6 +36,82 @@ def _frac(x):
     return x - math.floor(x)
 
 
+def _emit_dir(pitch_deg, yaw_deg):
+    """发射体朝向对应的单位方向（emitter 系）。
+
+    有两套互不相同的球坐标约定，不能混用：
+    - velocity_* / sphere_emitter_*：pitch 自 **+Y 轴**量（sph_to_dir），pitch=0
+      落在极点、此时 yaw 完全退化；
+    - emitter_*：pitch 是水平面仰角、yaw 是 XZ 平面方位角，基准方向为 **+X**。
+
+    依据是 fallen_empire_01_colossus_energy_effect：三个球按等边三角形摆在 XZ
+    平面，`emitter_yaw` 恰好等于「位置角 - 180」（ball_1 位置角 59.04→yaw -120；
+    ball_2 位置角 180→yaw 0；ball_3 位置角 -59.04→yaw 120），而 velocity 恒为
+    -100。按下式取 d 再乘 -100，三球速度全部沿径向朝外（夹角 0.96°/0°/0.96°，
+    3/3 通过）。若改用 sph_to_dir，ball_2 会得到竖直向下的 (0,-100,0)，与另两球
+    的径向不一致——差异恰好只出现在 yaw=0 那个球上，正是基准方向不同所致。
+
+        d = (cos p·cos y, sin p, cos p·sin y)
+
+    p=0 水平、p=90 朝 +Y、p=270 与 -90 都朝 -Y：原版取值里确实同时出现 270 与
+    -90，且存在负值（-20），说明它是可绕圈的仰角而非 0..180 的极角。
+    """
+    p = math.radians(pitch_deg)
+    y = math.radians(yaw_deg)
+    cp = math.cos(p)
+    return (cp * math.cos(y), math.sin(p), cp * math.sin(y))
+
+
+def _axis_angle_matrix(axis, angle_rad):
+    """绕任意轴旋转的 3x3 矩阵（罗德里格斯公式），axis 须为单位向量。"""
+    x, y, z = axis
+    c = math.cos(angle_rad)
+    s = math.sin(angle_rad)
+    t = 1.0 - c
+    return (
+        (t * x * x + c, t * x * y - s * z, t * x * z + s * y),
+        (t * x * y + s * z, t * y * y + c, t * y * z - s * x),
+        (t * x * z - s * y, t * y * z + s * x, t * z * z + c),
+    )
+
+
+def _emit_rot_matrix(pitch_deg, yaw_deg):
+    """发射体旋转矩阵：把代码里的基准方向 **+Y** 转到 _emit_dir(pitch, yaw)。
+
+    基准必须是 +Y 而不是 +X：被旋转的对象是初速度方向，而本文件算初速度方向用的
+    是 sph_to_dir(velocity_pitch, velocity_yaw)，velocity 角为 0 时它给出 +Y。
+    若把矩阵写成「+X → d」，作用到 +Y 上会得到第三个方向，三个球全错（实测
+    0/3，速度全塌成 (0,-100,0)）；写成「+Y → d」时两个显式写了 yaw 的球精确吻合
+    （径向夹角 0.96°/0.96°）。
+
+    取绕轴 (Y × d) 转 Y 与 d 夹角这一支（最短路径）。
+    注意 R(pitch=0, yaw=0) **不是**单位阵：_emit_dir(0,0)=+X，而基准是 +Y，所以它把
+    +Y 转到 +X。单位阵出现在 pitch=90 那类「d 与基准 +Y 同向」的角度。
+    （这条曾被写成「yaw=pitch=0 时退化为单位阵」，与实现不符，已更正。）
+    """
+    d = _emit_dir(pitch_deg, yaw_deg)
+    dot = max(-1.0, min(1.0, d[1]))          # d · Y
+    ang = math.acos(dot)
+    if ang < 1e-12:
+        return ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    # axis = Y × d
+    ax = (1.0 * d[2] - 0.0 * d[1], 0.0 * d[0] - 0.0 * d[2], 0.0 * d[1] - 1.0 * d[0])
+    ln = math.sqrt(ax[0] ** 2 + ax[1] ** 2 + ax[2] ** 2)
+    if ln < 1e-12:
+        # d 与 Y 对径（pitch=±90 且 cos p=0 之外的退化），绕 X 转 180
+        return ((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0))
+    axis = (ax[0] / ln, ax[1] / ln, ax[2] / ln)
+    return _axis_angle_matrix(axis, ang)
+
+
+def _rot_apply(m, v):
+    """3x3 矩阵乘列向量。"""
+    x, y, z = v
+    return (m[0][0] * x + m[0][1] * y + m[0][2] * z,
+            m[1][0] * x + m[1][1] * y + m[1][2] * z,
+            m[2][0] * x + m[2][1] * y + m[2][2] * z)
+
+
 # 各维用的互质基数（Halton 序列）。维度顺序固定，改动会改变既有回放结果。
 # 至少要覆盖 _spawn 用到的全部维度（0..15）且互不相同：一旦两维取到同一个
 # 基数，它们就变成同一个数，分布会重新退化。
@@ -146,6 +222,26 @@ class SubsystemSim:
         self.sphere_yaw = sub.sphere_yaw
         self.sphere_pitch = sub.sphere_pitch
 
+        # 发射体朝向：整个局部坐标系绕原点旋转，形状偏移与初速度方向一起转。
+        # 原先 emitter_yaw/emitter_pitch 在 parser 的 known 集合里但从未被读取，
+        # 既不生效也无诊断（静默丢弃）。原版 414 个子系统写非零值、2376 个显式
+        # 写 0、2332 个完全没写。
+        #
+        # 关键：必须区分「显式写 0」与「没写」。实测证据
+        # （arkship_01_exhaust_line_moving / fire_flare，position=(-15,0,0)、
+        # velocity=-20）：把它放在 -X 侧再给负速度，物理上就是朝 -X 向后喷；
+        # 若把「写 0」当作不旋转，尾焰会笔直朝下（(0,-20,0)），不合理。
+        # 同一批 175 个样本里，读法「写 0 → +X」全部得到水平方向，另一读法有
+        # 54 个笔直朝上。colossus 的 ball_2（position=(-22,0,0)）同理：只有把
+        # 写 0 解释为 +X，三球才全部径向（0.96°/0.00°/0.96°），否则 ball_2 差 90°。
+        # 故：写了键就旋转（0 → +X 方向），没写则保持代码原有的 +Y 基准不动。
+        self.emit_yaw = sub.emitter_yaw
+        self.emit_pitch = sub.emitter_pitch
+        self.emit_rot = None
+        self.emit_var = bool(self.emit_yaw[1] or self.emit_pitch[1])
+        if sub.has_emitter_rot or self.emit_var:
+            self.emit_rot = _emit_rot_matrix(self.emit_pitch[0], self.emit_yaw[0])
+
         # 运行状态
         self.reset()
 
@@ -253,16 +349,40 @@ class SubsystemSim:
             pz = d[2] * r
         else:
             px = py = pz = 0.0
-        pos0 = sub.position
-        px += pos0[0]
-        py += pos0[1]
-        pz += pos0[2]
 
         # 初速度方向
         p = self.pitch[0] + self.pitch[1] * (2.0 * w_dir1 - 1.0)
         y = self.yaw[0] + self.yaw[1] * (2.0 * w_dir2 - 1.0)
         d = sph_to_dir(p, y)
         v = self.vel + self.vel_var * (2.0 * w_speed - 1.0)
+
+        # 发射体朝向：旋转「形状偏移」与「出射方向」两样，position 不动。
+        # position 是设计者摆放发射体的位置，转它会让发射体离开原位——例如
+        # position=(0,6,12) 配 emitter_yaw=180，若连 position 一起转就变成
+        # (0,6,-12)，等于把发射体挪走，而设计者本可以直接写那个坐标。
+        # 反过来，只转形状与方向才解释得通：point 发射器没有体积，它写非零
+        # emitter_yaw 仍有效果（cybernetic_01_ship_exhaust 的 180 让尾焰反向），
+        # 这点只能由「方向被旋转」满足。
+        # 有方差时逐粒子取角，否则用构造期算好的固定矩阵。
+        # 注意判断顺序：不能写成 `m is None and self.emit_var`——__init__ 里的条件是
+        # `has_emitter_rot or emit_var`，只要 emit_var 为真就已经建好矩阵，于是
+        # `m is None` 蕴含 `not emit_var`，那个分支永远进不去（实测 9 个带方差的
+        # 子系统在 _spawn 期调用 _emit_rot_matrix 共 0 次，方差被静默忽略）。
+        # 现在直接按 emit_var 分支，方差才真正生效。
+        if self.emit_var:
+            ey = self.emit_yaw[0] + self.emit_yaw[1] * (2.0 * w_pos1 - 1.0)
+            ep = self.emit_pitch[0] + self.emit_pitch[1] * (2.0 * w_pos2 - 1.0)
+            m = _emit_rot_matrix(ep, ey) if (ey or ep) else self.emit_rot
+        else:
+            m = self.emit_rot
+        if m is not None:
+            px, py, pz = _rot_apply(m, (px, py, pz))
+            d = _rot_apply(m, d)
+
+        pos0 = sub.position
+        px += pos0[0]
+        py += pos0[1]
+        pz += pos0[2]
 
         ang0 = sub.rotation[0] + sub.rotation[1] * (2.0 * w_rot0 - 1.0)
         angvel = sub.rotation_speed[0] + sub.rotation_speed[1] * (2.0 * w_rotv - 1.0)
