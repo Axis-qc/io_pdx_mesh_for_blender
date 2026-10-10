@@ -300,12 +300,21 @@ class PdxSubsystem:
         "rotation", "rotation_speed", "rotation_speed_pitch", "rotation_speed_yaw",
         "rotation_speed_roll", "emission_pulse_duration", "emission_pulse_silence", "mass",
         "force_refs", "billboard", "local_space", "trail", "invert", "hide", "sort",
-        "unknown_keys",
+        "children", "unknown_keys",
     )
 
     def __init__(self, node):
         nm = node.child("name")
         self.name = str(nm.value) if nm is not None and nm.value is not None else "<unnamed>"
+        # 嵌套的子子系统定义（childsystem = { ... }）。实测全库 15 处 / 9 个文件，
+        # 块内顶层键与 subsystem 完全同构（32 个键，unknown 残留 0），是一套完整的
+        # 子系统而非参数。当前**只解析并记录，不参与模拟与渲染**——原因：
+        #   · 真实视觉收益只有 1 处明显（infernal_red_giant_explosion 的 sparks_child，
+        #     峰值 +67 颗）；9 处边际；6 个星体文件因 hide=yes 增量恰为 0。
+        #   · 15 处的 slave_particles 全为 0，说明「挂到父粒子上」缺少数据支撑，
+        #     真做父子跟随是高风险低收益。
+        # 解析出来至少让它在面板上可见（消除静默丢弃），也为将来要做时留好入口。
+        self.children = [PdxSubsystem(c) for c in node.child_values("childsystem")]
         self.max_amount = int(_pair(node.child("max_amount"), 100.0)[0])
         et = node.child("emitter_type")
         self.emitter_type = str(et.value).strip('"') if et is not None and et.value is not None else "point"
@@ -405,6 +414,10 @@ class PdxSubsystem:
             "rotation_speed", "rotation_speed_pitch", "rotation_speed_yaw",
             "rotation_speed_roll", "emission_pulse_duration", "emission_pulse_silence",
             "mass", "force", "sort",
+            # childsystem 已解析成 children（见 __init__ 注释），不再算未知。
+            # particle_roll 全库仅 1 处（planet_lightning.asset，值 { 0 0 } 即无效果），
+            # 收进 known 是为了不再静默丢弃——真实现它是另一件事。
+            "childsystem", "particle_roll",
         }
         self.unknown_keys = {c.key for c in node.children if c.key not in known}
 
@@ -427,6 +440,18 @@ class PdxParticleSystem:
             self.forces[force.name] = force
         known = {"name", "subsystem", "animation", "force"}
         self.unknown_top = {c.key for c in node.children if c.key not in known}
+
+    def nested_subsystems(self):
+        """所有被解析但**不参与模拟/渲染**的嵌套子子系统（childsystem）。
+
+        供面板/日志做诊断用：至少让用户知道「这里还有 N 个嵌套子系统没画出来」，
+        而不是像以前那样完全静默。返回 [(宿主子系统名, 子子系统)]。
+        """
+        out = []
+        for sub in self.subsystems:
+            for child in getattr(sub, "children", ()):  # noqa: B009
+                out.append((sub.name, child))
+        return out
 
     # ---- 动画引用解析（R/G/B 命名约定：全系统通用或 '<通道>_<子系统名>'）----
 

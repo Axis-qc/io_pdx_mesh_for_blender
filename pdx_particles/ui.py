@@ -220,6 +220,7 @@ def _import_loaded(context, loaded, missing, library):
 
     max_end = 0.0
     total_n = 0
+    nested = []                      # 已解析但不渲染的嵌套子子系统，用于诊断提示
     for system, offset in loaded:
         try:
             preview = PreviewScene(system, library, time_offset=offset)
@@ -232,6 +233,10 @@ def _import_loaded(context, loaded, missing, library):
         entry.name = system.name
         entry.collection = preview.collection.name
         max_end = max(max_end, preview.sim.total_duration() + offset)
+        try:
+            nested.extend(system.nested_subsystems())
+        except Exception:  # noqa: BLE001
+            pass
 
     if not _ACTIVE:
         return False
@@ -271,6 +276,16 @@ def _import_loaded(context, loaded, missing, library):
         IO_PDX_LOG.warning(
             "particle preview: no particles at frame %s; scrub the timeline to see them",
             best_frame)
+
+    # 嵌套子子系统（childsystem）已解析但不参与渲染，这里给出显式提示，
+    # 避免「静默少画了一部分」这种最难排查的情况。
+    # 实测全库仅 15 处 / 9 个文件，且其中 6 个星体文件是 hide=yes（本就不显示）、
+    # 9 处为边际收益，故只诊断不实现。
+    for _nm, _child in nested:
+        IO_PDX_LOG.info(
+            "particle preview: '%s' has nested subsystem '%s' (max_amount=%s) "
+            "which is parsed but not rendered",
+            _nm, _child.name, _child.max_amount)
     return True
 
 
