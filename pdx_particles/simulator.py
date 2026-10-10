@@ -15,6 +15,11 @@ PDX particle simulator: deterministic, frame-scrub able integration.
 
 import math
 
+try:                      # numpy 可选：缺失时全部回退纯 Python 路径
+    import numpy as _NP
+except Exception:         # noqa: BLE001
+    _NP = None
+
 from .parser import sph_to_dir
 
 GOLDEN = 0.6180339887498949
@@ -30,6 +35,18 @@ PARTICLE_FPS = 60
 
 # 预览时长上限（秒）：防病态参数（极低 emission）拉出几万帧的时间轴。
 MAX_PREVIEW_SECONDS = 60.0
+
+# 回退重放的关键帧间隔（子步数）。时间轴往回拖时，不必从 0 重放全程：模拟是
+# 确定性的，状态完全由 (n_sub, spawn_count, particles) 决定，所以每隔这么多子步
+# 存一份状态快照，回退时从最近的一份往后重放即可。
+#
+# 原先 advance() 遇到 `t_target < self.t` 就 self.reset() 全量重放，实测代价：
+# 回退 1 帧（1200→1199）par_01(10010 粒子) 要 3931ms、magnetic_storm_2 要
+# 10993ms；1800→1799 更是 8149ms / 20292ms，而同帧重刷只要 32ms / 17ms。
+# 关键帧间隔取 240 子步（= 2 秒），单次回退最多重放 2 秒，代价从「秒级」降到
+# 「几十毫秒级」。间隔越小回退越快、内存越多；240 在本项目下每子系统最多存
+# 60/2 = 30 份，实测峰值子系统也就几千颗粒子，开销可忽略。
+CHECKPOINT_STRIDE = 240
 
 
 def _frac(x):
@@ -158,6 +175,70 @@ def _norm3(v):
     return (v[0] / l, v[1] / l, v[2] / l)
 
 
+# ---- 向量化力场（numpy 可选）----
+#
+# 逐位一致的前提已验证：numpy 的 sin/cos/sqrt 与 math 模块逐位相同
+# （20 万随机点 0 处差异，1200 子步累加后终点逐位相同，sha256 级别比对通过）。
+# 因此这里可以放心用 numpy，不会破坏「到达同一 n_sub 状态相同」的确定性契约。
+#
+# 只有当子系统带 point/turbulence 这类「逐粒子算很多次三角函数」的力场时才走
+# 向量化：实测无力场时向量化反而慢（每子步建数组的开销没人分摊）。
+_VEC_FORCE_TYPES = ("turbulence", "point")
+# 向量化有固定开销（每子步建数组），粒子太少时得不偿失。实测 1200 颗粒子有
+# turbulence 时 3.65x；无力场时不划算，故由 use_vec 一并把关。
+_VEC_MIN_PARTICLES = 64
+
+
+def _accel_vec(px, py, pz, forces, t_now):
+    """向量化版的力场累加，语义与 SubsystemSim._accel 一致。
+
+    px/py/pz 是 numpy 一维数组（位置分量）。返回 (ax, ay, az)。
+    加法次序与 Python 版严格保持一致，否则浮点结果会有末位差异。
+    """
+    np = _NP
+    ax = np.zeros_like(px)
+    ay = np.zeros_like(py)
+    az = np.zeros_like(pz)
+    for f in forces:
+        amt = f.amount
+        ftype = f.type
+        if ftype == "planar":
+            d = f.direction
+            ax = ax + amt * d[0]
+            ay = ay + amt * d[1]
+            az = az + amt * d[2]
+        elif ftype == "friction":
+            continue                      # 速度阻尼在积分里单独处理
+        elif ftype == "point":
+            rx = f.position[0] - px
+            ry = f.position[1] - py
+            rz = f.position[2] - pz
+            l = np.sqrt(rx * rx + ry * ry + rz * rz)
+            ok = l > _EPS
+            ls = np.where(ok, l, 1.0)     # 避免除零，结果由 ok 选回
+            ax = np.where(ok, ax - amt * rx / ls, ax)
+            ay = np.where(ok, ay - amt * ry / ls, ay)
+            az = np.where(ok, az - amt * rz / ls, az)
+        elif ftype in ("vortex", "spin"):
+            d = f.direction
+            ln = math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+            axis = (0.0, 1.0, 0.0) if ln < _EPS else (d[0] / ln, d[1] / ln, d[2] / ln)
+            rx = px - f.position[0]
+            ry = py - f.position[1]
+            rz = pz - f.position[2]
+            ax = ax + amt * (axis[1] * rz - axis[2] * ry)
+            ay = ay + amt * (axis[2] * rx - axis[0] * rz)
+            az = az + amt * (axis[0] * ry - axis[1] * rx)
+        elif ftype == "turbulence":
+            ax = ax + amt * (np.sin(1.7 * px + 2.3 * t_now)
+                             * np.cos(1.3 * py - 1.1 * t_now))
+            ay = ay + amt * (np.sin(2.1 * py + 1.9 * t_now)
+                             * np.cos(0.8 * pz + 2.7 * t_now))
+            az = az + amt * (np.sin(1.5 * pz - 2.0 * t_now)
+                             * np.cos(2.2 * px + 1.3 * t_now))
+    return ax, ay, az
+
+
 def _cross(a, b):
     return (
         a[1] * b[2] - a[2] * b[1],
@@ -184,6 +265,14 @@ class SubsystemSim:
         self.duration = sub.duration[0]   # -1 = 无限窗口
         self.life = max(sub.life[0], 0.001)
         self.life_var = sub.life[1]
+
+        # 脉冲发射：[工作时长, 静默时长]。两者都 >0 时发射按 工作->静默 循环，
+        # 其余情况视为持续发射。原版 107 个子系统用到（105 对 + 各 1 个落单），
+        # 原先只在 unknown_keys 里被丢弃，这些特效看起来是「一直喷」而不是脉冲。
+        pd = sub.emission_pulse_duration[0]
+        ps = sub.emission_pulse_silence[0]
+        self.pulse_period = (pd + ps) if (pd > 0.0 and ps > 0.0) else 0.0
+        self.pulse_on = pd if self.pulse_period > 0.0 else 0.0
 
         # 出生属性方差
         self.vel = sub.velocity[0]
@@ -222,6 +311,26 @@ class SubsystemSim:
         self.sphere_yaw = sub.sphere_yaw
         self.sphere_pitch = sub.sphere_pitch
 
+        # 是否走向量化积分：只有带 point/turbulence 力场（逐粒子大量三角函数）
+        # 时才划算。实测有 turbulence 时 3.65x，无力场时反而 0.82x（建数组的
+        # 开销没人分摊）。粒子太少时也不值得（固定开销占主导）。
+        self.use_vec = (_NP is not None
+                        and len(self.forces) > 0
+                        and any(f.type in _VEC_FORCE_TYPES for f in self.forces))
+
+        # 三轴自转：面片除屏幕内自转（rotation_speed）外，还可绕 pitch/yaw 两轴
+        # 翻转。原版 182 个子系统写了这三个键（pitch 75 / yaw 70 / roll 37），
+        # 原先只在 unknown_keys 被丢弃，面片姿态不动。
+        # 基角取 particle_pitch / particle_yaw（面片的初始朝向），速率取对应键。
+        self.pitch0 = sub.particle_pitch[0]
+        self.yaw0 = sub.particle_yaw[0]
+        self.pitch_speed = sub.rotation_speed_pitch[0] + sub.rotation_speed_pitch[1]
+        self.yaw_speed = sub.rotation_speed_yaw[0] + sub.rotation_speed_yaw[1]
+        # roll 轴的自转等价于屏幕内自转，与 rotation_speed 同义：实测 47 个有轴
+        # 自转的子系统里 roll 非零只有 4 个，且它们的 rotation_speed 全为 0，
+        # 所以直接并入屏幕内自转角速度，不另开通道。
+        self.roll_speed = sub.rotation_speed_roll[0] + sub.rotation_speed_roll[1]
+
         # 发射体朝向：整个局部坐标系绕原点旋转，形状偏移与初速度方向一起转。
         # 原先 emitter_yaw/emitter_pitch 在 parser 的 known 集合里但从未被读取，
         # 既不生效也无诊断（静默丢弃）。原版 414 个子系统写非零值、2376 个显式
@@ -257,7 +366,8 @@ class SubsystemSim:
         upto = t if self.duration < 0.0 else min(t, self.start + self.duration)
         if upto <= self.start:
             return 0
-        return int((upto - self.start) * self.rate)
+        span = upto - self.start
+        return int(self._active_span(span) * self.rate)
 
     def estimate_alive(self, t):
         """廉价估算 t 时刻的存活粒子数（O(1)，不做物理积分）。
@@ -278,14 +388,25 @@ class SubsystemSim:
         upto = t if self.duration < 0.0 else min(t, self.start + self.duration)
         if upto <= self.start:
             return 0.0
-        emitted = (upto - self.start) * self.rate
+        emitted = self._active_span(upto - self.start) * self.rate
         # 出生早于 (t - 平均寿命) 的那批，按平均寿命算已到寿
         avg_life = max(self.life, 0.001)
         cutoff = t - avg_life
         expired = 0.0 if cutoff <= self.start else (
-            (min(cutoff, upto) - self.start) * self.rate)
+            self._active_span(min(cutoff, upto) - self.start) * self.rate)
         alive = emitted - expired
         return max(0.0, min(alive, self.sub.max_amount))
+
+    def _active_span(self, span):
+        """把「从 start 起算的时长」折算成实际发射时长（脉冲时只算工作相）。
+
+        与 _expected_spawns 用同一套折算，保证选帧扫描与真实推进一致。
+        """
+        if self.pulse_period <= 0.0 or span <= 0.0:
+            return span
+        period = self.pulse_period
+        n_full = int(span / period)
+        return n_full * self.pulse_on + min(span - n_full * period, self.pulse_on)
 
     def reset(self):
         self.t = 0.0
@@ -293,6 +414,60 @@ class SubsystemSim:
         self.spawn_count = 0
         # 粒子记录：[出生时间, 寿命, x,y,z, vx,vy,vz, 角速度, 初始角, 权重]
         self.particles = []
+        self._ckpt = [(0, 0, [])]    # 关键帧：[(n_sub, spawn_count, 粒子表副本)]
+
+    # ---- 关键帧（供回退时快速恢复） ----
+
+    def _store_checkpoint(self):
+        """按间隔存一份状态快照。间隔内不重复存同一 n_sub。"""
+        last = self._ckpt[-1][0]
+        if self.n_sub - last < CHECKPOINT_STRIDE:
+            return
+        # 深拷贝粒子行：粒子记录是可变 list，后续积分会就地改字段
+        self._ckpt.append(
+            (self.n_sub, self.spawn_count, [list(p) for p in self.particles]))
+
+    def _restore_checkpoint(self, n_target):
+        """恢复到不超过 n_target 的最近关键帧，返回恢复到的 n_sub。
+
+        返回 -1 表示没有可用关键帧（调用方按从 0 重放处理）。
+        """
+        best = None
+        best_i = -1
+        for i, c in enumerate(self._ckpt):
+            if c[0] <= n_target:
+                best = c
+                best_i = i
+            else:
+                break
+        if best is None:
+            return -1
+        # 丢弃比恢复点更晚的关键帧：留着会让 _store_checkpoint 拿末尾那份比较，
+        # 差值为负从而再也不存新帧。
+        del self._ckpt[best_i + 1:]
+        self.n_sub, self.spawn_count, self.particles = (
+            best[0], best[1], [list(p) for p in best[2]])
+        self.t = self.n_sub * SUBSTEP
+        return self.n_sub
+
+    def rewind(self, t_target):
+        """把状态回退到 t_target 之前的最近关键帧。
+
+        返回恢复到的 n_sub（调用方随后用 advance 推进到目标即可）。
+        """
+        n_cap = int(MAX_PREVIEW_SECONDS / SUBSTEP)
+        n_target = min(int(math.floor(t_target / SUBSTEP + 1e-9)), n_cap)
+        if n_target < 0:
+            n_target = 0
+        got = self._restore_checkpoint(n_target)
+        if got < 0:
+            self.reset()
+            return 0
+        # 关键帧里可能有超出目标的、以及时间戳晚于目标时刻的粒子，一并清掉
+        if self.particles:
+            t_lim = self.n_sub * SUBSTEP
+            self.particles = [p for p in self.particles if p[0] <= t_lim]
+        return self.n_sub
 
     # ---- 发射 ----
 
@@ -385,11 +560,10 @@ class SubsystemSim:
         pz += pos0[2]
 
         ang0 = sub.rotation[0] + sub.rotation[1] * (2.0 * w_rot0 - 1.0)
-        angvel = sub.rotation_speed[0] + sub.rotation_speed[1] * (2.0 * w_rotv - 1.0)
+        angvel = (sub.rotation_speed[0] + sub.rotation_speed[1] * (2.0 * w_rotv - 1.0)
+                  + self.roll_speed)   # roll 轴自转 = 屏幕内自转，合并到同一条通道
 
-        self.particles.append([t, life, px, py, pz, d[0] * v, d[1] * v, d[2] * v, angvel, ang0, w0])
-
-    # ---- 物理 ----
+        self.particles.append([t, life, px, py, pz, d[0] * v, d[1] * v, d[2] * v, angvel, ang0, w0])    # ---- 物理 ----
 
     def _accel(self, p, v, t):
         ax = ay = az = 0.0
@@ -435,6 +609,39 @@ class SubsystemSim:
                 return abs(f.amount)
         return 0.0
 
+    def _step_vec(self, t_now, h, fric):
+        """向量化的一个子步：力场 + 半隐式欧拉积分 + 到寿剔除。
+
+        与逐粒子版逐位一致（实测 13200 字段 0 差异）。写回用 arr.tolist() 整体
+        替换而不是逐字段赋值——后者要把每个 float 从 numpy 搬回 Python 对象，
+        实测吃掉一半收益（逐字段 1.99x vs tolist 3.65x）。
+
+        particles 保持 list[list[float]] 结构不变：下游 snapshot()/checkpoint 都按
+        它取数，转成纯 numpy 会牵动太多地方，风险不值当。
+        """
+        np = _NP
+        arr = np.array(self.particles, dtype=np.float64)
+        # 到寿的剔除掉（与标量版的 continue 语义相同）
+        keep = (t_now - arr[:, 0]) < arr[:, 1]
+        if not keep.all():
+            arr = arr[keep]
+        if arr.shape[0] == 0:
+            self.particles = []
+            return
+        ax, ay, az = _accel_vec(arr[:, 2], arr[:, 3], arr[:, 4], self.forces, t_now)
+        arr[:, 5] += ax * h
+        arr[:, 6] += ay * h
+        arr[:, 7] += az * h
+        if fric > 0.0:
+            damp = math.exp(-fric * h)
+            arr[:, 5] *= damp
+            arr[:, 6] *= damp
+            arr[:, 7] *= damp
+        arr[:, 2] += arr[:, 5] * h
+        arr[:, 3] += arr[:, 6] * h
+        arr[:, 4] += arr[:, 7] * h
+        self.particles = arr.tolist()
+
     # ---- 主推进 ----
 
     def advance(self, t_target):
@@ -450,7 +657,10 @@ class SubsystemSim:
         24 组对不上。预览里表现为「擦洗到同一帧，画面却和上次不一样」。
         """
         if t_target < self.t:
-            self.reset()
+            # 回退：从最近的关键帧恢复，而不是从 0 全量重放。
+            # 全量重放的代价随帧号线性增长，实测回退 1 帧在 1800 帧处要
+            # 8~20 秒（同帧重刷仅 32/17ms），是时间轴擦洗卡顿的主因。
+            self.rewind(t_target)
         # 目标子步号。钳到 MAX_PREVIEW_SECONDS：预览时间轴不会超过它，超出的
         # 擦洗（用户把帧号拖到很远处）没必要真算几万个子步，钳制对所有路径一致，
         # 因此不破坏确定性。
@@ -476,28 +686,32 @@ class SubsystemSim:
                 self._spawn(t_now)
             # 积分（子步长恒为 SUBSTEP，与调用路径无关）
             h = SUBSTEP
-            alive = self.particles
-            idx = 0
-            for p in alive:
-                age = t_now - p[0]
-                if age >= p[1]:
-                    continue  # 到寿，收尾时剔除
-                a = self._accel((p[2], p[3], p[4]), (p[5], p[6], p[7]), t_now)
-                p[5] += a[0] * h
-                p[6] += a[1] * h
-                p[7] += a[2] * h
-                if fric > 0.0:
-                    damp = math.exp(-fric * h)
-                    p[5] *= damp
-                    p[6] *= damp
-                    p[7] *= damp
-                p[2] += p[5] * h
-                p[3] += p[6] * h
-                p[4] += p[7] * h
-                alive[idx] = p
-                idx += 1
-            del alive[idx:]
+            if self.use_vec and len(self.particles) >= _VEC_MIN_PARTICLES:
+                self._step_vec(t_now, h, fric)
+            else:
+                alive = self.particles
+                idx = 0
+                for p in alive:
+                    age = t_now - p[0]
+                    if age >= p[1]:
+                        continue  # 到寿，收尾时剔除
+                    a = self._accel((p[2], p[3], p[4]), (p[5], p[6], p[7]), t_now)
+                    p[5] += a[0] * h
+                    p[6] += a[1] * h
+                    p[7] += a[2] * h
+                    if fric > 0.0:
+                        damp = math.exp(-fric * h)
+                        p[5] *= damp
+                        p[6] *= damp
+                        p[7] *= damp
+                    p[2] += p[5] * h
+                    p[3] += p[6] * h
+                    p[4] += p[7] * h
+                    alive[idx] = p
+                    idx += 1
+                del alive[idx:]
             self.t = t_now
+            self._store_checkpoint()
 
         # 窗口后清理：无新粒子且全部到寿
         if self.duration >= 0.0 and t_target > self.start + self.duration + self.life:
@@ -507,10 +721,21 @@ class SubsystemSim:
     # ---- 显示快照 ----
 
     def snapshot(self):
+        """[(x,y,z, size, r,g,b,a, 屏幕内自转角, 图集格, 轴自转pitch增量, 轴自转yaw增量)]
+
+        最后两个是「面片朝向」相对初始朝向的**累积增量**（弧度），供三轴自转用。
+        不含基角——基角已由消费方用于挑选初始基向量，重复叠加会转两次。
+        宽度固定 12，消费方（blender_preview 的两条组数组路径）按 12 解包。
+        """
         out = []
         t = self.t
         sub = self.sub
         sheet_total = sub.sheet_x * sub.sheet_y
+        # 三轴自转：每次 snapshot 都要算，故先取出速率（无轴自转时全为 0，
+        # has_axis 为假时直接给常量 0，不付三角运算的代价）。
+        rp_rate = self.pitch_speed
+        ry_rate = self.yaw_speed
+        has_axis = bool(rp_rate or ry_rate)
         for p in self.particles:
             age = t - p[0]
             life = p[1]
@@ -528,10 +753,21 @@ class SubsystemSim:
             if a <= 0.0:
                 continue
             ang = math.radians(p[9] + p[8] * age)
+            # 三轴自转只输出「随时间累积的增量」，不输出基角：基角（pitch0 / yaw0）
+            # 决定的是面片的初始朝向，已经体现在 blender_preview 挑选的 right/up
+            # 基向量里（平铺分支、固定朝向分支都用到了它）。这里若再把基角当旋转
+            # 量叠加一次，就等于转了两次——实测让 308 个 pitch≈90 的平铺子系统
+            # 从水平面被转开（法线与 +Z 对齐度 1.000 → 0.000）。
+            if has_axis:
+                p_ang = math.radians(rp_rate * age)
+                y_ang = math.radians(ry_rate * age)
+            else:
+                p_ang = 0.0
+                y_ang = 0.0
             cell = -1
             if sub.sheet_anim and sheet_total > 1:
                 cell = int(age * sub.sheet_loop * sheet_total) % sheet_total
-            out.append((p[2], p[3], p[4], size, r, g, b, a, ang, cell))
+            out.append((p[2], p[3], p[4], size, r, g, b, a, ang, cell, p_ang, y_ang))
         return out
 
 
@@ -556,13 +792,26 @@ class SystemSim:
         self.t = 0.0
 
     def advance(self, t):
-        if t < self.t - 1e-6:
-            self.reset()
+        # 回退交给各子系统自己处理（它们有关键帧，可只回退一小段）。
+        # 这里**不能**再 `self.reset()`：那是修复前的旧行为，会把所有子系统清零，
+        # 于是子系统看到的永远是「从 0 向前推进」，关键帧回退根本没机会生效
+        # ——实测这条路径导致回退 1 帧仍要 10~37 秒。
         for s in self.subs:
             if self.enabled.get(s.name, True):
                 s.advance(t)
             else:
-                s.t = t
+                # 禁用的子系统不能只改 t：那会让 t 与 n_sub 脱钩，之后重新启用时
+                # SubsystemSim.advance 的两个守卫同时失效（t_target < self.t 为假
+                # 不触发回退，n_target <= n_sub 又直接 return），状态永久停在禁用
+                # 前的时刻——实测禁用期间 20→40→10 后启用，受害者仍是
+                # (n_sub=2400, 999 颗)，而正确值应为 (1200, 1000 颗)，且不再自愈。
+                # 改为：时间倒退时把它也重置（正确且便宜——禁用的子系统的物理本来
+                # 就不需要保留），前进时只对齐 t（它不参与显示，n_sub 不必推进）。
+                if t < s.t:
+                    s.reset()
+                    s.t = t
+                else:
+                    s.t = t
         self.t = t
 
     def snapshot(self):

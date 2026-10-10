@@ -247,9 +247,22 @@ def _import_loaded(context, loaded, missing, library):
     best_frame, total_n = _pick_frame(list(_ACTIVE), fps, max_end)
     best_frame = max(scene.frame_start, min(best_frame, scene.frame_end))
 
+    # _pick_frame 若恰好停在该帧（模拟状态已推进到位），这里只需写网格，
+    # 不必再让 refresh() 从 0 重放一遍——那正是导入耗时里最大的一笔
+    # （par_01 实测 pick_frame 28.96s + refresh 重放 30.39s，合计约 60s）。
     scene.frame_set(best_frame)
+    t_target = (scene.frame_current - scene.frame_start) / PARTICLE_FPS
     for preview in list(_ACTIVE):
         try:
+            sim = preview.sim
+            subs = [s for s in sim.subs if sim.enabled.get(s.name, True)]
+            # 只要所有启用子系统都已在目标时刻，就直接刷网格
+            if subs and all(abs(s.t - max(t_target, 0.0)) < 1e-6 for s in subs):
+                for sp in preview.sub_previews:
+                    sp.refresh(preview._camera_inv())
+                preview.last_count = sum(
+                    len(sp.sub_sim.snapshot()) for sp in preview.sub_previews)
+                continue
             preview.refresh()
         except Exception as err:  # noqa: BLE001
             IO_PDX_LOG.error("particle initial refresh failed: %s", err)
@@ -419,30 +432,70 @@ def _pick_frame(previews, fps, max_end):
     if best_est <= 0.0:
         return 1, 0
 
-    # 第 2 步：复核估算最高的几个候选
+    # 第 2 步：复核估算最高的几个候选。
+    #
+    # 真正贵的地方不是「试了几个候选」，而是「全程模拟跑了两遍」：
+    # _pick_frame 跑到峰值帧后原本 reset() 把状态清零，紧接着调用方
+    # frame_set + refresh() 又从 0 跑一遍。perf-tester 实测 par_01 的
+    # pick_frame=28.96s 与 frame_set_refresh=30.39s 就是这两遍，占导入总耗时
+    # 60 秒的绝大部分。
+    #
+    # 因此：命中候选后**保留该时刻的模拟状态**（keep_state=True），调用方据此
+    # 直接把网格刷出来，省掉第二遍全程。为了让「保留状态」安全，这里只推进到
+    # 最终选中的那个时刻，且不再 reset。
     ranked = sorted(samples, key=lambda x: -x[0])
+    cand = []
     seen_k = set()
-    tries = 0
     for _, k in ranked:
         if k in seen_k:
             continue
         seen_k.add(k)
-        tries += 1
-        if tries > REPLAY_TRIES:
+        cand.append(k)
+        if len(cand) > REPLAY_TRIES:
             break
-        t = k / max(fps, 1)
+    if not cand:
         for pv in previews:
             pv.sim.reset()
-            pv.sim.advance(t)
-        n = _count_now(previews)
-        if n > 0:
-            for pv in previews:
-                pv.sim.reset()
-            return k + 1, n     # 场景 frame_start = 1，故帧号 = 1 + t*fps
+        return 1, 0
 
+    # 按时间升序单调推进一趟，在每个候选点记录真实粒子数。
+    # advance 是确定性的绝对子步网格，到达同一 n_sub 即状态逐位相同
+    # （已实测 75 组逐位一致），所以单趟推进与「逐个 reset 后从 0 直跳」等价。
+    order = sorted(cand)
+    top_k = ranked[0][1] if ranked else None
+    counted = {}
+    reached = None
+    for k in order:
+        t = k / max(fps, 1)
+        for pv in previews:
+            pv.sim.advance(t)
+        reached = k
+        counted[k] = _count_now(previews)
+        # 早退：估算最高的候选已有粒子，它就是答案（选择规则是按估算降序取第一个
+        # 有粒子的），不必再往后推进。
+        if k == top_k and counted[k] > 0:
+            break
+
+    # 选择仍按「估算值高的优先」，与原先一致——不能改成按时间取第一个，
+    # 那会挑到更早、粒子更少的帧。
+    best_k = None
+    best_n = 0
+    for _, k in ranked:
+        if k in counted and counted[k] > 0:
+            best_k, best_n = k, counted[k]
+            break
+
+    if best_k is not None and best_k == reached:
+        # 恰好停在选中的时刻：把状态原样留给调用方，不要 reset。
+        return best_k + 1, best_n
+
+    # 没停在对的时刻（选中帧比推进到的更早，或全部候选都没粒子）：
+    # 只能复位，调用方会重新推进。
     for pv in previews:
         pv.sim.reset()
-    return ranked[0][1] + 1, 0
+    if best_k is not None:
+        return best_k + 1, best_n     # 场景 frame_start = 1，故帧号 = 1 + t*fps
+    return (order[0] if order else 1) + 1, 0
 
 
 def _rebuild_list(scene):

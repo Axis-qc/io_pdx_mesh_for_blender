@@ -297,7 +297,8 @@ class PdxSubsystem:
         "color", "alpha", "position",
         "start", "duration", "velocity_pitch", "velocity_yaw", "velocity",
         "life", "emission", "size", "particle_yaw", "particle_pitch",
-        "rotation", "rotation_speed", "mass",
+        "rotation", "rotation_speed", "rotation_speed_pitch", "rotation_speed_yaw",
+        "rotation_speed_roll", "emission_pulse_duration", "emission_pulse_silence", "mass",
         "force_refs", "billboard", "local_space", "trail", "invert", "hide", "sort",
         "unknown_keys",
     )
@@ -368,6 +369,15 @@ class PdxSubsystem:
         self.particle_pitch = _pair(node.child("particle_pitch"))
         self.rotation = _pair(node.child("rotation"))
         self.rotation_speed = _pair(node.child("rotation_speed"))
+        # 三轴自转角速度。原版 182 个子系统用到（pitch 75 / yaw 70 / roll 37），
+        # 原先只在 unknown_keys 里被丢弃，粒子只会绕视线轴自转，另外两轴不动。
+        self.rotation_speed_pitch = _pair(node.child("rotation_speed_pitch"))
+        self.rotation_speed_yaw = _pair(node.child("rotation_speed_yaw"))
+        self.rotation_speed_roll = _pair(node.child("rotation_speed_roll"))
+        # 脉冲发射：[工作时长, 静默时长]，成对出现（实测 105 对 / 各 1 个落单）。
+        # 两者都缺省为 0 表示持续发射；非零时发射按 工作->静默 循环。
+        self.emission_pulse_duration = _pair(node.child("emission_pulse_duration"))
+        self.emission_pulse_silence = _pair(node.child("emission_pulse_silence"))
         self.mass = _pair(node.child("mass"), 1.0)
 
         force_node = node.child("force")
@@ -392,7 +402,9 @@ class PdxSubsystem:
             "billboard", "hide", "texture", "color", "position", "start", "duration",
             "emitter_yaw", "emitter_pitch", "velocity_pitch", "velocity_yaw", "velocity",
             "life", "emission", "size", "particle_yaw", "particle_pitch", "rotation",
-            "rotation_speed", "mass", "force", "sort",
+            "rotation_speed", "rotation_speed_pitch", "rotation_speed_yaw",
+            "rotation_speed_roll", "emission_pulse_duration", "emission_pulse_silence",
+            "mass", "force", "sort",
         }
         self.unknown_keys = {c.key for c in node.children if c.key not in known}
 

@@ -39,16 +39,41 @@ _CORNERS = ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0))
 _UV_CORNERS = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
 
 
+def _orient_basis(right, up, p_ang, y_ang):
+    """把面片基向量按 pitch/yaw 两轴自转转过 p_ang / y_ang 弧度。
+
+    两者都为 0 时原样返回（绝大多数子系统走这条快路径，不做任何三角运算）。
+    pitch 绕世界 +X 转、yaw 绕 Y 转——与 sph_to_dir 的约定一致（pitch 自 +Y 轴
+    量、yaw 绕 Y），这样「面片朝向」与「粒子方向」两处角度是同一套坐标语义。
+    """
+    if p_ang == 0.0 and y_ang == 0.0:
+        return right, up
+    if p_ang != 0.0:
+        cp, sp = math.cos(p_ang), math.sin(p_ang)
+        right = (right[0], right[1] * cp - right[2] * sp,
+                 right[1] * sp + right[2] * cp)
+        up = (up[0], up[1] * cp - up[2] * sp, up[1] * sp + up[2] * cp)
+    if y_ang != 0.0:
+        cy, sy = math.cos(y_ang), math.sin(y_ang)
+        right = (right[0] * cy + right[2] * sy, right[1],
+                 -right[0] * sy + right[2] * cy)
+        up = (up[0] * cy + up[2] * sy, up[1], -up[0] * sy + up[2] * cy)
+    return right, up
+
+
 def _build_arrays_py(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
     """纯 Python 组数组（numpy 不可用时的回退，逻辑与向量化版逐项对应）。"""
     coords = [0.0] * (cap * 12)
     colors = [0.0] * (cap * 16)
     uvs = [0.0] * (cap * 8)
     for i in range(n):
-        x, y, z, size, r, g, b, a, ang, cell = snap[i]
+        x, y, z, size, r, g, b, a, ang, cell, p_ang, y_ang = snap[i]
         c, s = math.cos(ang), math.sin(ang)
-        r2 = (right[0] * c - up[0] * s, right[1] * c - up[1] * s, right[2] * c - up[2] * s)
-        u2 = (right[0] * s + up[0] * c, right[1] * s + up[1] * c, right[2] * s + up[2] * c)
+        right_i, up_i = _orient_basis(right, up, p_ang, y_ang)
+        r2 = (right_i[0] * c - up_i[0] * s, right_i[1] * c - up_i[1] * s,
+              right_i[2] * c - up_i[2] * s)
+        u2 = (right_i[0] * s + up_i[0] * c, right_i[1] * s + up_i[1] * c,
+              right_i[2] * s + up_i[2] * c)
         # 1 局部单位 = 1 Blender 米：size 直读，size=1 即 1x1 标准面片
         half = size * 0.5
         bx, by, bz = x, -z, y
@@ -90,13 +115,15 @@ def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
     一步比 foreach_set 本身还贵。
     """
     np = _NP
-    # snap 是 list[tuple]，转成 (n,10) 一次成型；多余容量留 0（与纯 Python 版
+    # snap 是 list[tuple]，转成 (n,12) 一次成型；多余容量留 0（与纯 Python 版
     # 初始化为 0 的语义一致——mesh 顶点数固定为 cap，未用到的槽位保持原值/0）。
-    arr = np.array(snap[:n], dtype=np.float64).reshape(n, 10)
+    # 宽度 12：末两列是面片朝向的 pitch/yaw（弧度），供三轴自转用。
+    arr = np.array(snap[:n], dtype=np.float64).reshape(n, 12)
     px, py, pz = arr[:, 0], arr[:, 1], arr[:, 2]
     size = arr[:, 3]
     r, g, b, a = arr[:, 4], arr[:, 5], arr[:, 6], arr[:, 7]
     ang, cell = arr[:, 8], arr[:, 9]
+    p_ang, y_ang = arr[:, 10], arr[:, 11]
 
     coords = np.zeros((cap, 4, 3), dtype=np.float32)
     colors = np.zeros((cap, 4, 4), dtype=np.float32)
@@ -106,8 +133,29 @@ def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
     s = np.sin(ang)
     R = np.asarray(right, dtype=np.float64)
     U = np.asarray(up, dtype=np.float64)
-    r2 = R[None, :] * c[:, None] - U[None, :] * s[:, None]     # (n,3)
-    u2 = R[None, :] * s[:, None] + U[None, :] * c[:, None]     # (n,3)
+    # 三轴自转：逐粒子转基向量。全部为 0 时（绝大多数子系统）跳过，省掉两次
+    # (n,3) 的三角运算。
+    if np.any(p_ang) or np.any(y_ang):
+        cp, sp = np.cos(p_ang)[:, None], np.sin(p_ang)[:, None]
+        cy, sy = np.cos(y_ang)[:, None], np.sin(y_ang)[:, None]
+        # 把常量基向量广播成 (n,3)，再逐粒子旋转（绕 X 转 pitch，再绕 Y 转 yaw）
+        R = np.broadcast_to(R, (n, 3)).copy()
+        U = np.broadcast_to(U, (n, 3)).copy()
+        Rx0 = R[:, 0].copy()
+        Rx1 = R[:, 1] * cp[:, 0] - R[:, 2] * sp[:, 0]
+        Rx2 = R[:, 1] * sp[:, 0] + R[:, 2] * cp[:, 0]
+        Ux1 = U[:, 1] * cp[:, 0] - U[:, 2] * sp[:, 0]
+        Ux2 = U[:, 1] * sp[:, 0] + U[:, 2] * cp[:, 0]
+        Ux0 = U[:, 0].copy()
+        R = np.stack([Rx0 * cy[:, 0] + Rx2 * sy[:, 0], Rx1,
+                      -Rx0 * sy[:, 0] + Rx2 * cy[:, 0]], axis=1)
+        U = np.stack([Ux0 * cy[:, 0] + Ux2 * sy[:, 0], Ux1,
+                      -Ux0 * sy[:, 0] + Ux2 * cy[:, 0]], axis=1)
+        r2 = R * c[:, None] - U * s[:, None]                    # (n,3)
+        u2 = R * s[:, None] + U * c[:, None]
+    else:
+        r2 = R[None, :] * c[:, None] - U[None, :] * s[:, None]  # (n,3)
+        u2 = R[None, :] * s[:, None] + U[None, :] * c[:, None]
 
     half = size * 0.5
     # 坐标系换算：局部 y 轴取 -z，局部 z 轴取 y（与纯 Python 版一致）
@@ -411,9 +459,24 @@ class PreviewScene:
 
     def set_subsystem_enabled(self, name, enabled):
         self.sim.enabled[name] = enabled
+        # 重新启用时把该子系统同步到当前时刻：它在禁用期间没有推进物理，
+        # 只被对齐过 t；而 SubsystemSim.advance 在目标时间已经到达时会短路
+        # （n_target <= n_sub 直接 return），于是启用后若帧号未变，它会停在
+        # 空状态，用户看到的是「这个子系统整段消失」。这里显式推进一次。
+        if enabled:
+            scene = bpy.context.scene
+            t = (scene.frame_current - scene.frame_start) / PARTICLE_FPS
+            for sp in self.sub_previews:
+                if sp.sub_sim.name == name:
+                    sp.sub_sim.advance(max(t, 0.0))
+                    sp.refresh(self._camera_inv())
         for sp in self.sub_previews:
             if sp.sub_sim.name == name:
                 sp.obj.hide_viewport = not enabled
+
+    def _camera_inv(self):
+        cam = bpy.context.scene.camera
+        return cam.matrix_world if cam is not None else None
 
     def destroy(self):
         """删对象/网格/材质/贴图/集合（只删本预览创建的）。"""
