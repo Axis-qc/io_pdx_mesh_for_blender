@@ -53,7 +53,17 @@ Fixed missing textures. The texture filenames stored inside a `.mesh` are not ne
 
 Adapted for Blender 5.x animation data access, and `imp` replaced with `importlib` (the old module was removed in Python 3.12).
 
-`version` is 0.91.3, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
+### Particle preview
+
+Added preview import for `.gfx` registrations and `.asset` particle systems, scrub-able on the timeline once imported. Particle timing is in seconds at a fixed 60 frames per second, independent of the scene frame rate (changing the scene fps will not speed particles up or slow them down).
+
+Supported features: billboard and fixed orientation, sphere/box/point emitters (including all three box axes), emitter rotation, per-particle variance, pulsed emission, three-axis spin, animation curves (size/alpha/colour), textures and sprite sheets, and force fields (`point` / `planar` / `vortex` / `spin` / `turbulence` / `friction`).
+
+Import picks the busiest frame automatically, so you do not have to hunt for one. Scrubbing backwards only rewinds to the nearest checkpoint rather than replaying from the start.
+
+Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered (only 15 occurrences in the whole game, 6 of them `hide=yes`); `local_space` has no effect on the preview, as the preview has no transformed parent entity.
+
+`version` is 0.94.0, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
 
 ### Usage notes
 
