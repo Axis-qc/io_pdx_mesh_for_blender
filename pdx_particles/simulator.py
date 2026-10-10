@@ -588,7 +588,18 @@ class SubsystemSim:
                     ay -= amt * ry / l
                     az -= amt * rz / l
             elif ftype in ("vortex", "spin"):
-                axis = _norm3(f.direction) or (0.0, 1.0, 0.0)
+                # 零向量 direction 回退到 +Y。原先写的是
+                # `_norm3(f.direction) or (0.0, 1.0, 0.0)`，但 _norm3 在零向量时
+                # 返回**元组** (0,0,0)，而非空元组恒为真，所以 `or` 的回退**永不触发**，
+                # 实际用 axis=(0,0,0)（等价于该力场完全失效）。这与向量化版
+                # （`(0.0,1.0,0.0) if ln < _EPS else ...`）在零向量时给出不同加速度。
+                # 实测真实库（原版+mod，1096 个系统）：零向量 spin/vortex 力场 0 个、
+                # 省略 direction 键的 force 块 0 个、与 point/turbulence 共存的可达
+                # 组合 0 个，所以此前两种写法在现有数据上结果相同。这里统一为
+                # 「零向量 -> +Y」，与向量化版一致（否则是一处静默的防线缺口：
+                # 哪天数据写出不带 direction 的 spin，两条路径会给出不同画面且无报错）。
+                a = _norm3(f.direction)
+                axis = a if (a[0] or a[1] or a[2]) else (0.0, 1.0, 0.0)
                 rx = p[0] - f.position[0]
                 ry = p[1] - f.position[1]
                 rz = p[2] - f.position[2]
