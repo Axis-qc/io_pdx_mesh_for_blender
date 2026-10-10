@@ -936,7 +936,7 @@ check("回退走关键帧（rewind 被调用且未全量 reset）",
 # ---------------------------------------------------------------- 力场向量化
 print()
 print("=" * 78)
-print("8. 力场向量化（numpy，带 point/turbulence 的子系统）")
+print("8. 力场向量化（numpy，带 point/turbulence/vortex/spin 的子系统）")
 print("=" * 78)
 
 if S._NP is None:

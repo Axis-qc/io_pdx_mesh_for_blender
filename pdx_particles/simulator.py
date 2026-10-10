@@ -43,10 +43,16 @@ MAX_PREVIEW_SECONDS = 60.0
 # 原先 advance() 遇到 `t_target < self.t` 就 self.reset() 全量重放，实测代价：
 # 回退 1 帧（1200→1199）par_01(10010 粒子) 要 3931ms、magnetic_storm_2 要
 # 10993ms；1800→1799 更是 8149ms / 20292ms，而同帧重刷只要 32ms / 17ms。
-# 关键帧间隔取 240 子步（= 2 秒），单次回退最多重放 2 秒，代价从「秒级」降到
-# 「几十毫秒级」。间隔越小回退越快、内存越多；240 在本项目下每子系统最多存
-# 60/2 = 30 份，实测峰值子系统也就几千颗粒子，开销可忽略。
-CHECKPOINT_STRIDE = 240
+#
+# 间隔取 60 子步（= 0.5 秒），单次回退最多重放 0.5 秒。实测（16 个最重系统两档
+# 对比，标量路径，test/bench_checkpoint_stride.py）：
+# - 回退 1 秒从数百 ms 压到 1~9ms（纯关键帧恢复，中位加速 ~225x，最好 604x）；
+# - 回退 1 帧平均 ~2.5x，最坏与 240 档持平（目标帧恰落两档同余点时重放步数相同，
+#   不劣化）；
+# - 代价是内存：top10 重系统同时装载净增约 +244MB，单系统最大 +143MB（par_01
+#   万粒系统）；粒子表本身两档完全相同，无确定性/视觉差异。
+# 曾用 240 子步（= 2 秒）：内存省一半，但 1 秒级回退最多要重放 2 秒（几百 ms）。
+CHECKPOINT_STRIDE = 60
 
 
 def _frac(x):
@@ -181,9 +187,13 @@ def _norm3(v):
 # （20 万随机点 0 处差异，1200 子步累加后终点逐位相同，sha256 级别比对通过）。
 # 因此这里可以放心用 numpy，不会破坏「到达同一 n_sub 状态相同」的确定性契约。
 #
-# 只有当子系统带 point/turbulence 这类「逐粒子算很多次三角函数」的力场时才走
-# 向量化：实测无力场时向量化反而慢（每子步建数组的开销没人分摊）。
-_VEC_FORCE_TYPES = ("turbulence", "point")
+# 带这些力场的子系统走向量化：point/turbulence 是逐粒子大量三角函数，vortex/spin
+# 是逐粒子叉积乘加。实测（test/bench_vortex_vec.py，17 系统逐位比对 + 38 系统普查）：
+# astral_rift/scar 等峰值 500+ 粒的纯 vortex 系统 1.6~1.8x，storm 族 1.0~1.15x；
+# 无热点子系统的系统 0.94~1.02（B 与 A 做功相同，噪声内），粒子 <64 触不到
+# _VEC_MIN_PARTICLES 门槛的系统完全等价、零代价。实测无力场时向量化反而慢
+# （每子步建数组的开销没人分摊），所以仍按力场类型把关。
+_VEC_FORCE_TYPES = ("turbulence", "point", "vortex", "spin")
 # 向量化有固定开销（每子步建数组），粒子太少时得不偿失。实测 1200 颗粒子有
 # turbulence 时 3.65x；无力场时不划算，故由 use_vec 一并把关。
 _VEC_MIN_PARTICLES = 64
@@ -311,9 +321,10 @@ class SubsystemSim:
         self.sphere_yaw = sub.sphere_yaw
         self.sphere_pitch = sub.sphere_pitch
 
-        # 是否走向量化积分：只有带 point/turbulence 力场（逐粒子大量三角函数）
-        # 时才划算。实测有 turbulence 时 3.65x，无力场时反而 0.82x（建数组的
-        # 开销没人分摊）。粒子太少时也不值得（固定开销占主导）。
+        # 是否走向量化积分：带 _VEC_FORCE_TYPES 列出的力场才划算（point/turbulence
+        # 逐粒子大量三角函数，vortex/spin 逐粒子叉积）。实测有 turbulence 时 3.65x，
+        # 无力场时反而 0.82x（建数组开销没人分摊），纯 vortex 峰值 500+ 粒的系统
+        # 1.6~1.8x。粒子太少时也不值得（固定开销占主导），门槛见 _VEC_MIN_PARTICLES。
         self.use_vec = (_NP is not None
                         and len(self.forces) > 0
                         and any(f.type in _VEC_FORCE_TYPES for f in self.forces))
