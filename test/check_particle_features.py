@@ -1,15 +1,26 @@
 """
 粒子子系统特征自检：逐项断言「解析到了」且「真的生效了」。
 
-跑法（在插件根目录下）：
+跑法（脚本位置无关，放在 test/ 下即可）：
     & 'G:\\SteamLibrary\\steamapps\\common\\Blender\\blender.exe' -b --factory-startup \
-      --python check_particle_features.py
+      --python test/check_particle_features.py
 
-检查四类特征，各自走不同代码路径，任一处没加载都会在这里失败：
+游戏根目录默认 G:\\SteamLibrary\\steamapps\\common\\Stellaris，
+可用环境变量 IO_PDX_TEST_GAME 覆盖（换机器/换安装位置时不必改脚本）。
+
+检查这些特征，各自走不同代码路径，任一处没加载都会在这里失败：
   1. 立牌朝向   billboard=yes 的粒子是否跟随活动相机
   2. 平铺环     particle_pitch≈90 的粒子是否躺在水平面上
   3. 场发射     box 的三轴、sphere 的半径是否都被解析且真的散开
   4. 位置偏移   subsystem 的 position 是否加到出生点上
+  5. 脉冲发射   emission_pulse_duration / _silence 的静默相是否真的停发
+  6. 三轴自转   rotation_speed_pitch / _yaw / _roll 的朝向增量是否符合契约
+  7. 回退      时间轴回退是否走关键帧、且与从 0 全量重放逐位一致
+  8. 向量化    力场向量化与纯 Python 是否逐位一致
+
+抽样口径：解析层（读 .asset、数键）全量扫，成本秒级；
+模拟层（SystemSim + advance 跑物理）抽样，固定种子可复现——
+单次 advance 是数百毫秒，全量 4700+ 子系统要几十分钟，不值得。
 
 不修改任何文件；只在结尾打印报告并以退出码反映结果。
 """
@@ -18,15 +29,17 @@ import os
 import random
 import sys
 
-EXT = r"C:\Users\hp\AppData\Roaming\Blender Foundation\Blender\5.2\extensions\user_default"
-sys.path.insert(0, EXT)
+# 插件根目录 = 本脚本所在目录的上一级（不写死盘符，脚本可以随处放）
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(ROOT))
 
 import bpy  # noqa: E402
 from io_pdx_mesh.pdx_particles import parser as P  # noqa: E402
 from io_pdx_mesh.pdx_particles import simulator as S  # noqa: E402
 from io_pdx_mesh.pdx_particles import blender_preview as BP  # noqa: E402
 
-GAME = r"G:\SteamLibrary\steamapps\common\Stellaris"
+GAME = os.environ.get(
+    "IO_PDX_TEST_GAME", r"G:\SteamLibrary\steamapps\common\Stellaris")
 
 # 抽样规模。区分两类检查：
 #   - 解析层（读 .asset、数键、查字段）：全量扫，成本是秒级，全量更可信。

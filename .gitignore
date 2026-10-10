@@ -55,3 +55,9 @@ __pycache__/
 *.bak
 .vscode/
 AGENTS.md
+
+# 打包分发产物（blender --command extension build 的输出，内容可随时重建）
+dist/
+
+# 队友/临时验证脚手架目录
+_teammate_*/
