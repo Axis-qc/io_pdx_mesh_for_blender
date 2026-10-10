@@ -9,7 +9,7 @@
 可用环境变量 IO_PDX_TEST_GAME 覆盖（换机器/换安装位置时不必改脚本）。
 
 检查这些特征，各自走不同代码路径，任一处没加载都会在这里失败：
-  1. 立牌朝向   billboard=yes 的粒子是否跟随活动相机
+  1. 立牌朝向   billboard=yes 的粒子是否面向活动视口镜头（无视口时退回摄像机）
   2. 平铺环     particle_pitch≈90 的粒子是否躺在水平面上
   3. 场发射     box 的三轴、sphere 的半径是否都被解析且真的散开
   4. 位置偏移   subsystem 的 position 是否加到出生点上
@@ -28,6 +28,10 @@
 import os
 import random
 import sys
+
+# 只读自检：不写 __pycache__，保证跑完仓库零副作用（否则会在插件目录下留
+# __pycache__，虽已被 .gitignore 忽略，仍然脏）。必须在 import 插件之前设置。
+sys.dont_write_bytecode = True
 
 # 插件根目录 = 本脚本所在目录的上一级（不写死盘符，脚本可以随处放）
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -252,8 +256,10 @@ if pick:
         sim.reset()
         sim.advance(1.0)
 
-    def quad_basis():
-        sp.refresh(cam.matrix_world)
+    def quad_basis(basis):
+        # refresh 现在收的是镜头基向量 (right, up)，不再收相机矩阵：
+        # 立牌朝向的来源改为「视口镜头优先，摄像机兜底」，见 active_view_basis()。
+        sp.refresh(basis)
         co = [0.0] * (len(sp.mesh.vertices) * 3)
         sp.mesh.vertices.foreach_get("co", co)
         # 取第一个 quad 的两条边
@@ -266,12 +272,16 @@ if pick:
     cam.location = (0.0, -100.0, 0.0)
     cam.rotation_euler = (1.5708, 0, 0)
     bpy.context.view_layer.update()
-    e1a, e2a = quad_basis()
+    # 用相机世界矩阵的列 0/列 1 作为基向量（与 camera_basis 同构）
+    def cam_cols():
+        m = cam.matrix_world
+        return ((m[0][0], m[1][0], m[2][0]), (m[0][1], m[1][1], m[2][1]))
+    e1a, e2a = quad_basis(cam_cols())
 
     cam.location = (100.0, 0.0, 0.0)
     cam.rotation_euler = (1.5708, 0, 1.5708)
     bpy.context.view_layer.update()
-    e1b, e2b = quad_basis()
+    e1b, e2b = quad_basis(cam_cols())
 
     import math
     def ang(a, b):
@@ -290,6 +300,131 @@ if pick:
     pv.destroy()
 else:
     check("找到可测的 billboard 样本", False)
+
+# 视口镜头：面片应面向「界面里的实际镜头」（region_3d），不是场景摄像机。
+# 这是 billboard 的默认来源，也是「视角一转面片就露馅」那个 bug 的修复点。
+_view_basis = BP.active_view_basis()
+if _view_basis is None:
+    check("活动视口可取到镜头基向量", False, "无视口（后台模式？）")
+else:
+    import mathutils  # noqa: E402
+    r3d = BP._active_region_3d()
+
+    # 用单位四元数当自证式真值：view_rotation 是「相机空间 → 世界」的旋转，
+    # 单位四元数即相机与世界同向，此时 right 必须是 (1,0,0)、up 必须是 (0,1,0)。
+    # 不用 view_matrix 校验：视口没绘制过时它不更新（后台实测停在旧值），
+    # 拿它当真值会把正确的实现判成错的。
+    _saved_rot = r3d.view_rotation.copy()
+    r3d.view_rotation = mathutils.Quaternion((1.0, 0.0, 0.0, 0.0))
+    _ident = BP.active_view_basis()
+    ok_ident = (_ident is not None
+                and all(abs(_ident[0][i] - (1.0, 0.0, 0.0)[i]) < 1e-6 for i in range(3))
+                and all(abs(_ident[1][i] - (0.0, 1.0, 0.0)[i]) < 1e-6 for i in range(3)))
+    check("单位四元数视角下基向量 = (right +X, up +Y)", ok_ident,
+          "" if _ident is None else "right={0} up={1}".format(
+              tuple(round(x, 4) for x in _ident[0]),
+              tuple(round(x, 4) for x in _ident[1])))
+    # 再转一个角度验证「基向量跟着 view_rotation 走」。用 180°（w=cos90°=0，
+    # z=sin90°=1）而不是 90°，因为这里设的是四元数本身不是欧拉角：
+    # (0,0,0.7071,0.7071) 的 w=cos(θ/2)=0.7071 → θ=180°。转 180° 后
+    # right 从 +X 翻成 -X，与 R@(1,0,0) 一致。
+    r3d.view_rotation = mathutils.Quaternion((0.0, 0.0, 1.0, 0.0))
+    _rot180 = BP.active_view_basis()
+    r3d.view_rotation = _saved_rot
+    ok_rot = (_rot180 is not None
+              and all(abs(_rot180[0][i] - (-1.0, 0.0, 0.0)[i]) < 1e-5
+                      for i in range(3)))
+    check("转 180° 后 right 随之翻转", ok_rot,
+          "" if _rot180 is None else "right={0}".format(
+              tuple(round(x, 4) for x in _rot180[0])))
+
+    # 正交且单位长
+    n0 = math.sqrt(sum(x * x for x in _view_basis[0]))
+    n1 = math.sqrt(sum(x * x for x in _view_basis[1]))
+    dp = sum(a * b for a, b in zip(_view_basis[0], _view_basis[1]))
+    check("视口基向量正交且单位长",
+          abs(n0 - 1.0) < 1e-6 and abs(n1 - 1.0) < 1e-6 and abs(dp) < 1e-6,
+          "|r|={0:.6f} |u|={1:.6f} r·u={2:.2e}".format(n0, n1, dp))
+    # 指纹可比较：同一镜头两次取值应相同
+    k1 = BP.view_rotation_key()
+    k2 = BP.view_rotation_key()
+    check("视口镜头指纹稳定（可做脏检查）", k1 is not None and k1 == k2)
+
+    # 单窗口时「当前活动窗口」与「全局面积最大」必须指向同一个 region_3d，
+    # 否则 _active_region_3d 的活动窗口优先逻辑会选错。后台只有一个 window，
+    # 这里验的是这条等价性；多窗口行为无法在后台构造（window_new 会报
+    # context 错误），需真实 GUI 验证。
+    #
+    # 比较必须用 as_pointer()：Blender 的 w is bpy.context.window 永远为 False
+    # （每次访问都新建 Python 包装对象），用 is 比会把所有东西都判成不同。
+    def _px_of(r3d_target):
+        best = -1
+        for _w in bpy.context.window_manager.windows:
+            _s = getattr(_w, "screen", None)
+            for _a in getattr(_s, "areas", ()):
+                _sp = _a.spaces.active if _a.spaces is not None else None
+                if _a.type == "VIEW_3D" and _sp is not None \
+                        and _sp.region_3d is not None \
+                        and _sp.region_3d.as_pointer() == r3d_target.as_pointer():
+                    best = max(best, _a.width * _a.height)
+        return best
+
+    _global = None
+    _global_px = -1
+    for _w in bpy.context.window_manager.windows:
+        _p, _r = BP._region_3d_of(_w)
+        if _r is not None and _p > _global_px:
+            _global_px, _global = _p, _r
+    _chosen = BP._active_region_3d()
+    _chosen_px = _px_of(_chosen) if _chosen is not None else -1
+    check("单窗口下活动视口 = 全局最大视口",
+          _global is not None and _chosen is not None
+          and _chosen.as_pointer() == _global.as_pointer()
+          and _chosen_px == _global_px and _chosen_px > 0,
+          "chosen_px={0} global_px={1}".format(_chosen_px, _global_px))
+
+    # 面片法线应指向视线反方向（dot ≈ -1 表示正对镜头）
+    bill_pick = None
+    for _nm, _sy in lib.systems.items():
+        for _sb in _sy.subsystems:
+            if (not _sb.hide and _sb.billboard
+                    and abs(_sb.particle_pitch[0] - 90.0) > 5.0
+                    and _sb.max_amount >= 4 and _sb.emission[0] >= 2.0):
+                bill_pick = (_nm, _sy, _sb)
+                break
+        if bill_pick:
+            break
+    if bill_pick:
+        _nm, _sy, _sb = bill_pick
+        _pv = BP.PreviewScene(_sy, lib)
+        _sp = next(x for x in _pv.sub_previews if x.sub_sim.name == _sb.name)
+        sc.frame_set(1)
+        _pv.sim.reset()
+        _pv.sim.advance(1.0)
+
+        def _normal_now():
+            _sp.refresh(BP.active_view_basis())
+            _co = [0.0] * (len(_sp.mesh.vertices) * 3)
+            _sp.mesh.vertices.foreach_get("co", _co)
+            _v = [(_co[i * 3], _co[i * 3 + 1], _co[i * 3 + 2]) for i in range(4)]
+            _e1 = tuple(_v[1][k] - _v[0][k] for k in range(3))
+            _e2 = tuple(_v[3][k] - _v[0][k] for k in range(3))
+            return (_e1[1] * _e2[2] - _e1[2] * _e2[1],
+                    _e1[2] * _e2[0] - _e1[0] * _e2[2],
+                    _e1[0] * _e2[1] - _e1[1] * _e2[0])
+
+        _R = r3d.view_rotation.to_matrix()
+        _vd = (_R @ mathutils.Vector((0.0, 0.0, -1.0))).normalized()
+        _n = _normal_now()
+        _ln = math.sqrt(sum(x * x for x in _n)) or 1e-9
+        _dot = sum(_n[i] * _vd[i] for i in range(3)) / _ln
+        print("  样本: {0} / {1}".format(_nm, _sb.name))
+        print("    面法线与视线点积: {0:.4f} (-1.0 = 正对镜头)".format(_dot))
+        check("billboard 面片正对活动视口镜头", _dot < -0.9,
+              "点积 {0:.4f}".format(_dot))
+        _pv.destroy()
+    else:
+        check("找到可测的视口朝向样本", False)
 
 # 平铺环：pitch≈90 应躺在水平面（法线朝 +Z）
 flat_pick = None
@@ -311,7 +446,7 @@ if flat_pick:
     sc.frame_set(1)
     pv.sim.reset()
     pv.sim.advance(1.0)
-    sp.refresh(None)
+    sp.refresh(None)          # None = 既无视口也无摄像机的兜底分支
     co = [0.0] * (len(sp.mesh.vertices) * 3)
     sp.mesh.vertices.foreach_get("co", co)
     v = [(co[i * 3], co[i * 3 + 1], co[i * 3 + 2]) for i in range(4)]

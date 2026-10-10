@@ -31,10 +31,24 @@ from .parser import (
     parse_gfx_registrations,
 )
 from .simulator import PARTICLE_FPS
-from .blender_preview import PreviewScene
+from .blender_preview import PreviewScene, view_rotation_key
 
 # 活动预览列表（模块级；跨 .blend 不持久化，重开文件后重新导入即可）
 _ACTIVE = []
+
+# 视口跟随：billboard 面片要朝向「界面里的实际镜头」，而 Blender 没有「视口旋转」
+# 事件，也没有 screen.areas.active（5.2 实测不存在），只能靠定时器轮询镜头角度。
+# 轮询到的角度与上次相同才算「镜头停了」，此时才重写网格——拖动视角的过程中不刷，
+# 避免每帧重算全部顶点（10 万粒子量级约 80ms/次）。
+_VIEW_POLL_INTERVAL = 0.05
+# 镜头持续运动时，pending 最多挂起多少个轮询周期，超过就强制刷一次。
+# 没有这个兜底，「拖动中不刷」会退化成「一直动就一直不刷」——视口相机动画、
+# fly/walk 连续导航下表现为完全不跟随（与原始 bug 同类症状）。
+_VIEW_PENDING_MAX = 20                      # 20 × 0.05s ≈ 1s
+# 定时器函数对象的存放槽（driver_namespace 跨模块重载/重装存活）。
+# 定时器没有可枚举的注册列表，重载后旧对象只能靠这个槽找回并注销，否则会泄漏。
+_VIEW_POLL_SLOT = "__io_pdx_particle_view_poll__"
+_view_state = {"key": None, "pending": False, "ticks": 0}
 
 
 def _roots():
@@ -106,12 +120,120 @@ def _mod_root(source_file):
 
 
 def _clear_previews():
+    _stop_view_poll()
     for preview in list(_ACTIVE):
         try:
             preview.destroy()
         except Exception as err:  # noqa: BLE001
             IO_PDX_LOG.error("particle preview destroy failed: %s", err)
     _ACTIVE.clear()
+
+
+def _view_follow_enabled():
+    """视口跟随开关（场景属性，默认开）。取不到场景时按开处理。"""
+    try:
+        return bool(bpy.context.scene.io_pdx_particle_face_view)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _view_poll():
+    """轮询视口镜头，停稳后把 billboard 面片转向镜头。
+
+    Blender 没有「视口旋转」事件，也没有 screen.areas.active，所以只能轮询
+    region_3d.view_rotation。语义按用户要求：镜头**不动了**才刷新一次，拖动
+    过程中不动网格。
+    """
+    if not _ACTIVE or not _view_follow_enabled():
+        return _VIEW_POLL_INTERVAL
+    try:
+        key = view_rotation_key()
+    except Exception:  # noqa: BLE001
+        return _VIEW_POLL_INTERVAL
+    if key is None:
+        return _VIEW_POLL_INTERVAL          # 无视口（后台/无 GUI），什么都不做
+
+    last = _view_state["key"]
+    if last is None:
+        # 首次轮询。不能假设「导入时刷的朝向」与当前镜头一致：导入完成到本函数
+        # 第一次跑之间有 50ms 窗口，镜头可能在此期间移动并已停稳。无条件置
+        # pending，让下一次轮询按当前镜头补刷一次（代价是一次 ~10ms 的重写，
+        # 只在每次导入后发生一次）。
+        _view_state["key"] = key
+        _view_state["pending"] = True
+        _view_state["ticks"] = 0
+        return _VIEW_POLL_INTERVAL
+    if key != last:
+        _view_state["key"] = key            # 还在动：记下，等它停
+        _view_state["pending"] = True
+        _view_state["ticks"] += 1
+        # 镜头持续运动时 key 永远不会等于 last，「停稳才刷」会退化成永不刷新
+        # （视口相机动画、fly/walk 连续导航）。超过阈值就强制刷一次。
+        if _view_state["ticks"] < _VIEW_PENDING_MAX:
+            return _VIEW_POLL_INTERVAL
+    if not _view_state["pending"]:
+        return _VIEW_POLL_INTERVAL          # 镜头没动过，无事可做
+
+    _view_state["pending"] = False
+    _view_state["ticks"] = 0
+    for preview in list(_ACTIVE):
+        try:
+            preview.refresh_for_view(key)
+        except ReferenceError:
+            _ACTIVE.remove(preview)
+        except Exception as err:  # noqa: BLE001
+            IO_PDX_LOG.error("particle view refresh failed: %s", err)
+    return _VIEW_POLL_INTERVAL
+
+
+def _start_view_poll():
+    """挂上视口轮询定时器；重复调用不会挂两份。
+
+    注销旧对象必须靠 driver_namespace 里存的引用，不能只按当前模块的
+    _view_poll 查：重载脚本/重装插件会重新 import 本模块，_view_poll 变成新
+    对象，而定时器列表里留着旧对象——旧对象引用旧模块的（已空的）_ACTIVE，
+    既查不到也删不掉，会越积越多。这与帧处理器遇到的坑同构（那边靠函数名 +
+    来源文件辨认，定时器没有这种列表可枚举，只能自己留存引用）。
+    插件自身的 unregister() 会经 _clear_previews 清掉当前模块的定时器，但清不掉
+    重载前旧模块留下的那个（unregister 跑在新模块上，只认新对象）——这正是要
+    在这里按槽对账的原因（实测 _ACTIVE.clear() 后定时器仍在，孤儿可达）。
+    """
+    fn = globals().get("_view_poll")
+    if fn is None:
+        return
+    try:
+        stale = bpy.app.driver_namespace.get(_VIEW_POLL_SLOT)
+        if stale is not None and stale is not fn:
+            try:
+                if bpy.app.timers.is_registered(stale):
+                    bpy.app.timers.unregister(stale)
+            except Exception:  # noqa: BLE001
+                pass
+        if not bpy.app.timers.is_registered(fn):
+            bpy.app.timers.register(fn, first_interval=_VIEW_POLL_INTERVAL)
+        bpy.app.driver_namespace[_VIEW_POLL_SLOT] = fn
+    except Exception as err:  # noqa: BLE001
+        IO_PDX_LOG.error("particle view poll register failed: %s", err)
+
+
+def _stop_view_poll():
+    """注销轮询定时器：当前对象与 driver_namespace 里可能残留的旧对象都清掉。"""
+    fns = [globals().get("_view_poll"), bpy.app.driver_namespace.get(_VIEW_POLL_SLOT)]
+    for fn in fns:
+        if fn is None:
+            continue
+        try:
+            if bpy.app.timers.is_registered(fn):
+                bpy.app.timers.unregister(fn)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        bpy.app.driver_namespace.pop(_VIEW_POLL_SLOT, None)
+    except Exception:  # noqa: BLE001
+        pass
+    _view_state["key"] = None
+    _view_state["pending"] = False
+    _view_state["ticks"] = 0
 
 
 @persistent
@@ -264,7 +386,7 @@ def _import_loaded(context, loaded, missing, library):
             # 只要所有启用子系统都已在目标时刻，就直接刷网格
             if subs and all(abs(s.t - max(t_target, 0.0)) < 1e-6 for s in subs):
                 for sp in preview.sub_previews:
-                    sp.refresh(preview._camera_inv())
+                    sp.refresh(preview._view_basis())
                 preview.last_count = sum(
                     len(sp.sub_sim.snapshot()) for sp in preview.sub_previews)
                 continue
@@ -286,6 +408,7 @@ def _import_loaded(context, loaded, missing, library):
             "particle preview: '%s' has nested subsystem '%s' (max_amount=%s) "
             "which is parsed but not rendered",
             _nm, _child.name, _child.max_amount)
+    _start_view_poll()
     return True
 
 
@@ -879,6 +1002,7 @@ class IOPDX_PT_PDXparticles(Panel):
         row = col.row(align=True)
         row.operator("io_pdx_particles.ref_sphere", text="Show ref sphere")
         row.operator("io_pdx_particles.ref_sphere_hide", text="Hide")
+        layout.prop(scene, "io_pdx_particle_face_view", icon="ORIENTATION_VIEW")
         row = layout.row(align=True)
         row.operator("io_pdx_particles.reload", icon="FILE_REFRESH", text="Reload")
         row.operator("io_pdx_particles.clear", icon="TRASH", text="Clear")
@@ -934,21 +1058,26 @@ def _find_stale_handlers():
 
 @persistent
 def _load_post_handler(dummy=None):
-    """加载文件后把帧处理器补回来。
+    """加载文件后把帧处理器与视口轮询补回来。
 
-    处理器本身是 @persistent 的，加载文件不会被清掉；但「用户先加载文件、插件
+    帧处理器本身是 @persistent 的，加载文件不会被清掉；但「用户先加载文件、插件
     处理器恰好不在」的情况仍会发生（例如先开文件后启用插件、或别的插件脚本
     清过列表）。这里做一次廉价自愈，保证任何时序下都有一个在位的处理器。
     注意：_ACTIVE 是模块级状态，加载文件后它仍指向上一份文件的预览对象，那些
     对象已经随旧文件释放，帧处理器会通过 ReferenceError 自动剔除。
+
+    视口轮询是 bpy.app.timers 注册的，**加载文件会把它清掉**（帧处理器因
+    @persistent 存活，定时器没有这个机制）。不清查就会「粒子还在动但视角不再
+    跟随」，因此这里一并补回——只在确实还有活动预览时补，否则会留下一个永远
+    空转的定时器（导入时会自己启动，见 _import_loaded）。
     """
-    if _frame_handler in bpy.app.handlers.frame_change_post:
-        return
-    stale = _find_stale_handlers()
-    if stale:
-        return          # 已有一份（可能是旧对象），不必再加
-    bpy.app.handlers.frame_change_post.append(_frame_handler)
-    IO_PDX_LOG.info("particle frame handler re-attached after file load")
+    if _frame_handler not in bpy.app.handlers.frame_change_post:
+        stale = _find_stale_handlers()
+        if not stale:       # 已有一份（可能是旧对象），不必再加
+            bpy.app.handlers.frame_change_post.append(_frame_handler)
+            IO_PDX_LOG.info("particle frame handler re-attached after file load")
+    if _ACTIVE:
+        _start_view_poll()
 
 
 def register():
@@ -965,6 +1094,12 @@ def register():
         description="Show only registrations whose name or type contains this text",
         default="",
         update=_filter_update,
+    )
+    bpy.types.Scene.io_pdx_particle_face_view = BoolProperty(  # type: ignore
+        name="Face the viewport",
+        description="Turn billboard particles toward the 3D viewport camera "
+                    "(off = keep using the scene camera / fixed fallback)",
+        default=True,
     )
     bpy.types.Scene.io_pdx_particle_vanilla_root = StringProperty(  # type: ignore
         name="Vanilla root",
@@ -1004,6 +1139,8 @@ def unregister():
     del bpy.types.Scene.io_pdx_particle_items
     del bpy.types.Scene.io_pdx_particle_index
     del bpy.types.Scene.io_pdx_particle_filter
+    if hasattr(bpy.types.Scene, "io_pdx_particle_face_view"):
+        del bpy.types.Scene.io_pdx_particle_face_view
     del bpy.types.Scene.io_pdx_particle_vanilla_root
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

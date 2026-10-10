@@ -4,7 +4,8 @@ Build/refresh Blender preview objects for a simulated PDX particle system.
  渲染策略：
  - 每个子系统一个网格对象，容量 = max_amount（封顶 4000），quad 拓扑一次建好；
    每帧只 foreach 刷新顶点坐标 / 顶点色 / UV，未用到的 quad 收成零面积退化面。
- - 立牌（billboard=yes 或 pitch 非 90）面向活动相机；pitch≈90 的粒子（冲击波环）
+ - 立牌（billboard=yes 或 pitch 非 90）面向镜头：3D 视口镜头优先，没有视口才退回
+   场景摄像机；billboard=no 的固定朝向粒子不跟随镜头。pitch≈90 的粒子（冲击波环）
    平铺在水平面。
  - 坐标映射：模拟空间 (x, y, z) → Blender (x, -z, y)（粒子 +Y 朝上 → Blender +Z；
    粒子 -Z 朝飞船 → Blender -Y）。
@@ -37,6 +38,103 @@ MAX_QUADS = 4000
 # 面片四个角的 (su, sv)，与纯 Python 版保持同序，避免顶点绕序变化
 _CORNERS = ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0))
 _UV_CORNERS = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+
+
+def _region_3d_of(window):
+    """一个 window 里面积最大的 3D 视口 → (像素面积, region_3d)；没有则 (0, None)。
+
+    screen.areas 是普通集合，没有 active / active_index（5.2 实测两者都不存在），
+    所以「这个窗口的活动视口」也只能按面积取。同一窗口内通常只有一个 VIEW_3D，
+    分屏出多个时用户视线主要落在大的那个上。
+    """
+    screen = getattr(window, "screen", None)
+    if screen is None:
+        return 0, None
+    best = None
+    best_px = -1
+    for area in screen.areas:
+        if area.type != "VIEW_3D":
+            continue
+        spaces = getattr(area, "spaces", None)
+        space = spaces.active if spaces is not None else None
+        r3d = getattr(space, "region_3d", None) if space is not None else None
+        if r3d is None:
+            continue
+        px = area.width * area.height
+        if px > best_px:
+            best_px = px
+            best = r3d
+    if best is None:
+        return 0, None
+    return best_px, best
+
+
+def _active_region_3d():
+    """取「当前活动窗口」的 3D 视口 region_3d，取不到再全局兜底。
+
+    用户要的是主窗口里正在看的那个视口，所以先认 bpy.context.window（实测定时器
+    里可用，但 bpy.context.area 为 None——「活动区域」没有 API）。context 取不到
+    窗口时（后台、脚本环境）退回「所有窗口里面积最大的 VIEW_3D」，单窗口时两者
+    等价。
+
+    不直接用全局最大：多开窗口时，主窗口较小而副窗口较大就会跟错窗口，面片会朝
+    一个用户没在看的视口转。
+    """
+    win = getattr(bpy.context, "window", None)
+    if win is not None:
+        _px, r3d = _region_3d_of(win)
+        if r3d is not None:
+            return r3d
+    wm = getattr(bpy.context, "window_manager", None)
+    if wm is None:
+        return None
+    best = None
+    best_px = -1
+    for w in wm.windows:
+        px, r3d = _region_3d_of(w)
+        if r3d is not None and px > best_px:
+            best_px = px
+            best = r3d
+    return best
+
+
+def active_view_basis():
+    """取 3D 视口的镜头基向量 (right, up)，没有视口时返回 None。
+
+    用户看到的是「界面里的实际镜头」，即视口视角（region_3d.view_rotation），
+    不是场景里摆的摄像机（scene.camera）。两者可能同时存在，且视口总是存在，
+    所以视口优先、摄像机只作回退。
+
+    四元数取矩阵列 0/列 1，与 view_matrix.inverted() 的列逐位一致，且两向量
+    正交、单位长（均实测）。
+    """
+    r3d = _active_region_3d()
+    if r3d is None:
+        return None
+    try:
+        m = r3d.view_rotation.to_matrix()
+    except Exception:  # noqa: BLE001
+        return None
+    return ((m[0][0], m[1][0], m[2][0]), (m[0][1], m[1][1], m[2][1]))
+
+
+def view_rotation_key():
+    """视口镜头的可比较指纹，用于「镜头不动了才刷新」的脏检查。"""
+    r3d = _active_region_3d()
+    if r3d is None:
+        return None
+    q = r3d.view_rotation
+    return (round(q[0], 6), round(q[1], 6), round(q[2], 6), round(q[3], 6))
+
+
+def camera_basis():
+    """场景摄像机的镜头基向量（无摄像机返回 None）。视口不可用时的回退。"""
+    scene = getattr(bpy.context, "scene", None)
+    cam = getattr(scene, "camera", None) if scene is not None else None
+    if cam is None:
+        return None
+    m = cam.matrix_world
+    return ((m[0][0], m[1][0], m[2][0]), (m[0][1], m[1][1], m[2][1]))
 
 
 def _orient_basis(right, up, p_ang, y_ang):
@@ -332,7 +430,7 @@ class SubsystemPreview:
 
     # ---- 每帧刷新 ----
 
-    def refresh(self, camera_inv=None):
+    def refresh(self, cam_basis=None):
         sim = self.sub_sim
         sub = sim.sub
         snap = sim.snapshot()
@@ -342,9 +440,9 @@ class SubsystemPreview:
 
         # 立牌基向量三选一，按粒子自身的朝向声明决定：
         # - particle_pitch≈90：水平环（冲击波），平铺在水平面上；
-        # - billboard=no：固定朝向，不跟随相机。这类粒子朝向写在 particle_yaw /
+        # - billboard=no：固定朝向，不跟随镜头。这类粒子朝向写在 particle_yaw /
         #   particle_pitch 里，用它们构造面片基向量；
-        # - 其余（billboard=yes）：面向活动相机，取相机世界矩阵的列 0/列 1。
+        # - 其余（billboard=yes）：面向镜头，用调用方传来的 (right, up)。
         # billboard 字段原先解析了却从未被读取，导致 1630 个明确写了
         # billboard=no 的子系统（占 31.8%）被当成立牌渲染——飞船尾焰、定向火舌
         # 这类本该固定朝向的粒子会随视角转动，方向是错的。
@@ -365,12 +463,10 @@ class SubsystemPreview:
             up = (d[1] * right[2] - d[2] * right[1],
                   d[2] * right[0] - d[0] * right[2],
                   d[0] * right[1] - d[1] * right[0])
-        elif camera_inv is not None:
-            m = camera_inv
-            right = (m[0][0], m[1][0], m[2][0])
-            up = (m[0][1], m[1][1], m[2][1])
+        elif cam_basis is not None:
+            right, up = cam_basis
         else:
-            # 无相机：面向 -Y 立起（Blender 默认视向），up 取世界 +Z
+            # 既无视口也无摄像机：面向 -Y 立起（Blender 默认视向），up 取世界 +Z
             right, up = (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)
 
         sheet_x = max(sub.sheet_x, 1)
@@ -412,6 +508,7 @@ class PreviewScene:
         self.sub_previews = []
         self.ref_sphere = None
         self.last_count = 0
+        self._last_view_key = None
         self._build()
 
     def _build(self):
@@ -443,19 +540,37 @@ class PreviewScene:
         帧 → 秒 用固定的 PARTICLE_FPS（60），不用场景 render.fps：粒子数据里
         的时间量全部以秒为单位，拿可变的场景 fps 换算会让同一份数据在不同
         fps 的场景里跑出不同速度。
+
+        面片朝向由 _view_basis 现取（视口 → 摄像机 → 兜底），所以帧驱动的刷新
+        天然会用上最新视角。
         """
         scene = bpy.context.scene
         t = (scene.frame_current - scene.frame_start) / PARTICLE_FPS
         self.sim.advance(max(t, 0.0))
-        camera_inv = None
-        cam = scene.camera
-        if cam is not None:
-            camera_inv = cam.matrix_world
         total = 0
+        basis = self._view_basis()
         for sp in self.sub_previews:
-            total += sp.refresh(camera_inv)
+            total += sp.refresh(basis)
         self.last_count = total
         return total
+
+    def _view_basis(self):
+        """取当前应使用的镜头基向量：(视口 → 摄像机 → None)。"""
+        basis = active_view_basis()
+        if basis is None:
+            basis = camera_basis()
+        return basis
+
+    def refresh_for_view(self, view_key):
+        """视口镜头变化时调用：镜头停了才重写网格。
+
+        返回重写的粒子数；镜头与上次相同则返回 None（什么都不做）。
+        view_key 为 None（取不到视口）时不做脏检查，直接走普通 refresh。
+        """
+        if view_key is not None and view_key == self._last_view_key:
+            return None
+        self._last_view_key = view_key
+        return self.refresh()
 
     def set_subsystem_enabled(self, name, enabled):
         self.sim.enabled[name] = enabled
@@ -469,14 +584,10 @@ class PreviewScene:
             for sp in self.sub_previews:
                 if sp.sub_sim.name == name:
                     sp.sub_sim.advance(max(t, 0.0))
-                    sp.refresh(self._camera_inv())
+                    sp.refresh(self._view_basis())
         for sp in self.sub_previews:
             if sp.sub_sim.name == name:
                 sp.obj.hide_viewport = not enabled
-
-    def _camera_inv(self):
-        cam = bpy.context.scene.camera
-        return cam.matrix_world if cam is not None else None
 
     def destroy(self):
         """删对象/网格/材质/贴图/集合（只删本预览创建的）。"""

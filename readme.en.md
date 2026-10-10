@@ -59,11 +59,13 @@ Added preview import for `.gfx` registrations and `.asset` particle systems, scr
 
 Supported features: billboard and fixed orientation, sphere/box/point emitters (including all three box axes), emitter rotation, per-particle variance, pulsed emission, three-axis spin, animation curves (size/alpha/colour), textures and sprite sheets, and force fields (`point` / `planar` / `vortex` / `spin` / `turbulence` / `friction`).
 
+Billboard particles face the **actual viewport camera** (the 3D view's own view), not a camera object placed in the scene; the scene camera is only a fallback when there is no 3D viewport. With several windows open it follows the viewport of the active window. Rotating the view refreshes once the camera settles, rather than recomputing while you drag; if the view never settles (viewport camera animation, continuous navigation) it falls back to refreshing once per second so it never stops following entirely. The `Face the viewport` toggle in the panel turns this off, after which the scene camera is used. Particles with `billboard=no` keep their own fixed orientation and never follow the camera.
+
 Import picks the busiest frame automatically, so you do not have to hunt for one. Scrubbing backwards only rewinds to the nearest checkpoint rather than replaying from the start.
 
 Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered (only 15 occurrences in the whole game, 6 of them `hide=yes`); `local_space` has no effect on the preview, as the preview has no transformed parent entity.
 
-`version` is 0.94.0, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
+`version` is 0.95.0, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
 
 ### Usage notes
 
