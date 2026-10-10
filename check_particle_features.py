@@ -15,6 +15,7 @@
 """
 
 import os
+import random
 import sys
 
 EXT = r"C:\Users\hp\AppData\Roaming\Blender Foundation\Blender\5.2\extensions\user_default"
@@ -26,6 +27,23 @@ from io_pdx_mesh.pdx_particles import simulator as S  # noqa: E402
 from io_pdx_mesh.pdx_particles import blender_preview as BP  # noqa: E402
 
 GAME = r"G:\SteamLibrary\steamapps\common\Stellaris"
+
+# 抽样规模。区分两类检查：
+#   - 解析层（读 .asset、数键、查字段）：全量扫，成本是秒级，全量更可信。
+#   - 模拟层（SystemSim + advance 跑物理）：**必须抽样**。单次 advance 是数百
+#     毫秒量级，全量 4700 个子系统要跑几十分钟——为验证一条契约不值得。
+# 固定种子保证结果可复现，不因每次随机到不同样本而时好时坏。
+SAMPLE_N = 240
+RNG = random.Random(20241010)
+
+
+def sample(items, n=SAMPLE_N):
+    """固定种子抽样：items 少于 n 时全取，否则随机取 n 个。"""
+    items = list(items)
+    if len(items) <= n:
+        return items
+    return RNG.sample(items, n)
+
 
 PASS, FAIL = [], []
 
@@ -511,6 +529,324 @@ if colossus:
                     kept += 1
     check("没写键的子系统不被旋转（保持 +Y）", kept == tot2,
           "{0}/{1}".format(kept, tot2))
+
+# ---------------------------------------------------------------- 脉冲发射
+print()
+print("=" * 78)
+print("5. 脉冲发射 emission_pulse_duration / emission_pulse_silence")
+print("=" * 78)
+print("   这两个键原先只在 unknown_keys 里被丢弃（107 个子系统受影响），")
+print("   特效表现为一直喷而不是脉冲。这里验「工作相发射、静默相停发」。")
+
+pulsed = []
+for sy in lib.systems.values():
+    for sb in sy.subsystems:
+        if sb.emission_pulse_duration[0] > 0 and sb.emission_pulse_silence[0] > 0:
+            pulsed.append((sy, sb))
+print("  原版脉冲子系统: {0} 个".format(len(pulsed)))
+check("存在脉冲发射子系统", len(pulsed) > 0, "{0} 个".format(len(pulsed)))
+
+# 逐子系统验排程：工作相内应单调增长，静默相内必须持平。
+# 注意不能用 spawn_count 验——它受 max_amount 限流，脉冲会被掩盖。
+violations = 0
+checked_pulse = 0
+for sy, sb in sample(pulsed, 40):
+    sim = S.SystemSim(sy)
+    st = next((s for s in sim.subs if s.sub.name == sb.name), None)
+    if st is None or st.pulse_period <= 0.0:
+        continue
+    checked_pulse += 1
+    step = st.pulse_period / 40.0
+    prev = None
+    prev_phase = None
+    for i in range(41):
+        t = st.start + i * step
+        n = st._expected_spawns(t)
+        phase = (t - st.start) % st.pulse_period
+        # 静默相内不允许增长（两端都要在静默相，避免跨相位边界误判）
+        if (prev is not None and n > prev
+                and phase >= st.pulse_on + 1e-9 and prev_phase >= st.pulse_on + 1e-9):
+            violations += 1
+        prev, prev_phase = n, phase
+check("脉冲子系统在静默相不发射", violations == 0,
+      "抽样 {0} 个，{1} 次违规".format(checked_pulse, violations))
+
+# 非脉冲子系统不能被误伤：排程应等于闭式解 int((t-start)*rate)。
+# 注意不能写成「10s 应是 5s 的两倍」——start≠0 时 (10-start)/(5-start) 不是 2
+# （例：start=1、rate=30 时是 9/4=2.25）。这一条我第一版就写错了。
+plain_bad = 0
+plain_checked = 0
+plain_examples = []
+for sy in sample(list(lib.systems.values()), 300):
+    for s in S.SystemSim(sy).subs:
+        sb = s.sub
+        if (sb.emission_pulse_duration[0] == 0 and sb.emission_pulse_silence[0] == 0
+                and sb.emission[0] > 0 and sb.duration[0] < 0):
+            for T in (5.0, 10.0):
+                if T <= s.start:
+                    continue
+                plain_checked += 1
+                want = int((T - s.start) * s.rate)
+                got = s._expected_spawns(T)
+                if got != want:
+                    plain_bad += 1
+                    if len(plain_examples) < 3:
+                        plain_examples.append("{0}/{1} T={2} got={3} want={4}".format(
+                            sy.name[:24], sb.name[:12], T, got, want))
+check("非脉冲子系统的发射排程等于闭式解", plain_bad == 0,
+      "抽查 {0} 个时刻，偏离 {1} 个 {2}".format(
+          plain_checked, plain_bad, ("; ".join(plain_examples)) if plain_examples else ""))
+
+# 脉冲不能破坏「跳帧 vs 逐帧」一致性。
+# 这里必须真跑物理（正是要验两条推进路径一致），所以样本小、时间短。
+path_bad = 0
+path_tot = 0
+for sy, sb in sample(pulsed, 3):
+    for T in (3.0, 6.0):
+        a = S.SystemSim(sy)
+        a.advance(T)
+        b = S.SystemSim(sy)
+        for k in range(1, int(T * 60) + 1):
+            b.advance(k / 60.0)
+        path_tot += 1
+        if {n: len(v) for n, v in a.snapshot()} != {n: len(v) for n, v in b.snapshot()}:
+            path_bad += 1
+check("脉冲下跳帧与逐帧结果一致", path_bad == 0,
+      "{0} 组比对".format(path_tot))
+
+# ---------------------------------------------------------------- 三轴自转
+print()
+print("=" * 78)
+print("6. 三轴自转 rotation_speed_pitch / _yaw / _roll")
+print("=" * 78)
+print("   原先这三个键被静默丢弃（182 个子系统），面片只能绕视线轴自转。")
+
+axis_subs = [(sy, sb) for sy in lib.systems.values() for sb in sy.subsystems
+             if (sb.rotation_speed_pitch[0] or sb.rotation_speed_yaw[0]
+                 or sb.rotation_speed_roll[0])]
+check("存在带轴自转的子系统", len(axis_subs) > 0, "{0} 个".format(len(axis_subs)))
+
+# snapshot 元组宽度必须是 12
+sim0 = S.SystemSim(sorted(lib.systems.values(), key=lambda s: s.name)[0])
+sim0.advance(2.0)
+width = 0
+for _n, rows in sim0.snapshot():
+    if rows:
+        width = len(rows[0])
+        break
+check("snapshot 元组宽度为 12", width == 12, "实测 {0}".format(width))
+
+# 轴自转必须真的改变朝向：验契约「增量 == radians(速率 × 年龄)」。
+# 这里**手工把 size/alpha 动画关掉**，让 snapshot 的唯一过滤条件变成「年龄」，
+# 从而能与 st.particles 按序一一对齐。直接按位置匹配是不行的：
+# point 发射器会让同一时刻出生的多颗粒子位置完全相同，字典匹配会互相覆盖
+# （我第一版就这么错，误报 106 处不符）。
+turned = 0
+probe = 0
+axis_bad = 0
+axis_examples = []
+for sy, sb in axis_subs:
+    st = next((s for s in S.SystemSim(sy).subs if s.sub.name == sb.name), None)
+    if st is None or not (st.pitch_speed or st.yaw_speed):
+        continue
+    probe += 1
+    # 关掉 size/alpha 过滤，保证 snapshot 与「年龄过滤后的 particles」逐行对应
+    st.size_anim = None
+    st.alpha_anim = None
+    st.size_base, st.size_var = 100.0, 0.0
+    st.alpha_base, st.alpha_var = 1.0, 0.0
+    st.advance(2.0)
+    rows = st.snapshot()
+    if not rows:
+        continue
+    kept = [p for p in st.particles if 0.0 <= st.t - p[0] < p[1]]
+    if len(kept) != len(rows):
+        axis_bad += 1
+        continue
+    nonzero = False
+    for p, r in zip(kept, rows):
+        age = st.t - p[0]
+        if st.pitch_speed:
+            if abs(math.radians(st.pitch_speed * age) - r[10]) > 1e-9:
+                axis_bad += 1
+            if r[10] != 0.0:
+                nonzero = True
+        if st.yaw_speed:
+            if abs(math.radians(st.yaw_speed * age) - r[11]) > 1e-9:
+                axis_bad += 1
+            if r[11] != 0.0:
+                nonzero = True
+    if nonzero:
+        turned += 1
+    elif len(axis_examples) < 3:
+        axis_examples.append("{0}/{1} speed=({2},{3}) n={4}".format(
+            sy.name[:24], sb.name[:12], st.pitch_speed, st.yaw_speed, len(rows)))
+    if probe >= 10:
+        break
+check("轴自转的朝向增量随时间累积", turned > 0,
+      "{0}/{1} 个在转 {2}".format(turned, probe,
+                                  ("; ".join(axis_examples)) if axis_examples else ""))
+check("朝向增量 == radians(速率 × 年龄)", axis_bad == 0,
+      "逐粒子核对，{0} 处不符".format(axis_bad))
+
+# 无轴自转的必须不受影响。注意速率是 [基值] + [方差]：只看 [0] 会漏掉
+# rotation_speed_pitch=(0.0, 2.0) 这类「只在方差里非零」的（我第一版漏了 10 个）。
+still_tot = 0
+still_ok = 0
+still_examples = []
+# 抽样即可：这条只验「速率为 0 时增量恒为 0」，与具体系统无关，几十个样本足够。
+# 时间取 0.5 秒（不是 1 秒）——够产生粒子，又少一半子步。
+for sy in sample(list(lib.systems.values()), 80):
+    for s in S.SystemSim(sy).subs:
+        sb = s.sub
+        if s.pitch_speed or s.yaw_speed:
+            continue                      # 用模拟里的真实速率判定，而不是解析字段的 [0]
+        still_tot += 1
+        s.advance(0.5)
+        rows = s.snapshot()
+        if all(r[10] == 0.0 and r[11] == 0.0 for r in rows):
+            still_ok += 1
+        elif len(still_examples) < 3:
+            still_examples.append("{0}/{1}".format(sy.name[:24], sb.name[:12]))
+check("无轴自转的子系统朝向增量恒为 0", still_ok == still_tot,
+      "抽样 {0} 个 {1}".format(still_tot,
+                               ("; ".join(still_examples)) if still_examples else ""))
+
+# ---------------------------------------------------------------- 回归关键帧
+print()
+print("=" * 78)
+print("7. 时间轴回退（关键帧回退，替代原先的从 0 全量重放）")
+print("=" * 78)
+
+
+def _fp(sim):
+    import hashlib
+    import struct as _st
+    h = hashlib.sha256()
+    for s in sim.subs:
+        h.update(s.name.encode("utf-8"))
+        h.update(_st.pack("<q", s.n_sub))
+        h.update(_st.pack("<q", s.spawn_count))
+        for p in s.particles:
+            for v in p:
+                h.update(_st.pack("<d", float(v)))
+    return h.hexdigest()
+
+
+# 回退后重放 vs 直接从 0 全量重放，必须逐位一致
+equiv_bad = 0
+equiv_tot = 0
+sample_names = [n for n in ("magnetic_storm_2_file", "par_01_beholder_portrait_ship_part_effect_file",
+                            "particle_storm_1_file") if n in lib.systems]
+if not sample_names:
+    sample_names = sorted(lib.systems)[:2]
+for nm in sample_names:
+    sy = lib.systems[nm]
+    for T in (4.0, 8.0):
+        a = S.SystemSim(sy)
+        a.advance(T + 4.0)
+        a.advance(T)                 # 回退
+        b = S.SystemSim(sy)
+        b.advance(T)                 # 参考
+        equiv_tot += 1
+        if _fp(a) != _fp(b):
+            equiv_bad += 1
+check("回退后状态与从 0 全量重放逐位一致", equiv_bad == 0,
+      "{0} 组比对，{1} 组不一致".format(equiv_tot, equiv_bad))
+
+# 回退必须走关键帧而不是全量 reset
+calls = {"rewind": 0, "reset": 0}
+_orig_rewind = S.SubsystemSim.rewind
+_orig_reset = S.SubsystemSim.reset
+
+
+def _spy_rewind(self, t):
+    calls["rewind"] += 1
+    return _orig_rewind(self, t)
+
+
+def _spy_reset(self):
+    calls["reset"] += 1
+    return _orig_reset(self)
+
+
+S.SubsystemSim.rewind = _spy_rewind
+S.SubsystemSim.reset = _spy_reset
+try:
+    sy = lib.systems[sample_names[0]]
+    sim = S.SystemSim(sy)
+    sim.advance(20.0)
+    calls["rewind"] = calls["reset"] = 0
+    sim.advance(19.9833333)          # 回退 1 帧
+finally:
+    S.SubsystemSim.rewind = _orig_rewind
+    S.SubsystemSim.reset = _orig_reset
+check("回退走关键帧（rewind 被调用且未全量 reset）",
+      calls["rewind"] > 0 and calls["reset"] == 0,
+      "rewind={0} reset={1}".format(calls["rewind"], calls["reset"]))
+
+# ---------------------------------------------------------------- 力场向量化
+print()
+print("=" * 78)
+print("8. 力场向量化（numpy，带 point/turbulence 的子系统）")
+print("=" * 78)
+
+if S._NP is None:
+    print("  numpy 不可用，跳过向量化检查")
+else:
+    # 抽样统计覆盖面：给全部 4700+ 个子系统各建一个 SystemSim 太慢，
+    # 而这条只关心「有没有走向量化的」，抽样足够。
+    vec_subs = 0
+    tot_subs = 0
+    for sy in sample(list(lib.systems.values()), 120):
+        for s in S.SystemSim(sy).subs:
+            tot_subs += 1
+            if s.use_vec:
+                vec_subs += 1
+    check("存在走向量化积分的子系统", vec_subs > 0,
+          "抽样 {0} 个子系统中 {1} 个（{2:.1f}%）".format(
+              tot_subs, vec_subs, 100.0 * vec_subs / max(tot_subs, 1)))
+
+    # 关键：强制关闭向量化后结果必须逐位相同。
+    # 只在抽样集合里找走向量化的样本——不要对全库每个系统都建 SystemSim
+    # 只为了挑 4 个（我第一版就这么写，白跑几千次构造）。
+    vsamples = []
+    for sy in sample(list(lib.systems.values()), 200):
+        if any(s.use_vec for s in S.SystemSim(sy).subs):
+            vsamples.append(sy.name)
+        if len(vsamples) >= 3:
+            break
+    vbad = 0
+    vtot = 0
+    for nm in vsamples:
+        sy = lib.systems[nm]
+        for T in (4.0, 8.0):
+            a = S.SystemSim(sy)
+            for s in a.subs:
+                s.use_vec = False
+            a.advance(T)
+            b = S.SystemSim(sy)
+            b.advance(T)
+            vtot += 1
+            if _fp(a) != _fp(b):
+                vbad += 1
+    check("向量化与纯 Python 逐位一致", vbad == 0,
+          "{0} 组比对，{1} 组不一致".format(vtot, vbad))
+
+    # numpy 与 math 的三角函数逐位一致性（这是向量化安全的前提）
+    import math as _m
+    import struct as _st2
+    import random as _rnd
+    _rnd.seed(2024)
+    diffs = 0
+    for _ in range(20000):
+        x = _rnd.uniform(-200.0, 200.0)
+        if _st2.pack("<d", _m.sin(x)) != _st2.pack("<d", float(S._NP.sin(x))):
+            diffs += 1
+        if _st2.pack("<d", _m.cos(x)) != _st2.pack("<d", float(S._NP.cos(x))):
+            diffs += 1
+    check("numpy 的 sin/cos 与 math 逐位一致", diffs == 0,
+          "2 万点 {0} 处差异".format(diffs))
 
 bpy.data.objects.remove(cam, do_unlink=True)
 
