@@ -5,10 +5,12 @@ Build/refresh Blender preview objects for a simulated PDX particle system.
  - 每个子系统一个网格对象，容量 = max_amount（封顶 4000），quad 拓扑一次建好；
    每帧只 foreach 刷新顶点坐标 / 顶点色 / UV，未用到的 quad 收成零面积退化面。
  - 立牌（billboard=yes 或 pitch 非 90）面向镜头：3D 视口镜头优先，没有视口才退回
-   场景摄像机；billboard=no 的固定朝向粒子不跟随镜头。pitch≈90 的粒子（冲击波环）
-   平铺在水平面。
- - 坐标映射：模拟空间 (x, y, z) → Blender (x, -z, y)（粒子 +Y 朝上 → Blender +Z；
-   粒子 -Z 朝飞船 → Blender -Y）。
+   场景摄像机；billboard=no 的固定朝向粒子不跟随镜头，姿态由 particle_yaw（绕世界 +Y）
+   与 particle_pitch（绕面片长轴自转）决定，两者为 0 时贴图 U=+X、V=+Y、法线 +Z。
+   billboard=yes 恒正面朝镜头并完全忽略这两个字段（pdx_axis_probe 实机定案）。
+ - 坐标映射：模拟空间 (x, y, z) → Blender (x, z, y)，与 mesh 导入的 SPACE_MATRIX
+   同一套（交换 Y/Z）。粒子空间 -Z 是前方 → Blender -Y 是前方，与导入模型的
+   船头方向（-Y）一致；粒子上方 +Y → Blender +Z。
  - 材质：ParticleAdditive → 发光叠加观感；ParticleAlphaBlend → 普通透明混合。
  - 显示缩放（默认 0.02）只影响整体呈现尺寸，等比，不改内部比例；
    不复现父级/entity 挂载缩放。
@@ -28,7 +30,6 @@ try:
 except Exception:  # noqa: BLE001
     _NP = None
 
-from .parser import sph_to_dir
 from .simulator import PARTICLE_FPS, SystemSim
 
 IO_LOG = logging.getLogger("io_pdx.particles")
@@ -140,9 +141,12 @@ def camera_basis():
 def _orient_basis(right, up, p_ang, y_ang):
     """把面片基向量按 pitch/yaw 两轴自转转过 p_ang / y_ang 弧度。
 
+    这是「三轴自转」的累积增量（快照末两列），作用在已选好的初始基向量上；
+    与 _fixed_quad_basis 的基角（particle_yaw/pitch）是两回事，不会重复转。
+
     两者都为 0 时原样返回（绝大多数子系统走这条快路径，不做任何三角运算）。
-    pitch 绕世界 +X 转、yaw 绕 Y 转——与 sph_to_dir 的约定一致（pitch 自 +Y 轴
-    量、yaw 绕 Y），这样「面片朝向」与「粒子方向」两处角度是同一套坐标语义。
+    转轴沿世界 +X / +Y：这是 rotation_speed_pitch / _yaw 的既有实现契约，
+    已由 check_particle_features 第 6 项逐位断言，本次不改动。
     """
     if p_ang == 0.0 and y_ang == 0.0:
         return right, up
@@ -156,6 +160,57 @@ def _orient_basis(right, up, p_ang, y_ang):
         right = (right[0] * cy + right[2] * sy, right[1],
                  -right[0] * sy + right[2] * cy)
         up = (up[0] * cy + up[2] * sy, up[1], -up[0] * sy + up[2] * cy)
+    return right, up
+
+
+def _rot_about(axis, v, ang):
+    """罗德里格斯公式：把向量 v 绕单位轴 axis 转 ang 弧度。"""
+    ax, ay, az = axis
+    cross = (ay * v[2] - az * v[1], az * v[0] - ax * v[2], ax * v[1] - ay * v[0])
+    dot = ax * v[0] + ay * v[1] + az * v[2]
+    c, s = math.cos(ang), math.sin(ang)
+    k = dot * (1.0 - c)
+    return (v[0] * c + cross[0] * s + ax * k,
+            v[1] * c + cross[1] * s + ay * k,
+            v[2] * c + cross[2] * s + az * k)
+
+
+def _fixed_quad_basis(yaw_deg, pitch_deg):
+    """billboard=no 固定朝向面片的 (right, up)，Blender 空间。
+
+    依据 pdx_axis_probe 标定件实机读数（billboard=no，逐格单变量）：
+      默认姿态：贴图 U（箭头）→ 世界 +X、V → 世界 +Y，面片立 X-Y 平面、法线 +Z。
+      particle_yaw  ：绕世界 +Y 转，+90° 把 +X 转到 -Z。
+      particle_pitch：绕**面片自身长轴（贴图 U 轴）**自转，不改变指向，只翻平面。
+                      （名字叫 pitch，实际是 roll —— 曾按「绕 right 抬起」实现，已证伪）
+
+    本函数返回**Blender 空间**的基向量。引擎与 Blender 经 (x, z, y) 交换（SPACE_MATRIX），
+    该映射行列式为 -1（镜像），所以**引擎里的正向旋转在 Blender 里符号相反**：
+      引擎 U=+X → Blender (1, 0, 0)   ；
+      引擎 V=+Y → Blender (0, 0, 1)   ；
+      引擎绕 +Y 转 +θ → Blender 绕 +Z 转 **-θ**；
+      绕长轴自转同理，取 **-pitch**。
+
+    如实机读数逐条自洽（z1/z2/z3/z7 四格）：
+      yaw=0,  pitch=0   → 箭头 +X                       （z1）
+      yaw=90, pitch=0   → 箭头 -Y（引擎 -Z）             （z2）
+      yaw=0,  pitch=90  → 箭头 +X、面片水平（法线 +Z）    （z3）
+      yaw=90, pitch=90  → 箭头 -Y、面片水平               （z7）
+    注意 yaw 与 pitch 的旋转都作用于**两个基向量**，且 pitch 的转轴是 yaw 之后的当前
+    长轴，才能同时满足 z2 与 z7。
+
+    默认姿态下 right × up = -Y（Blender 正面视角方向），材质关了背面剔除，正反都可见。
+    """
+    right = (1.0, 0.0, 0.0)
+    up = (0.0, 0.0, 1.0)
+    if yaw_deg:
+        axis = (0.0, 0.0, 1.0)
+        ang = -math.radians(yaw_deg)
+        right = _rot_about(axis, right, ang)
+        up = _rot_about(axis, up, ang)
+    if pitch_deg:
+        # 绕当前长轴（= right）自转；right 与转轴平行，保持不变
+        up = _rot_about(right, up, -math.radians(pitch_deg))
     return right, up
 
 
@@ -174,7 +229,9 @@ def _build_arrays_py(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
               right_i[2] * s + up_i[2] * c)
         # 1 局部单位 = 1 Blender 米：size 直读，size=1 即 1x1 标准面片
         half = size * 0.5
-        bx, by, bz = x, -z, y
+        # 坐标映射：与 mesh 导入同一套 (x, z, y)（见 SPACE_MATRIX）。
+        # 粒子空间 -Z 是前方，映射后 Blender -Y 是前方，与导入的模型船头一致。
+        bx, by, bz = x, z, y
         vbase = i * 12
         for (su, sv), k in zip(_CORNERS, range(4)):
             o = vbase + k * 3
@@ -189,9 +246,14 @@ def _build_arrays_py(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
             colors[o + 2] = b
             colors[o + 3] = a
         ubase = i * 8
-        if do_sheet and cell >= 0:
-            cx = cell % sheet_x
-            cy = cell // sheet_x
+        if do_sheet:
+            # cell<0 表示贴图集没配动画（spritesheet_animation=no）：实机定案是
+            # **默认只取第 1 帧**，所以退回 cell 0，而不是铺满整张贴图。
+            # 修前这里对 anim=no 显示整图，444 个多帧贴图的子系统全是错的
+            # （单帧贴图写 x=2 时表现为「显示错位的半张」）。
+            cell_i = cell if cell >= 0 else 0
+            cx = cell_i % sheet_x
+            cy = cell_i // sheet_x
             u0 = cx / sheet_x
             v0 = 1.0 - (cy + 1) / sheet_y
             du = 1.0 / sheet_x
@@ -256,8 +318,8 @@ def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
         u2 = R[None, :] * s[:, None] + U[None, :] * c[:, None]
 
     half = size * 0.5
-    # 坐标系换算：局部 y 轴取 -z，局部 z 轴取 y（与纯 Python 版一致）
-    base = np.stack([px, -pz, py], axis=1)                      # (n,3)
+    # 坐标映射：与纯 Python 版一致，同 mesh 导入的 (x, z, y)
+    base = np.stack([px, pz, py], axis=1)                      # (n,3)
     su = np.asarray([c0 for c0, _ in _CORNERS], dtype=np.float64)[None, :, None]
     sv = np.asarray([c1 for _, c1 in _CORNERS], dtype=np.float64)[None, :, None]
     off = (r2[:, None, :] * su + u2[:, None, :] * sv) * half[:, None, None]
@@ -269,15 +331,17 @@ def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
     colors[:n, :, 3] = a[:, None]
 
     if do_sheet:
+        # cell<0 = 没配 spritesheet_animation：实机定案是**默认只取第 1 帧**，
+        # 所以退回 cell 0，而不是铺满整张贴图。修前这里对 cell<0 把 du/dv 设成
+        # 1.0（整图），与纯 Python 版的行为不一致——两版都改过后才对齐。
         cell_i = cell.astype(np.int64)
-        ok = cell_i >= 0
-        safe = np.where(ok, cell_i, 0)
+        safe = np.where(cell_i >= 0, cell_i, 0)
         cx = safe % sheet_x
         cy = safe // sheet_x
-        u0 = np.where(ok, cx / float(sheet_x), 0.0)
-        v0 = np.where(ok, 1.0 - (cy + 1) / float(sheet_y), 0.0)
-        du = np.where(ok, 1.0 / float(sheet_x), 1.0)
-        dv = np.where(ok, 1.0 / float(sheet_y), 1.0)
+        u0 = cx / float(sheet_x)
+        v0 = 1.0 - (cy + 1) / float(sheet_y)
+        du = np.full(n, 1.0 / float(sheet_x), dtype=np.float64)
+        dv = np.full(n, 1.0 / float(sheet_y), dtype=np.float64)
     else:
         u0 = np.zeros(n, dtype=np.float64)
         v0 = np.zeros(n, dtype=np.float64)
@@ -323,7 +387,13 @@ class SubsystemPreview:
         for _ in range(cap):
             verts.extend([(0.0, 0.0, 0.0)] * 4)
             b = len(faces) * 4
-            faces.append((b, b + 1, b + 2, b + 3))
+            # 顶点顺序取反（b+3..b）而不是正向：坐标映射 (x,z,y) 的行列式为 -1
+            # （镜像），同样的绕序在 Blender 里算出的面法线符号与引擎相反。引擎
+            # 默认姿态的 U×V = +X×+Y = +Z，正向绕序搬到 Blender 会得到 -Z，反向后
+            # 才是 +Z，与 pdx_axis_probe 标定的「法线 +Z」对齐。
+            # 画面不变（材质关了背面剔除、纯自发光，正反同图），改的是「面朝哪边」
+            # 这个属性本身，以及依赖它的法线/光照类判断。
+            faces.append((b + 3, b + 2, b + 1, b))
         mesh.from_pydata(verts, [], faces)
         mesh.update()
         # 顶点色与 UV
@@ -438,31 +508,21 @@ class SubsystemPreview:
         if cap <= 0:
             return 0
 
-        # 立牌基向量三选一，按粒子自身的朝向声明决定：
-        # - particle_pitch≈90：水平环（冲击波），平铺在水平面上；
-        # - billboard=no：固定朝向，不跟随镜头。这类粒子朝向写在 particle_yaw /
-        #   particle_pitch 里，用它们构造面片基向量；
-        # - 其余（billboard=yes）：面向镜头，用调用方传来的 (right, up)。
-        # billboard 字段原先解析了却从未被读取，导致 1630 个明确写了
-        # billboard=no 的子系统（占 31.8%）被当成立牌渲染——飞船尾焰、定向火舌
-        # 这类本该固定朝向的粒子会随视角转动，方向是错的。
-        flat = abs(sub.particle_pitch[0] - 90.0) < 1.0 and sub.particle_pitch[1] < 1.0
-        if flat:
-            right, up = (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)
-        elif not sub.billboard:
-            # 固定朝向：面片法线由 particle 的 yaw/pitch 决定（与球坐标同源）
-            d = sph_to_dir(sub.particle_pitch[0], sub.particle_yaw[0])
-            up = (0.0, 1.0, 0.0)
-            # 取一个与 d 不平行的参考向量，叉乘得到面内右向量
-            ref = (0.0, 0.0, 1.0) if abs(d[1]) > 0.9 else (0.0, 1.0, 0.0)
-            right = (d[1] * ref[2] - d[2] * ref[1],
-                     d[2] * ref[0] - d[0] * ref[2],
-                     d[0] * ref[1] - d[1] * ref[0])
-            ln = math.sqrt(right[0] ** 2 + right[1] ** 2 + right[2] ** 2) or 1.0
-            right = (right[0] / ln, right[1] / ln, right[2] / ln)
-            up = (d[1] * right[2] - d[2] * right[1],
-                  d[2] * right[0] - d[0] * right[2],
-                  d[0] * right[1] - d[1] * right[0])
+        # 立牌基向量二选一，按粒子自身的朝向声明决定：
+        # - billboard=no：固定朝向，不跟随镜头。朝向由 particle_yaw / particle_pitch
+        #   唯一决定（含 pitch=90 的平铺姿态，_fixed_quad_basis 已能算出来）；
+        # - billboard=yes：恒正面朝镜头，**完全忽略** particle_yaw / particle_pitch。
+        #
+        # 实机定案（pdx_axis_probe）：billboard=yes 的 base / yaw=90 / pitch=90
+        # 三组显示完全一致，说明这两个字段对 billboard 粒子无效。
+        #
+        # 修前这里先判 `flat`（|pitch-90|<1）再判 billboard，导致 129 个同时写了
+        # billboard=yes 与 particle_pitch≈90 的子系统被当成平铺环，面片被摁平在
+        # 水平面上、不再面向镜头——而它们本该忽略 pitch 正常朝镜头。
+        # billboard=no 的平铺姿态不再需要单独分支：pitch=90 经 _fixed_quad_basis
+        # 的「绕长轴自转」自然得到水平面（法线 +Z），与原实现结果一致。
+        if not sub.billboard:
+            right, up = _fixed_quad_basis(sub.particle_yaw[0], sub.particle_pitch[0])
         elif cam_basis is not None:
             right, up = cam_basis
         else:
@@ -471,7 +531,11 @@ class SubsystemPreview:
 
         sheet_x = max(sub.sheet_x, 1)
         sheet_y = max(sub.sheet_y, 1)
-        do_sheet = sub.sheet_anim and (sheet_x * sheet_y) > 1
+        # 贴图集只要 >1 帧就要按格取 UV（do_sheet），与 spritesheet_animation 无关：
+        # anim=no 时 snapshot 给的 cell 为 -1，组数组里退回第 1 帧——这正是实机
+        # 读数（默认只取第 1 帧）。修前 do_sheet 带上 sheet_anim 条件，anim=no 的
+        # 444 个子系统会把整张贴图铺在一个面片上。
+        do_sheet = (sheet_x * sheet_y) > 1
 
         coords = [0.0] * (cap * 12)
         colors = [0.0] * (cap * 16)

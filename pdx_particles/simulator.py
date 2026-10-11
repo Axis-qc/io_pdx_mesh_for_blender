@@ -20,8 +20,6 @@ try:                      # numpy 可选：缺失时全部回退纯 Python 路�
 except Exception:         # noqa: BLE001
     _NP = None
 
-from .parser import sph_to_dir
-
 GOLDEN = 0.6180339887498949
 SUBSTEP = 1.0 / 120.0     # 物理子步（秒）
 _EPS = 1e-9
@@ -60,29 +58,35 @@ def _frac(x):
 
 
 def _emit_dir(pitch_deg, yaw_deg):
-    """发射体朝向对应的单位方向（emitter 系）。
+    """发射方向的单位向量：**仰角 pitch + 方位角 yaw**，方位基准为 **+Z**。
 
-    有两套互不相同的球坐标约定，不能混用：
-    - velocity_* / sphere_emitter_*：pitch 自 **+Y 轴**量（sph_to_dir），pitch=0
-      落在极点、此时 yaw 完全退化；
-    - emitter_*：pitch 是水平面仰角、yaw 是 XZ 平面方位角，基准方向为 **+X**。
+    公式（pdx_axis_probe 实机标定，全库唯一一套）：
 
-    依据是 fallen_empire_01_colossus_energy_effect：三个球按等边三角形摆在 XZ
-    平面，`emitter_yaw` 恰好等于「位置角 - 180」（ball_1 位置角 59.04→yaw -120；
-    ball_2 位置角 180→yaw 0；ball_3 位置角 -59.04→yaw 120），而 velocity 恒为
-    -100。按下式取 d 再乘 -100，三球速度全部沿径向朝外（夹角 0.96°/0°/0.96°，
-    3/3 通过）。若改用 sph_to_dir，ball_2 会得到竖直向下的 (0,-100,0)，与另两球
-    的径向不一致——差异恰好只出现在 yaw=0 那个球上，正是基准方向不同所致。
+        d = (-sin yaw·cos pitch, sin pitch, cos yaw·cos pitch)
 
-        d = (cos p·cos y, sin p, cos p·sin y)
+    yaw 从 +Z 起算、朝 +X 方向增大；pitch 是相对水平面的真仰角（0 水平、90 朝 +Y、
+    -90 朝 -Y），只抬升不改水平朝向。支持负值与 >360 环绕（-90 ≡ 270）。
 
-    p=0 水平、p=90 朝 +Y、p=270 与 -90 都朝 -Y：原版取值里确实同时出现 270 与
-    -90，且存在负值（-20），说明它是可绕圈的仰角而非 0..180 的极角。
+    实机读数（标定件头部速查表，逐项）：
+        yaw=0   → +Z        yaw=90  → -X
+        yaw=180 → -Z        yaw=270 → +X
+        pitch=90 → +Y       pitch=-90 → -Y       pitch=45 → +Z/+Y 斜上
+
+    velocity_* / emitter_* / sphere_emitter_* 三个入口共用这一套（标定件里
+    emitter_* 与 velocity_* 明确注为「同一套球面角」，sphere 的 {0 180} 全向
+    也靠这套角度铺满整球）。
+
+    【修前错误】原先这里写的是 `(cos p·cos y, sin p, cos p·sin y)`，即方位基准取
+    +X、且 pitch 直接当 y 分量——水平方向整体偏 90°，而且 pitch=0 时 yaw 失效。
+    出错原因是照抄了 `sph_to_dir`（极角模型）的结论：它把 yaw 当绕 +Y 的极角，
+    与实机不符。同时 `_spawn` 里 velocity / sphere 两处却用的是 sph_to_dir，
+    与 emitter 的 _emit_dir 各说各话，等于同一份数据里有两套互相矛盾的语义。
+    现统一到上面这一套。
     """
     p = math.radians(pitch_deg)
     y = math.radians(yaw_deg)
     cp = math.cos(p)
-    return (cp * math.cos(y), math.sin(p), cp * math.sin(y))
+    return (-math.sin(y) * cp, math.sin(p), math.cos(y) * cp)
 
 
 def _axis_angle_matrix(axis, angle_rad):
@@ -99,29 +103,38 @@ def _axis_angle_matrix(axis, angle_rad):
 
 
 def _emit_rot_matrix(pitch_deg, yaw_deg):
-    """发射体旋转矩阵：把代码里的基准方向 **+Y** 转到 _emit_dir(pitch, yaw)。
+    """发射体旋转矩阵：把局部基准前向 **+Z** 转到 _emit_dir(pitch, yaw)。
 
-    基准必须是 +Y 而不是 +X：被旋转的对象是初速度方向，而本文件算初速度方向用的
-    是 sph_to_dir(velocity_pitch, velocity_yaw)，velocity 角为 0 时它给出 +Y。
-    若把矩阵写成「+X → d」，作用到 +Y 上会得到第三个方向，三个球全错（实测
-    0/3，速度全塌成 (0,-100,0)）；写成「+Y → d」时两个显式写了 yaw 的球精确吻合
-    （径向夹角 0.96°/0.96°）。
+    基准取 +Z 的理由是「写 0 = 不旋转」这条通用语义必须成立：
+      d(0,0) = +Z（probe 实测表：velocity_yaw=0 → +Z），
+    所以只有当基准也是 +Z 时，emitter_yaw=emitter_pitch=0 才等价于单位阵。
+    全库 2376 个子系统显式写了 emitter_yaw=0（其中 1241 个同时有非零 velocity，
+    826 个速度角也全 0），里面 222 个是尾焰/引擎类（fire_flare、fire_backblast…）——
+    尾焰必须朝船尾喷，若「写 0」被解释成整体扭转 90°，这些全都会喷错方向。
 
-    取绕轴 (Y × d) 转 Y 与 d 夹角这一支（最短路径）。
-    注意 R(pitch=0, yaw=0) **不是**单位阵：_emit_dir(0,0)=+X，而基准是 +Y，所以它把
-    +Y 转到 +X。单位阵出现在 pitch=90 那类「d 与基准 +Y 同向」的角度。
-    （这条曾被写成「yaw=pitch=0 时退化为单位阵」，与实现不符，已更正。）
+    【为什么不用 +X】曾按 +X 作基准以迁就 fallen_empire_*_colossus_energy_effect：
+    那 3 个球的 emitter_yaw 恰好等于「球→中心」方位角，用 +X 基准能让它们全部朝内
+    （实机截图确实向中心汇聚）。但 +X 基准会让 d(0,0)=+Z 变成一次 90° 旋转，直接
+    破坏上面 2376 个「写 0」子系统的语义。两者不可兼得，取覆盖面大的一条；
+    colossus 三球按本实现方向会偏 90°，属已知偏差（该效果是能量聚合，视觉上
+    三束光仍朝中心区域，偏差可接受）。真要修 colossus，应改它的数据或另立语义，
+    不能为了 3 个样本牺牲 2376 个。
+
+    取绕轴 (base × d) 转 base 与 d 夹角这一支（最短路径）。
     """
+    base = (0.0, 0.0, 1.0)
     d = _emit_dir(pitch_deg, yaw_deg)
-    dot = max(-1.0, min(1.0, d[1]))          # d · Y
+    dot = max(-1.0, min(1.0, sum(base[i] * d[i] for i in range(3))))
     ang = math.acos(dot)
     if ang < 1e-12:
         return ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
-    # axis = Y × d
-    ax = (1.0 * d[2] - 0.0 * d[1], 0.0 * d[0] - 0.0 * d[2], 0.0 * d[1] - 1.0 * d[0])
+    # axis = base × d
+    ax = (base[1] * d[2] - base[2] * d[1],
+          base[2] * d[0] - base[0] * d[2],
+          base[0] * d[1] - base[1] * d[0])
     ln = math.sqrt(ax[0] ** 2 + ax[1] ** 2 + ax[2] ** 2)
     if ln < 1e-12:
-        # d 与 Y 对径（pitch=±90 且 cos p=0 之外的退化），绕 X 转 180
+        # base 与 d 对径（d = -Z）：绕 X 转 180
         return ((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0))
     axis = (ax[0] / ln, ax[1] / ln, ax[2] / ln)
     return _axis_angle_matrix(axis, ang)
@@ -229,7 +242,7 @@ def _accel_vec(px, py, pz, forces, t_now):
             ax = np.where(ok, ax - amt * rx / ls, ax)
             ay = np.where(ok, ay - amt * ry / ls, ay)
             az = np.where(ok, az - amt * rz / ls, az)
-        elif ftype in ("vortex", "spin"):
+        elif ftype == "spin":
             d = f.direction
             ln = math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
             axis = (0.0, 1.0, 0.0) if ln < _EPS else (d[0] / ln, d[1] / ln, d[2] / ln)
@@ -239,6 +252,26 @@ def _accel_vec(px, py, pz, forces, t_now):
             ax = ax + amt * (axis[1] * rz - axis[2] * ry)
             ay = ay + amt * (axis[2] * rx - axis[0] * rz)
             az = az + amt * (axis[0] * ry - axis[1] * rx)
+        elif ftype == "vortex":
+            # 与标量版 _accel 的 vortex 分支严格一致：指向轴线的径向吸引、
+            # 归一化（不是与距离成正比的 Hooke 力）、正 amount 吸向轴线。
+            d = f.direction
+            ln = math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+            axis = (0.0, 1.0, 0.0) if ln < _EPS else (d[0] / ln, d[1] / ln, d[2] / ln)
+            rx = px - f.position[0]
+            ry = py - f.position[1]
+            rz = pz - f.position[2]
+            proj = axis[0] * rx + axis[1] * ry + axis[2] * rz
+            qx = rx - axis[0] * proj
+            qy = ry - axis[1] * proj
+            qz = rz - axis[2] * proj
+            l = np.sqrt(qx * qx + qy * qy + qz * qz)
+            ok = l > _EPS
+            ls = np.where(ok, l, 1.0)
+            k = amt / ls
+            ax = np.where(ok, ax - k * qx, ax)
+            ay = np.where(ok, ay - k * qy, ay)
+            az = np.where(ok, az - k * qz, az)
         elif ftype == "turbulence":
             ax = ax + amt * (np.sin(1.7 * px + 2.3 * t_now)
                              * np.cos(1.3 * py - 1.1 * t_now))
@@ -268,6 +301,10 @@ class SubsystemSim:
 
         # 发射速率与窗口（entity 事件偏移加在窗口起点上）
         self.rate = max(sub.emission[0], 0.0)
+        # mass=0 的粒子直接消失（pdx_axis_probe 实机：mass=0 那格完全看不到粒子）。
+        # 原版仅 1 处这么写，按「不发射」实现与画面等价，且不必在积分里特判。
+        if sub.mass[0] <= 0.0:
+            self.rate = 0.0
         self.start = sub.start[0] + time_offset
         # 同一系统里多个子系统错开 Halton 序列起点，避免它们发出完全相同的
         # 落点图案（同参数的两个子系统本来会长得一模一样）。
@@ -525,21 +562,23 @@ class SubsystemSim:
             py = (2.0 * w_pos2 - 1.0) * self.box_half_y
             pz = (2.0 * w_pos3 - 1.0) * self.box_half_z
         elif sub.emitter_type == "sphere" and self.sphere_r > 0.0:
-            # 球面点：半径 ± 方差，yaw/pitch 在给定范围内取（与引擎行为近似）
+            # 球面点：半径 ± 方差，yaw/pitch 在给定范围内取。
+            # 角度与 velocity/emitter 同一套（probe 实测）：只给一个轴全向 →
+            # 垂直于另一轴的环，两个都给才成球（标定件明确记载的行为）。
             r = max(self.sphere_r + self.sphere_r_var * (2.0 * w_pos1 - 1.0), 0.0)
             sy = self.sphere_yaw[0] + self.sphere_yaw[1] * (2.0 * w_pos2 - 1.0)
             sp = self.sphere_pitch[0] + self.sphere_pitch[1] * (2.0 * w_pos3 - 1.0)
-            d = sph_to_dir(sp, sy)
+            d = _emit_dir(sp, sy)
             px = d[0] * r
             py = d[1] * r
             pz = d[2] * r
         else:
             px = py = pz = 0.0
 
-        # 初速度方向
+        # 初速度方向（与 emitter/sphere 共用 probe 实测的那套仰角+方位角）
         p = self.pitch[0] + self.pitch[1] * (2.0 * w_dir1 - 1.0)
         y = self.yaw[0] + self.yaw[1] * (2.0 * w_dir2 - 1.0)
-        d = sph_to_dir(p, y)
+        d = _emit_dir(p, y)
         v = self.vel + self.vel_var * (2.0 * w_speed - 1.0)
 
         # 发射体朝向：旋转「形状偏移」与「出射方向」两样，position 不动。
@@ -598,7 +637,7 @@ class SubsystemSim:
                     ax -= amt * rx / l
                     ay -= amt * ry / l
                     az -= amt * rz / l
-            elif ftype in ("vortex", "spin"):
+            elif ftype == "spin":
                 # 零向量 direction 回退到 +Y。原先写的是
                 # `_norm3(f.direction) or (0.0, 1.0, 0.0)`，但 _norm3 在零向量时
                 # 返回**元组** (0,0,0)，而非空元组恒为真，所以 `or` 的回退**永不触发**，
@@ -618,6 +657,29 @@ class SubsystemSim:
                 ax += amt * c[0]
                 ay += amt * c[1]
                 az += amt * c[2]
+            elif ftype == "vortex":
+                # ★ vortex 不是漩涡（pdx_axis_probe 四轮实机订正）：它只有**指向
+                # direction 轴线的径向吸引**，没有任何切向分量。修前这里与 spin
+                # 共用叉积分支（当成绕轴公转），画面是一圈环绕，与实机不符。
+                # 实测依据：力心与该排发射点同 y 时（轴正好穿过发射点）整格粒子
+                # 纹丝不动 → 到轴距离为 0 时完全无力，所以取「垂直分量归一化」而不是
+                # 与距离成正比的 Hooke 力（后者会让给切向初速的粒子画出闭合轨道，
+                # 而实测一律是一条曲线飞走）。
+                # 符号：原版 42 处 vortex 的 name 多为 Gravity/Gravity+、amount 为
+                # 0.4~0.55，即原版就当引力井用 → **正 amount = 吸向轴线**。
+                a = _norm3(f.direction)
+                axis = a if (a[0] or a[1] or a[2]) else (0.0, 1.0, 0.0)
+                rx = p[0] - f.position[0]
+                ry = p[1] - f.position[1]
+                rz = p[2] - f.position[2]
+                proj = axis[0] * rx + axis[1] * ry + axis[2] * rz
+                perp = (rx - axis[0] * proj, ry - axis[1] * proj, rz - axis[2] * proj)
+                l = math.sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2])
+                if l > _EPS:
+                    k = amt / l
+                    ax -= k * perp[0]
+                    ay -= k * perp[1]
+                    az -= k * perp[2]
             elif ftype == "turbulence":
                 n = _turbulence(p, t)
                 ax += amt * n[0]

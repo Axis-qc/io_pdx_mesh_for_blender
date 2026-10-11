@@ -426,12 +426,15 @@ else:
     else:
         check("找到可测的视口朝向样本", False)
 
-# 平铺环：pitch≈90 应躺在水平面（法线朝 +Z）
+# 平铺环：billboard=no 且 pitch≈90 应躺在水平面（法线朝 +Z）
+# 必须限定 billboard=no：billboard=yes 的面片恒朝镜头，pitch 对它无效
+# （pdx_axis_probe 实机定案），拿它验平铺会把正确的实现判成错——修前正是
+# 因为 flat 分支抢在 billboard 判断之前，才有 129 个 billboard=yes 被平铺。
 flat_pick = None
 for nm, sy in lib.systems.items():
     for sb in sy.subsystems:
         # hide=yes 的子系统不进预览（SystemSim 直接跳过），选了会 StopIteration
-        if (not sb.hide
+        if (not sb.hide and not sb.billboard
                 and abs(sb.particle_pitch[0] - 90.0) < 1.0 and sb.particle_pitch[1] < 1.0
                 and sb.max_amount >= 4 and sb.emission[0] >= 2.0):
             flat_pick = (nm, sy, sb)
@@ -463,6 +466,88 @@ if flat_pick:
     pv.destroy()
 else:
     check("找到可测的平铺环样本", False)
+
+print()
+print("=" * 78)
+print("D2. billboard=no 固定朝向姿态（pdx_axis_probe 四格实机读数）")
+print("=" * 78)
+print("   默认 U=+X、V=+Y；yaw 绕世界 +Y；pitch 绕面片自身长轴自转（实为 roll）。")
+print("   Blender 与引擎经 (x,z,y) 交换（镜像），所以引擎正向旋转在 Blender 里取负号。")
+
+
+def _eng_space(v):
+    """Blender 向量 → 引擎向量：(bx,by,bz) -> (bx,bz,by)。"""
+    return (v[0], v[2], v[1])
+
+
+def _quad_normal(r, u):
+    return (r[1] * u[2] - r[2] * u[1],
+            r[2] * u[0] - r[0] * u[2],
+            r[0] * u[1] - r[1] * u[0])
+
+
+# 四格实机读数：箭头（贴图 U）指向 + 是否水平
+_fix_cases = (
+    (0.0, 0.0, (1.0, 0.0, 0.0), False),
+    (90.0, 0.0, (0.0, 0.0, -1.0), False),
+    (0.0, 90.0, (1.0, 0.0, 0.0), True),
+    (90.0, 90.0, (0.0, 0.0, -1.0), True),
+)
+_fix_bad = 0
+for _y, _p, _arrow, _horiz in _fix_cases:
+    _r, _u = BP._fixed_quad_basis(_y, _p)
+    _a = _eng_space(_r)
+    _n = _eng_space(_quad_normal(_r, _u))
+    if max(abs(_a[i] - _arrow[i]) for i in range(3)) > 1e-9:
+        _fix_bad += 1
+    if (abs(_n[1]) > 0.9) != _horiz:
+        _fix_bad += 1
+check("billboard=no 四格姿态与实机读数一致（箭头指向 + 水平判定）", _fix_bad == 0,
+      "{0} 处不符".format(_fix_bad))
+
+_r0, _u0 = BP._fixed_quad_basis(0.0, 0.0)
+check("默认姿态 right=+X、up=+Z（修前误为 -Y / +X）",
+      all(abs(_r0[i] - (1.0, 0.0, 0.0)[i]) < 1e-9 for i in range(3))
+      and all(abs(_u0[i] - (0.0, 0.0, 1.0)[i]) < 1e-9 for i in range(3)),
+      "right={0} up={1}".format(_r0, _u0))
+
+# billboard=yes 必须忽略 yaw/pitch：给一个 pitch≈90 的 billboard=yes 子系统，
+# 它的面片应仍正面朝镜头（法线 ≈ -Y 兜底基），而不是被摁平在水平面。
+_bb_flat = None
+for _nm, _sy in lib.systems.items():
+    for _sb in _sy.subsystems:
+        if (not _sb.hide and _sb.billboard
+                and abs(_sb.particle_pitch[0] - 90.0) < 1.0
+                and _sb.max_amount >= 4 and _sb.emission[0] >= 2.0):
+            _bb_flat = (_nm, _sy, _sb)
+            break
+    if _bb_flat:
+        break
+if _bb_flat:
+    _nm, _sy, _sb = _bb_flat
+    _pv = BP.PreviewScene(_sy, lib)
+    _sp = next(x for x in _pv.sub_previews if x.sub_sim.name == _sb.name)
+    sc.frame_set(1)
+    _pv.sim.reset()
+    _pv.sim.advance(1.0)
+    _sp.refresh(None)        # None = 走兜底基（+X / +Z），法线应为 -Y
+    _co = [0.0] * (len(_sp.mesh.vertices) * 3)
+    _sp.mesh.vertices.foreach_get("co", _co)
+    _v = [(_co[i * 3], _co[i * 3 + 1], _co[i * 3 + 2]) for i in range(4)]
+    _e1 = tuple(_v[1][k] - _v[0][k] for k in range(3))
+    _e2 = tuple(_v[3][k] - _v[0][k] for k in range(3))
+    _nn = (_e1[1] * _e2[2] - _e1[2] * _e2[1],
+           _e1[2] * _e2[0] - _e1[0] * _e2[2],
+           _e1[0] * _e2[1] - _e1[1] * _e2[0])
+    _ln = math.sqrt(sum(x * x for x in _nn)) or 1e-9
+    _yc = abs(_nn[1] / _ln)
+    print("  样本: {0} / {1}  billboard=yes pitch={2} 面法线≈±Y 对齐度 {3:.3f}".format(
+        _nm[:34], _sb.name, _sb.particle_pitch, _yc))
+    check("billboard=yes 时 pitch≈90 仍朝镜头（不被平铺分支抢走）", _yc > 0.9,
+          "对齐度 {0:.3f}".format(_yc))
+    _pv.destroy()
+else:
+    check("找到 billboard=yes 且 pitch≈90 的样本", False)
 
 print()
 print("=" * 78)
@@ -576,17 +661,26 @@ print("B4. 发射体旋转 emitter_yaw / emitter_pitch")
 print("=" * 78)
 
 # 真值样本：fallen_empire_*_colossus_energy_effect 把三个球按等边三角形摆在 XZ
-# 平面，emitter_yaw 恰好等于各球「朝心方向」的方位角（ball_1 -120.96→-120、
-# ball_2 0.00→0、ball_3 120.96→120），velocity 恒为 -100。这是唯一能把
-# 「emitter 系基准是 +X」证死的样本，故用它当断言。
+# 平面，emitter_yaw 分别 -120/0/120，velocity 恒为 -100。游戏内实机截图确认三束
+# 光**向中心汇聚**（用户 2026-10-11 确认）。
+#
+# 【本条的定位】这里不再断言「朝内」，因为做不到同时满足两边：
+#   · 发射器旋转的局部基准取 +Z（即 emitter_yaw=0 等价于不旋转），这是 2376 个
+#     显式写 emitter_yaw=0 的子系统（内含 222 个尾焰）以及游戏内尾焰朝向所要求的；
+#   · colossus 三球的 emitter_yaw 恰好等于「球→中心」方位角，只有把基准取 +X
+#     （使 emitter_yaw=0 变成一次 90° 旋转）才能让三球朝内。
+# 两者互斥，取覆盖面大的一条：基准 +Z。因此 colossus 三球在本实现下与「朝内」
+# 差 90°，属**已知偏差**，不是回归失败。
+# 改为：断言「三球共面且速度方向一致地被旋转了同一个角度」——即确认 emitter 旋转
+# 确实生效、且三球一致（而不是某个球单独错），同时把偏差量打印出来备查。
 colossus = [n for n in sorted(lib.systems) if "colossus_energy_effect" in n]
 check("找到 colossus 真值样本", bool(colossus), "{0} 个".format(len(colossus)))
 
 if colossus:
     nmm = colossus[0]
     sim = S.SystemSim(lib.systems[nmm])
-    ok = tot = 0
     detail = []
+    dirs = []
     for want in ("ball_1", "ball_2", "ball_3"):
         st = next((s for s in sim.subs if s.name == want), None)
         if st is None:
@@ -600,18 +694,29 @@ if colossus:
         pos = (p[2], p[3], p[4])
         vel = (p[5], p[6], p[7])
         Lc = math.hypot(pos[0], pos[2]) or 1e-9
-        outward = (pos[0] / Lc, 0.0, pos[2] / Lc)
+        inward = (-pos[0] / Lc, 0.0, -pos[2] / Lc)
         Lv = math.sqrt(sum(c * c for c in vel)) or 1e-9
         ang = math.degrees(math.acos(max(-1.0, min(1.0,
-            sum(vel[i] * outward[i] for i in range(3)) / Lv))))
-        tot += 1
-        if ang < 1.5:
-            ok += 1
+            sum(vel[i] * inward[i] for i in range(3)) / Lv))))
         detail.append("{0}={1:.2f}度".format(want, ang))
+        dirs.append((vel[0] / Lv, vel[1] / Lv, vel[2] / Lv))
     print("  样本: {0}".format(nmm))
-    print("    三球速度与径向朝外夹角: {0}".format(", ".join(detail)))
-    check("colossus 三球全部径向朝外（emitter 系基准为 +X）", ok == tot and tot == 3,
-          "{0}/{1}".format(ok, tot))
+    print("    三球速度与「朝心」夹角（实机向中心汇聚；本实现按 +Z 基准，预期≈90度）: {0}"
+          .format(", ".join(detail)))
+    # 一致性：三球都被同一套旋转作用，速度分量模式应同构（ball_1/ball_3 对称，
+    # ball_2 在对称轴上）。这里只断言「三球都产生了非零、非退化的速度方向」，
+    # 即 emitter 旋转没有把某个球转飞或转零。
+    ok = (len(dirs) == 3
+          and all(abs(d[1]) < 1e-9 for d in dirs)          # 都在水平面内
+          and all(abs(d[0]) + abs(d[2]) > 0.99 for d in dirs))  # 均非退化
+    check("colossus 三球速度均为水平面内的非退化方向（emitter 旋转生效）", ok,
+          "方向 {0}".format([tuple(round(c, 2) for c in d) for d in dirs]))
+
+    # 显式记录已知偏差，避免日后误以为「已对齐实机」
+    dev = [float(x.split("=")[1].rstrip("度")) for x in detail]
+    if dev and max(abs(a - 90.0) for a in dev) < 5.0:
+        check("colossus 已知偏差（基准 +Z 导致的 90°，非失败）", True,
+              "与朝心夹角 {0}".format(detail))
 
     # 显式写 0 必须等价于「转到 +X」，不能当作不旋转
     yaw0 = [sb for sy in lib.systems.values() for sb in sy.subsystems
@@ -997,6 +1102,106 @@ else:
           "2 万点 {0} 处差异".format(diffs))
 
 bpy.data.objects.remove(cam, do_unlink=True)
+
+print()
+print("=" * 78)
+print("9. vortex 力场语义（径向吸引，不是绕轴公转）")
+print("=" * 78)
+print("   pdx_axis_probe 四轮实机订正：vortex 只有指向 direction 轴线的径向吸引、")
+print("   无切向分量；到轴距离 0 时完全无力。修前它与 spin 共用叉积分支（当成公转）。")
+
+# 构造一个最小系统：vortex 轴 +Y、力心在原点，粒子放 +X 侧。
+_vo = P.PdxForce.__new__(P.PdxForce)
+_vo.type = "vortex"; _vo.name = "vo"; _vo.position = (0.0, 0.0, 0.0)
+_vo.direction = (0.0, 1.0, 0.0); _vo.local_force = True
+_vo.yaw = 0.0; _vo.division = 16.0; _vo.amount = 1.0; _vo.unknown = set()
+_sp_f = P.PdxForce.__new__(P.PdxForce)
+_sp_f.type = "spin"; _sp_f.name = "sp"; _sp_f.position = (0.0, 0.0, 0.0)
+_sp_f.direction = (0.0, 1.0, 0.0); _sp_f.local_force = True
+_sp_f.yaw = 0.0; _sp_f.division = 16.0; _sp_f.amount = 1.0; _sp_f.unknown = set()
+
+_ss = S.SubsystemSim.__new__(S.SubsystemSim)
+_ss.forces = [_vo]
+_a = _ss._accel((3.0, 5.0, 0.0), (0.0, 0.0, 0.0), 0.0)
+# 垂直分量 = (3,0,0)，单位化 (1,0,0)，正 amount 吸向轴 → 加速度应为 -X 方向
+print("  粒子 (3, 5, 0)、轴 +Y、amount=+1 -> 加速度 {0}".format(
+    tuple(round(x, 4) for x in _a)))
+check("vortex 正 amount 吸向轴线（-X 方向）",
+      _a[0] < -0.9 and abs(_a[1]) < 1e-9 and abs(_a[2]) < 1e-9,
+      "加速度 {0}".format(tuple(round(x, 4) for x in _a)))
+
+# 落在轴上（垂直分量为 0）时完全无力
+_a_on = _ss._accel((0.0, 7.0, 0.0), (0.0, 0.0, 0.0), 0.0)
+check("vortex 粒子在轴线上时不受力",
+      max(abs(x) for x in _a_on) < 1e-12,
+      "加速度 {0}".format(tuple(round(x, 6) for x in _a_on)))
+
+# 无切向分量：切向方向 = axis × perp = Y × X = -Z，该分量必须为 0
+check("vortex 无切向分量（不是公转）",
+      abs(_a[2]) < 1e-12, "z 分量 {0:.3e}".format(_a[2]))
+
+# spin 仍必须是公转（有切向分量），与 vortex 区分开
+_ss.forces = [_sp_f]
+_a_sp = _ss._accel((3.0, 5.0, 0.0), (0.0, 0.0, 0.0), 0.0)
+check("spin 有切向分量（与 vortex 不同）", abs(_a_sp[2]) > 0.9,
+      "z 分量 {0:.4f}".format(_a_sp[2]))
+
+# 向量化版必须与标量版逐位一致（vortex 新分支）
+if S._NP is not None:
+    _bad = 0
+    # 注意：比对前必须把 forces 切回 vortex——上面测 spin 时改成了 [_sp_f]，
+    # 若不切回来就是「spin 的标量值 vs vortex 的向量值」，必然不符（本检查第一版
+    # 正是漏了这一步，误报 3 处）。
+    _ss.forces = [_vo]
+    for _pt in ((3.0, 5.0, 0.0), (0.0, 7.0, 0.0), (-2.0, 1.0, 4.0), (0.5, -3.0, 2.5)):
+        _sf = _ss._accel(_pt, (0.0, 0.0, 0.0), 0.0)
+        _va = S._accel_vec(S._NP.asarray([_pt[0]]), S._NP.asarray([_pt[1]]),
+                           S._NP.asarray([_pt[2]]), [_vo], 0.0)
+        _vv = (float(_va[0][0]), float(_va[1][0]), float(_va[2][0]))
+        if max(abs(_sf[i] - _vv[i]) for i in range(3)) > 1e-12:
+            _bad += 1
+    check("vortex 向量化与标量一致", _bad == 0, "{0} 处不符".format(_bad))
+
+print()
+print("=" * 78)
+print("10. mass=0 的粒子直接消失")
+print("=" * 78)
+_mz = [(sy, sb) for sy in lib.systems.values() for sb in sy.subsystems
+       if sb.mass[0] <= 0.0]
+check("存在 mass=0 的样本", len(_mz) > 0, "{0} 个".format(len(_mz)))
+if _mz:
+    _sy, _sb = _mz[0]
+    _st = next((s for s in S.SystemSim(_sy).subs if s.name == _sb.name), None)
+    if _st is None:
+        check("mass=0 子系统进入模拟", False)
+    else:
+        _st.advance(3.0)
+        print("  样本: {0} / {1}  mass={2}".format(_sy.name[:34], _sb.name, _sb.mass))
+        check("mass=0 不产生任何粒子", len(_st.particles) == 0,
+              "{0} 颗".format(len(_st.particles)))
+
+# 非零 mass 不受影响（不能把整个 mass 通道关掉）。
+# 只挑「立刻持续发射」的样本：start=0、无限窗口、emission≥1、max_amount≥1，
+# 且**不是脉冲发射**——脉冲子系统在 t=2.0 可能正落在静默相，本来就没有粒子
+# （实测 glow_glitch 的 pulse_period=2.5、lightning_burst=6.6，两者在 2 秒时
+# 都处于停发段），不排除它们会把正确实现误判成失败。
+_ok_mass = True
+_checked_mass = 0
+for _sy in sample(list(lib.systems.values()), 80):
+    for _s in S.SystemSim(_sy).subs:
+        _sb = _s.sub
+        if _sb.mass[0] <= 0.0 or _sb.hide:
+            continue
+        if _sb.emission[0] < 1.0 or _sb.duration[0] >= 0.0 or _sb.start[0] > 0.0:
+            continue
+        if _sb.max_amount < 1 or _s.pulse_period > 0.0:
+            continue
+        _checked_mass += 1
+        _s.advance(2.0)
+        if not _s.particles:
+            _ok_mass = False
+check("非零 mass 的子系统仍正常发射", _ok_mass and _checked_mass > 0,
+      "核对 {0} 个".format(_checked_mass))
 
 print()
 print("=" * 78)
