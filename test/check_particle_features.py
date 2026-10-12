@@ -47,9 +47,8 @@ from io_pdx_mesh.pdx_particles import blender_preview as BP  # noqa: E402
 GAME = os.environ.get(
     "IO_PDX_TEST_GAME", r"G:\SteamLibrary\steamapps\common\Stellaris")
 
-# 可选：用户自建的标定件 mod 根。标定件（pdx_axis_probe）常放在 gfx/models 下，
-# 索引范围已放宽到整个 gfx/ 所以能被收进来；设了这个环境变量就能跑那几条真值断言，
-# 没设就退回游戏内同特征样本。默认读到已知路径就用，读不到不影响其它检查。
+# 可选：自建标定件所在的 mod 根。设了就跑针对标定件的真值断言，
+# 没设则退回游戏内同特征样本（标定件在用户 mod 下，测试库不一定扫得到）。
 PROBE_ROOT = os.environ.get(
     "IO_PDX_TEST_PROBE_ROOT",
     r"C:\Users\hp\Documents\Paradox Interactive\Stellaris\mod\stellaris_godie")
@@ -565,10 +564,7 @@ print()
 print("=" * 78)
 print("B2. 发射器形态：sphere 出生区域与半径（哈希权重回归）")
 print("=" * 78)
-print("   每个二元组字段的取数规则见 simulator._VAR_RULES：角度类用「基准 ± 方差」，")
-print("   长度/标量类用「基准 + 方差*U」。球面出生区域由 sphere_emitter_yaw / _pitch")
-print("   划定（角度类）：两轴都取到 ±180 才铺满整球；窄的范围得到一段弧带")
-print("   （标定件 test_2 的 yaw={10 20} pitch={60 80}，pitch 下探到 -20 会伸进下半球）。")
+print("   球面出生区域由 sphere_emitter_yaw / _pitch 划定；取数规则见 _VAR_RULES。")
 
 sph_pick = None
 for nm, sy in lib.systems.items():
@@ -1296,9 +1292,7 @@ print()
 print("=" * 78)
 print("11. 面片基角随机扰动 particle_pitch_var / particle_yaw_var")
 print("=" * 78)
-print("   原版结构由 _decomp/editor_registry.cpp 实锤：_var 用 CreateComponentVariation，")
-print("   且把同名基值当父节点传入 = 基值 + 变化量。修复前只取 [0]，全系统共享一组基向量。")
-print("   扰动在**发射时定死**，逐粒子一次（与 rotation 的基角同样式），不是每帧变。")
+print("   面片基角的方差按 _VAR_RULES 取，发射时定死、逐粒子一次。")
 
 _jit = [(sy.name, sb.name) for sy in lib.systems.values() for sb in sy.subsystems
         if not sb.billboard and (abs(sb.particle_pitch[1]) > 1e-6
@@ -1448,9 +1442,7 @@ print()
 print("=" * 78)
 print("12. 哈希权重：维度独立性与种子")
 print("=" * 78)
-print("   随机量来自整数哈希（_hash32），不再用 Halton 低差异序列。")
-print("   原因：低差异序列在索引小于 base 时退化成精确等差，小 max_amount 的")
-print("   子系统永远落在该区，导致 ① 相邻粒子恒定步长、② 各维同序（同进同退）。")
+print("   随机量来自整数哈希（_hash32），各维独立、同种子可复现。")
 
 _sim_w = S.SystemSim(sorted(lib.systems.values(), key=lambda s: s.name)[0])
 _st_w = _sim_w.subs[0]
@@ -1520,8 +1512,7 @@ print()
 print("=" * 78)
 print("13. 「基准 + 方差」字段的第二值是否真的被用上")
 print("=" * 78)
-print("   同类漏用在本仓库出现过多次，都是「解析层读到了、模拟层没用第二个值」。")
-print("   这里逐字段验：方差非零的样本，逐粒子取值必须散开。")
+print("   方差非零的样本，逐粒子取值必须散开（解析层读到、模拟层没用会露馅）。")
 
 
 def _spread_of(sysname, subname, team=60):
@@ -1640,9 +1631,9 @@ else:
 
 print()
 print("=" * 78)
-print("14. 二元组语义统一为「基准 + 方差×U」（U ∈ [0,1)）")
+print("14. 二元组取值域与球面出生区域")
 print("=" * 78)
-print("   不是「基准 ± 方差」。旧实现在半径上会让一半取到负值、被钳到原点。")
+print("   按 _VAR_RULES 的规则验各字段取值域（长度类不得为负、角度类可下探下半球）。")
 
 # 14a 逐字段验证：取值必须落在 [基准, 基准+方差] 内，且能覆盖整个区间
 _sem_sys = None
@@ -1697,8 +1688,7 @@ if _dust2[0] in lib.systems:
               all(-1e-6 <= r <= _rv + 1e-6 for r in _rs),
               "方差 {0:g} 实测 {1:.3f}~{2:.3f}".format(_rv, min(_rs), max(_rs)))
 
-# 14c 出生区域必须是「一段带」而不是整球：用标定件 test_2 的参数
-#     （yaw={10 20}、pitch={60 80}，用户实机确认是一条弧带）复现。
+# 14c 出生区域是「一段弧带」而不是整球：用标定件 test_2 的参数复现。
 _probe = ("pdx_axis_probe", "test_2")
 _sim_probe = None
 for _n, _sy in lib.systems.items():
@@ -1718,21 +1708,17 @@ if _probe[0] in lib.systems and any(s.name == "test_2" for s in lib.systems[_pro
         for _i in range(2000):
             _st.spawn_count = _i
             _st._spawn(0.0)
-        # 出生点要**减去 position 偏移**再归一化：p[2..4] 是引擎绝对坐标，含
-        # 子系统 position（test_2 的 position.y=20）。直接用绝对坐标算方向会被
-        # 偏移带歪，判负半球也会永远判不到。
+        # 出生点要减去 position 偏移再归一化：p[2..4] 是引擎绝对坐标，
+        # 含子系统 position（test_2 的 position.y=20）。
         _pos = _sb.position
         _pt = [(p[2] - _pos[0], p[3] - _pos[1], p[4] - _pos[2]) for p in _st.particles]
-        # 区间按**规则表**推：sphere_emitter_yaw/pitch 是角度类（±）
+        # 区间按规则表推（sphere_emitter_yaw/pitch 是角度类，±）
         _plo = _sb.sphere_pitch[0] - _sb.sphere_pitch[1]
         _phi = _sb.sphere_pitch[0] + _sb.sphere_pitch[1]
         _ylo = _sb.sphere_yaw[0] - _sb.sphere_yaw[1]
         _yhi = _sb.sphere_yaw[0] + _sb.sphere_yaw[1]
-        # 判定方式：把每颗方向反解回 (pitch, yaw)，再检查是否存在**同一区间内**
-        # 的一组角度能产生它。_emit_dir 的水平朝向 = (-sin yaw, cos yaw) 乘
-        # cos(pitch)；pitch 跨 90 时 cos 变号，水平朝向翻转 180°。所以按
-        # cos(pitch) 的符号分两支：正号组要求 yaw 落在区间内，负号组要求
-        # yaw+180 落在区间内（等价于 yaw ∈ 区间+180）。
+        # 反解判定：pitch 跨 90 时 cos(pitch) 变号、水平朝向翻 180°，
+        # 所以按 cos 符号分两支，负号支要求 yaw+180 落在区间内。
         _bad = 0
         for _x, _y, _z in _pt:
             _L = math.sqrt(_x * _x + _y * _y + _z * _z) or 1e-9
@@ -1878,8 +1864,7 @@ print()
 print("=" * 78)
 print("15. 二元组取数规则表（每字段一条规则）")
 print("=" * 78)
-print("   规则表存在的意义：改一个字段的语义不波及其它字段。历史上两次踩坑都是")
-print("   因为硬套统一语义（统一 ± 让半径算出负值；统一区间让 pitch 进不了下半球）。")
+print("   逐字段登记是否有规则、两种规则的端点值、标定件真值。")
 
 # 15a 规则表本身：角度类必须 pm、长度类必须 interval
 _rule_expect = {
@@ -1943,9 +1928,8 @@ if _negv:
 else:
     check("找到负基准 velocity 样本", False)
 
-# 15c 真值：pitch 基准 + 方差跨过 90 的球面发射器，角度类必须是 ± 才能进下半球。
-#     优先用标定件 test_2（pitch={60 80}）；标定件在用户 mod 目录下、测试库只扫
-#     游戏根目录时取不到，则退回游戏内同特征的样本。
+# 15c 真值：pitch 跨过 90 的球面发射器必须能进下半球（角度类才成立）。
+#     优先用标定件 test_2；取不到则退回游戏内同特征样本。
 _cross = None
 for _n, _sy in lib.systems.items():
     if "pdx_axis_probe" in _n:

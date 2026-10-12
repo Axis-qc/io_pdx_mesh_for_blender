@@ -729,15 +729,11 @@ def build_catalog(roots, roots_for_index=None):
 class ParticleLibrary:
     """扫多个根目录的 gfx/**/*.asset 建立系统名索引，并解析贴图绝对路径。
 
-    扫描范围是**整个 gfx/ 而不只是 gfx/particles/**：粒子本体不一定放在
-    gfx/particles 下，用户自建的标定件就常放在 gfx/models/test_mesh/ 之类的位置。
-    只扫 gfx/particles 会让这类文件虽然被注册表列出（注册项扫的是 gfx/**/*.gfx），
-    却因为索引里没有本体而在预览时报 "No body found for type ..."。
-    实测代价可忽略、误收为零：原版 gfx/ 下 359 个非 particles 的 .asset 顶层键
-    全是 entity(8409) / animation(2469) / light(27) 之类，命中 SYSTEM_KEYS 的
-    为 0 个，全部解析仅 ~1 秒。
+    扫整个 gfx/ 而不只是 gfx/particles/：粒子本体不一定放在 gfx/particles 下，
+    只扫那里会让注册表列出、预览却报 "No body found"。非粒子 .asset 的顶层键
+    不是 SYSTEM_KEYS，不会收进来。
 
-    扫描是递归的：本体在子目录里同样收进来。同名本体后扫到的覆盖先扫到的，
+    递归扫描：本体在子目录里同样收进来。同名本体后扫到的覆盖先扫到的，
     因此把优先级高的根（mod）放在 roots 前面。
     """
 
@@ -748,8 +744,6 @@ class ParticleLibrary:
 
     def scan(self):
         for root in self.roots:
-            # 只认 gfx/**/*.asset；_scan_file 内部再按 SYSTEM_KEYS 过滤顶层键，
-            # 所以模型/灯光/动画的 .asset 不会被当成粒子系统收进来。
             for path in iter_files(root, "gfx", {".asset"}):
                 self._scan_file(path)
         return self

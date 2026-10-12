@@ -331,8 +331,7 @@ def _import_loaded(context, loaded, missing, library):
     max_end = 0.0
     total_n = 0
     nested = []                      # 已解析但不渲染的嵌套子子系统，用于诊断提示
-    # 种子要在清空 entries **之前**读出来：import 算子每次都 clear + 重建，
-    # 放到之后就只能永远读到默认的 0 了。
+    # 种子必须在清空 entries 之前读：import 会 clear + 重建，之后读只能拿到默认值
     seed = context.scene.io_pdx_particle_seed
     for system, offset in loaded:
         try:
@@ -917,8 +916,7 @@ class IOPDX_PT_PDXparticles(Panel):
         layout.operator("io_pdx_particles.import", icon="FILEBROWSER",
                         text="Load from file ...")
 
-        # 种子：只影响「载入/重载时」生成的随机量，改完要 Reload 才生效
-        # （重建预览代价不小，不做成自动触发）。
+        # 种子改完要 Reload 才生效（不做成自动触发，重建预览代价不小）
         row = layout.row(align=True)
         row.prop(scene, "io_pdx_particle_seed", text="Seed")
         row.operator("io_pdx_particles.reload", text="", icon="FILE_REFRESH")
