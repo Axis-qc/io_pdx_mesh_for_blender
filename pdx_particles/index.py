@@ -214,13 +214,37 @@ class PDXIndex(object):
                 name = _text_of(top, "name")
                 if not name:
                     continue
+                # 记 (粒子名, 挂点名, 起播延迟)：挂点是粒子该出现的位置，
+                # 只留粒子名会让加载时无从定位。
                 particles = []
                 for state in top.child_values("state"):
                     for ev in state.child_values("event") + state.child_values("start_event"):
                         p = _text_of(ev, "particle")
                         if p:
-                            particles.append(p)
-                entities.append((name, _text_of(top, "pdxmesh"), particles, path, root, is_vanilla))
+                            t = ev.child("time")
+                            try:
+                                when = float(t.value) if t is not None and t.value is not None else 0.0
+                            except (TypeError, ValueError):
+                                when = 0.0
+                            particles.append({"particle": p, "node": _text_of(ev, "node"),
+                                              "time": when})
+                # entity 自带的挂点（实测 8429 个 entity 里 2160 个有，占 25.6%）：
+                # 这些点不在 .mesh 里，只导入模型不会建出它们，必须自己解析。
+                locators = []
+                for loc in top.child_values("locator"):
+                    lname = _text_of(loc, "name")
+                    if not lname:
+                        continue
+                    pos = loc.child("position")
+                    vals = list(getattr(pos, "positional", []) or []) if pos is not None else []
+                    try:
+                        xyz = [float(v) for v in vals[:3]] if len(vals) >= 3 else [0.0, 0.0, 0.0]
+                    except (TypeError, ValueError):
+                        xyz = [0.0, 0.0, 0.0]
+                    locators.append({"name": lname, "position": xyz})
+                simple = [p["particle"] for p in particles]
+                entities.append((name, _text_of(top, "pdxmesh"), particles, simple,
+                                 locators, path, root, is_vanilla))
 
     # ------------------------------------------------------------- entries
 
@@ -260,7 +284,7 @@ class PDXIndex(object):
                 {"type": typ, "scale": scale, "resolved": has_body}))
 
     def _build_entities(self, entities, pdxmesh_defs):
-        for name, pdxmesh, particles, src, root, is_vanilla in entities:
+        for name, pdxmesh, particles, simple, locators, src, root, is_vanilla in entities:
             mesh = ""
             if pdxmesh:
                 hit = pdxmesh_defs.get(pdxmesh)
@@ -269,12 +293,13 @@ class PDXIndex(object):
             keys = [name.lower()]
             if pdxmesh:
                 keys.append(pdxmesh.lower())
-            keys.extend(p.lower() for p in particles)
+            keys.extend(p.lower() for p in simple)
             self.entries.append(IndexEntry(
                 KIND_ENTITY, name, keys, src, _category_of(root, src),
                 root, is_vanilla,
-                {"pdxmesh": pdxmesh, "mesh": mesh, "particles": particles,
-                 "has_particle": bool(particles)}))
+                {"pdxmesh": pdxmesh, "mesh": mesh, "particles": simple,
+                 "events": particles, "locators": locators,
+                 "has_particle": bool(simple)}))
 
     # -------------------------------------------------------------- query
 

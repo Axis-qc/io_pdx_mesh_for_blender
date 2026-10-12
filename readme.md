@@ -63,9 +63,9 @@ git clone https://github.com/Axis-qc/io_pdx_mesh_for_blender.git
 
 导入会自动挑一帧粒子最多的画面，不用手动找。`Seed` 控制每颗粒子的随机量（寿命、速度、发射位置、朝向、颜色），同一个种子结果完全一样，改完按旁边的刷新按钮重载才生效；默认 0 按子系统序号自动错开。
 
-已知限制：`childsystem` 嵌套子系统只解析并在日志里提示，不参与渲染；`local_space` 不影响预览。`Entity` 那一栏目前只做到「模型导入 + 粒子按时起播」，粒子还落在原点，按 entity 的挂点定位尚未实现。
+已知限制：`childsystem` 嵌套子系统只解析并在日志里提示，不参与渲染；`local_space` 不影响预览。`Entity` 那一栏会把粒子挂到 entity 的 `node` 指定的挂点上，挂点优先用模型自带的，entity 自己写的 `locator` 会自动补建；没写 `node` 或名字对不上时粒子留在原点并在日志里提示。
 
-`version` 为 0.97.0，`current_git_tag` 保持 0.91 不动，让插件内置更新器仍以官方 0.91 为参照。
+`version` 为 0.98.0，`current_git_tag` 保持 0.91 不动，让插件内置更新器仍以官方 0.91 为参照。
 
 ### 使用注意事项
 

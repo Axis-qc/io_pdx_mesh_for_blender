@@ -1043,11 +1043,36 @@ def _load_particle_system(context, name, index):
     return _import_one(context, system, index.library)
 
 
-def _load_entity(context, entry, index):
-    """entity → 导入模型 + 挂点粒子（挂点定位见后续版本）。
+def _mount_points():
+    """场景里可作挂点的对象：模型导入时把 locator 建成 EMPTY，node 指向的就是它。"""
+    return {o.name: o for o in bpy.data.objects if o.type == "EMPTY"}
 
-    本轮只做到「模型进场景、粒子按事件 time 起播」，粒子位于原点：
-    node 挂点解析是下一轮的工作。
+
+def _make_locator_empty(name, xyz):
+    """按 entity 自带的 locator 建一个 EMPTY 挂点。
+
+    坐标换算与 .mesh 导入一致：引擎 (x, y, z) → Blender (x, z, y)（SPACE_MATRIX）。
+    """
+    from mathutils import Matrix, Vector  # type: ignore
+    # 复用 mesh 导入的同一套空间矩阵，避免两处各写一份换算
+    from ..pdx_blender.blender_import_export import SPACE_MATRIX
+    obj = bpy.data.objects.new(name, None)
+    obj.empty_display_type = "PLAIN_AXES"
+    obj.empty_display_size = 0.4
+    bpy.context.scene.collection.objects.link(obj)
+    # 先按引擎轴序平移，再整体换到 Blender 空间
+    local = Matrix.Translation(Vector((float(xyz[0]), float(xyz[1]), float(xyz[2]))))
+    obj.matrix_world = SPACE_MATRIX @ local
+    obj.rotation_mode = "XYZ"
+    return obj
+
+
+def _load_entity(context, entry, index):
+    """entity → 导入模型 + 把粒子挂到 node 指定的挂点上。
+
+    事件的 particle 是 .gfx 注册名（经 system_for_registration 换算本体），
+    node 是挂点名；名字匹配场景里的 EMPTY（模型导入时由 locator 建出），
+    命中就把粒子挂上去，没写明 node 或找不到对应挂点时留在原点并记日志。
     """
     detail = entry.detail
     mesh = detail.get("mesh") or ""
@@ -1058,22 +1083,62 @@ def _load_entity(context, entry, index):
             loaded_any = True
         except Exception as err:  # noqa: BLE001
             IO_PDX_LOG.error("entity mesh import failed: %s (%s)", mesh, err)
+
     scene = context.scene
     scene.io_pdx_particle_entries.clear()
     _clear_previews()
-    loaded = []
-    missing = []
-    for pname in detail.get("particles") or []:
+
+    mounts = _mount_points()
+    # entity 自带的 locator 不在 .mesh 里，只导模型不会建出它们；有 node 指向
+    # 这些名字时先补建 EMPTY，否则粒子找不到挂点只能留在原点。
+    for loc in detail.get("locators") or []:
+        lname = loc.get("name") or ""
+        if not lname or lname in mounts:
+            continue
+        try:
+            mounts[lname] = _make_locator_empty(lname, loc.get("position") or (0, 0, 0))
+        except Exception as err:  # noqa: BLE001
+            IO_PDX_LOG.error("locator create failed: %s (%s)", lname, err)
+    events = detail.get("events") or [{"particle": p} for p in detail.get("particles") or []]
+    # 先把 (本体, 挂点名, 起播延迟) 收齐再一次装载：逐个 _import_loaded 会各自
+    # 重挑一遍显示帧并反复重置时间轴范围，多事件 entity 会慢很多且只有最后一个生效。
+    plan, unmatched = [], []
+    for ev in events:
+        pname = ev.get("particle") or ""
         system = _resolve_system(index, pname)
         if system is None:
-            missing.append(pname)
+            unmatched.append(pname)
             continue
-        loaded.append((system, 0.0))
-    if loaded:
-        _import_loaded(context, loaded, missing, index.library)
-        loaded_any = True
-    if missing:
-        IO_PDX_LOG.warning("entity particle(s) not found: %s", ", ".join(sorted(set(missing))))
+        try:
+            offset = float(ev.get("time") or 0.0)
+        except (TypeError, ValueError):
+            offset = 0.0
+        plan.append((system, offset, ev.get("node") or "", pname))
+
+    if plan:
+        loaded = [(system, offset) for system, offset, _node, _n in plan]
+        if _import_loaded(context, loaded, [], index.library):
+            loaded_any = True
+        # 挂点按「本体名 → 该本体的 node 序列」对齐，而不是按 _ACTIVE 与 plan 的
+        # 下标：_import_loaded 只在建成功后追加 _ACTIVE，下标对不齐；同一个本体
+        # 出现多次时按出现顺序取。
+        nodes_by_system = {}
+        for system, _offset, node, _n in plan:
+            nodes_by_system.setdefault(system.name, []).append(node)
+        for preview in _ACTIVE:
+            queue = nodes_by_system.get(preview.system.name) or []
+            node = queue.pop(0) if queue else ""
+            if not node:
+                continue
+            empty = mounts.get(node)
+            if empty is not None:
+                preview.set_mount(empty)
+            else:
+                unmatched.append("{0}@{1}".format(preview.system.name, node))
+
+    if unmatched:
+        IO_PDX_LOG.warning("entity particle/mount not found: %s",
+                           ", ".join(sorted(set(unmatched))))
     return loaded_any
 
 

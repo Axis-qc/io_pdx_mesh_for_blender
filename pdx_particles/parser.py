@@ -485,21 +485,37 @@ def parse_gfx_registrations(path):
 
 
 def parse_entity_events(path):
-    """entity 包装文件 → [{entity, events:[{particle, time, keep_particle}]}]"""
+    """entity 包装文件 → [{entity, events:[{particle, time, node, ...}]}]
+
+    事件参数按实机出现频率取用（原版 8292 个 entity 块统计）：
+    node 32111 处、time 32107、particle 31137、trigger_once 30886。
+    node 是粒子挂在哪根挂点上，缺了它粒子只能堆在原点。
+
+    两个 key 都要读：event 是常规事件，start_event 是状态启动时触发
+    （全库 4642 处，astral_rift_entity 的粒子就写在里面），只读 event 会漏掉。
+    """
     out = []
     for top in parse_file(path):
         if top.key not in ENTITY_KEYS:
             continue
         name = top.child("name")
-        entry = {"entity": str(name.value) if name is not None and name.value is not None else "", "events": []}
+        # 与其他字段一致地去引号：parse 层已去一层，这里兜底（原写法会留下引号，
+        # 导致 entity 名带 " 与事件里的 particle 名对不上）。
+        ent_name = ""
+        if name is not None and name.value is not None:
+            ent_name = str(name.value).strip().strip('"')
+        entry = {"entity": ent_name, "events": []}
         for state in top.child_values("state"):
-            for ev in state.child_values("event"):
+            for ev in state.child_values("event") + state.child_values("start_event"):
                 p = ev.child("particle")
                 t = ev.child("time")
+                n = ev.child("node")
                 entry["events"].append({
-                    "particle": str(p.value).strip('"') if p is not None and p.value is not None else "",
+                    "particle": str(p.value).strip().strip('"') if p is not None and p.value is not None else "",
                     "time": _as_float(t.value, 0.0) if t is not None and t.value is not None else 0.0,
+                    "node": str(n.value).strip().strip('"') if n is not None and n.value is not None else "",
                     "keep_particle": _bool(ev.child("keep_particle")),
+                    "trigger_once": _bool(ev.child("trigger_once")),
                 })
         out.append(entry)
     return out

@@ -328,6 +328,24 @@ def main():
               len(scene.io_pdx_particle_entries) > 0,
               "n={0}".format(len(scene.io_pdx_particle_entries)))
 
+        # 挂点定位：test_example_entity 的事件写着 node="loc02"，模型导入会建出
+        # 同名 EMPTY，粒子对象应当 parent 到它而不是留在世界原点。
+        mounted = [o for o in bpy.data.objects
+                   if o.parent is not None and o.name.startswith("pdx_part_")]
+        if mounted:
+            parents = {o.parent.name for o in mounted}
+            check("particles mounted on the node locator", "loc02" in parents,
+                  "parents={0}".format(sorted(parents)))
+            # 单位阵 parent inverse：世界坐标应等于挂点坐标，而不是回到原点
+            got = mounted[0].matrix_world.translation
+            want = bpy.data.objects["loc02"].matrix_world.translation
+            check("mount keeps the locator position (not back at origin)",
+                  (got - want).length < 1e-4,
+                  "world={0} locator={1}".format(tuple(round(v, 3) for v in got),
+                                                 tuple(round(v, 3) for v in want)))
+        else:
+            check("entity particle objects exist", False, "no pdx_part_* objects")
+
     print("\n{0} passed / {1} failed".format(len(PASS), len(FAIL)))
     if FAIL:
         print("failed:", ", ".join(FAIL))

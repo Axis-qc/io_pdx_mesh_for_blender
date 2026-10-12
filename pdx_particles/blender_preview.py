@@ -21,6 +21,7 @@ import logging
 import math
 
 import bpy  # type: ignore
+from mathutils import Matrix  # type: ignore
 
 # numpy 是可选加速项：Blender 自带 numpy，但插件被裁剪过的环境可能没有。
 # 缺失时退回纯 Python 实现（结果完全一致，只是慢），不影响可用性。
@@ -620,6 +621,32 @@ class PreviewScene:
     def show_ref_sphere(self, show):
         self.ref_sphere.hide_viewport = not show
         self.ref_sphere.hide_render = not show
+
+    def set_mount(self, empty):
+        """把整个预览挂到一个挂点对象上（entity 的 node 字段指的那根）。
+
+        粒子网格按引擎局部坐标构建，挂到挂点后自然落在该挂点的位置与朝向上，
+        与游戏里「在 fx_turret 挂点播放 cannon_flash」一致。传 None 卸下挂载，
+        回到世界原点。
+
+        matrix_parent_inverse 必须是单位阵而不是 parent.matrix_world.inverted()：
+        后者是「保持变换」的写法，会让粒子留在世界原点不动，正是这里要避免的。
+        """
+        inv = Matrix.Identity(4)
+        for sp in self.sub_previews:
+            if sp.obj is None:
+                continue
+            try:
+                sp.obj.parent = empty
+                sp.obj.matrix_parent_inverse = inv
+            except ReferenceError:
+                pass
+        if self.ref_sphere is not None:
+            try:
+                self.ref_sphere.parent = empty
+                self.ref_sphere.matrix_parent_inverse = inv
+            except ReferenceError:
+                pass
 
     def refresh(self):
         """按当前场景帧驱动模拟并刷新所有网格。

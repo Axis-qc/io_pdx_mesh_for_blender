@@ -63,9 +63,9 @@ Particles share the model's axes, so a preview lines up with an imported ship fo
 
 Import picks the busiest frame automatically. The `Seed` field controls per-particle randomness (lifetime, speed, spawn position, orientation, colour); the same seed always reproduces the same result, and the refresh button next to it reloads after a change. The default 0 staggers subsystems by index.
 
-Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered; `local_space` has no effect on the preview. The `Entity` tab currently imports the model and starts the particles on their event time only — particles still sit at the origin, as mount-point placement is not implemented yet.
+Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered; `local_space` has no effect on the preview. The `Entity` tab places particles on the mount point named by the entity's `node` field; mount points come from the model where it has them, and `locator` blocks written in the entity itself are created as needed. When there is no `node`, or the name does not match, particles stay at the origin and a note goes to the log.
 
-`version` is 0.97.0, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
+`version` is 0.98.0, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
 
 ### Usage notes
 
