@@ -8,13 +8,29 @@ import importlib
 from textwrap import wrap
 
 import bpy  # type: ignore
-from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty  # type: ignore
-from bpy.types import Operator, Panel, UIList  # type: ignore
+from bpy.props import (  # type: ignore
+    BoolProperty,
+    CollectionProperty,
+    EnumProperty,
+    IntProperty,
+    StringProperty,
+)
+from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList  # type: ignore
 from bpy_extras.io_utils import ExportHelper, ImportHelper  # type: ignore
 
 from .. import ENGINE_SETTINGS, IO_PDX_INFO, IO_PDX_LOG, IO_PDX_SETTINGS
 from ..pdx_data import PDXData
 from ..updater import github
+
+# 本插件顶层包的模块名。这个值取决于安装方式：以扩展安装时是
+# "bl_ext.<仓库名>.io_pdx_mesh"，传统 addon 安装时是 "io_pdx_mesh"。
+# 偏好类的 bl_idname 必须用它——Blender 的 addons 字典就是拿这个键存偏好的，
+# 写死字面量会导致其中一种装法下偏好挂空（取到 None）。官方手册
+# "Extensions and Namespace > User Preferences and __package__" 也是这么要求的。
+from .. import __package__ as base_package
+
+# 粒子解析层：原版根探测直接复用 parser 里现成的实现，不重写。
+from ..pdx_particles.parser import detect_game_roots, looks_like_game_root
 
 try:
     from . import blender_import_export
@@ -879,3 +895,175 @@ class IOPDX_PT_PDXblender_help(PDXUI, Panel):
         col.operator("wm.url_open", icon="QUESTION", text="Addon Wiki").url = IO_PDX_INFO["doc_url"]
         col.operator("wm.url_open", icon="QUESTION", text="Paradox forums").url = IO_PDX_INFO["forum_url"]
         col.operator("wm.url_open", icon="QUESTION", text="Source code").url = IO_PDX_INFO["website"]
+
+
+""" ====================================================================================================================
+    Add-on preferences: where the game and any extra folders live.
+
+    These are read by the asset index (pdx_particles/index.py) through
+    bpy.context.preferences.addons[<module>].preferences, so the property names below are
+    part of that contract and must not be renamed.
+========================================================================================================================
+"""
+
+
+def get_addon_preferences():
+    """Return this add-on's AddonPreferences, or None when it isn't registered/available.
+
+    The key held in preferences.addons depends on how the add-on was installed: an
+    extension installs as "bl_ext.<repo>.io_pdx_mesh", a legacy add-on as "io_pdx_mesh".
+    Both are tried so callers work either way.
+    """
+    addons = bpy.context.preferences.addons
+    for key in (base_package, IO_PDX_INFO.get("id", "")):
+        if not key:
+            continue
+        addon = addons.get(key)
+        if addon is not None and addon.preferences is not None:
+            return addon.preferences
+    return None
+
+
+# fmt:off
+class PDXIndexRoot(PropertyGroup):
+    # Sorting only: pdx_blender/__init__.py registers in panel_order order, and a
+    # PropertyGroup must be registered before the AddonPreferences that references it
+    # (otherwise CollectionProperty raises "expected an RNA type ... missing bl_rna").
+    panel_order = -1
+
+    path: StringProperty(
+        name="Folder",
+        description="Folder to index for models, particles and entities",
+        subtype="DIR_PATH",
+        default="",
+    )
+
+
+class IOPDX_UL_index_root_list(UIList):
+    """Extra index folders; the path is edited inline in the row."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        layout.prop(item, "path", text="", emboss=False, icon="FILE_FOLDER")
+
+
+class IOPDX_AddonPreferences(AddonPreferences):
+    bl_idname = base_package
+    # Registered last (see PDXIndexRoot): every class this one references must exist first.
+    panel_order = 100
+
+    vanilla_root: StringProperty(
+        name="Game folder",
+        description="Root folder of the base game install; used to resolve assets that "
+                    "mods reference but do not ship",
+        subtype="DIR_PATH",
+        default="",
+    )
+    extra_roots: CollectionProperty(
+        type=PDXIndexRoot,
+    )
+    extra_root_index: IntProperty(
+        default=0,
+    )
+
+    def draw(self, context):
+        layout = self.layout
+
+        box = layout.box()
+        box.label(text="Game folder:", icon="FILE_FOLDER")
+        row = box.row(align=True)
+        row.prop(self, "vanilla_root", text="")
+        row.operator("io_pdx_mesh.detect_game_root", icon="VIEWZOOM", text="Detect")
+
+        box.separator()
+        box.label(text="Extra folders to index:", icon="FILE_FOLDER")
+        row = box.row()
+        row.template_list("IOPDX_UL_index_root_list", "", self, "extra_roots",
+                          self, "extra_root_index", rows=3)
+        col = row.column(align=True)
+        col.operator("io_pdx_mesh.add_index_root", icon="ADD", text="")
+        col.operator("io_pdx_mesh.remove_index_root", icon="REMOVE", text="")
+
+        # Status line. Prefer what the index layer reports on the scene; fall back to a
+        # count of configured folders. Neither is required, so drawing never fails here.
+        status = ""
+        scene = getattr(context, "scene", None)
+        if scene is not None:
+            status = getattr(scene, "io_pdx_index_status", "") or ""
+        if not status:
+            n_extra = len([entry for entry in self.extra_roots if entry.path])
+            status = "{0} game folder, {1} extra folder(s) configured".format(
+                "1" if self.vanilla_root else "no", n_extra)
+        box.label(text=status, icon="INFO")
+# fmt:on
+
+
+class IOPDX_OT_detect_game_root(Operator):
+    bl_idname = "io_pdx_mesh.detect_game_root"
+    bl_description = bl_label = "Find the game install folder"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        prefs = get_addon_preferences()
+        if prefs is None:
+            self.report({"WARNING"}, "Add-on preferences are not available!")
+            return {"CANCELLED"}
+
+        try:
+            roots = detect_game_roots()
+        except Exception as err:  # noqa: BLE001
+            self.report({"WARNING"}, "Game folder detection failed: {0}".format(err))
+            return {"CANCELLED"}
+
+        if not roots:
+            self.report({"WARNING"}, "No game install found - set the game folder manually")
+            return {"CANCELLED"}
+
+        # detect_game_roots() sorts usable roots first, but the rest are still returned so
+        # the user can point at a game whose layout we don't recognise.
+        pick = roots[0]
+        prefs.vanilla_root = pick
+        if looks_like_game_root(pick):
+            self.report({"INFO"}, "Game folder: {0}".format(pick))
+        else:
+            self.report({"WARNING"},
+                        "Found {0} but it has no gfx/particles or gfx/models - "
+                        "set the folder manually".format(pick))
+        return {"FINISHED"}
+
+
+class IOPDX_OT_add_index_root(Operator):
+    bl_idname = "io_pdx_mesh.add_index_root"
+    bl_description = bl_label = "Add a folder to index"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        prefs = get_addon_preferences()
+        if prefs is None:
+            self.report({"WARNING"}, "Add-on preferences are not available!")
+            return {"CANCELLED"}
+
+        # Left empty on purpose: the user types or picks the folder in the list row.
+        prefs.extra_roots.add()
+        prefs.extra_root_index = len(prefs.extra_roots) - 1
+        return {"FINISHED"}
+
+
+class IOPDX_OT_remove_index_root(Operator):
+    bl_idname = "io_pdx_mesh.remove_index_root"
+    bl_description = bl_label = "Remove the selected folder"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        prefs = get_addon_preferences()
+        if prefs is None:
+            self.report({"WARNING"}, "Add-on preferences are not available!")
+            return {"CANCELLED"}
+
+        index = prefs.extra_root_index
+        if not 0 <= index < len(prefs.extra_roots):
+            self.report({"WARNING"}, "Select a folder first")
+            return {"CANCELLED"}
+
+        prefs.extra_roots.remove(index)
+        prefs.extra_root_index = max(0, index - 1)
+        return {"FINISHED"}

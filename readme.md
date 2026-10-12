@@ -45,9 +45,13 @@ git clone https://github.com/Axis-qc/io_pdx_mesh_for_blender.git
 
 适配 Blender 5.x 的动画数据读取，以及 `imp` 换成 `importlib`（旧模块已在 Python 3.12 移除）。
 
-### 粒子预览
+### 资源浏览器与粒子预览
 
-把 `.gfx` 注册项或 `.asset` 粒子系统导入 Blender，在时间轴上擦洗预览。面板在侧栏 `PDX Blender Tools > Particles`：加扫描目录后 `Scan`，列表里挑一条 `Preview selected`；或用 `Load from file ...` 直接选文件。`.asset` 改完点 `Reload from source` 重新载入。
+面板在侧栏 `PDX Blender Tools > Particles`，分 `Models` / `Particles` / `Entity` 三个入口，对应「单独导模型」「单独看粒子」「模型和挂点粒子一起」。
+
+先在 `编辑 > 偏好设置 > 插件 > IO PDX Mesh` 里配好游戏目录（有 `Detect` 按钮自动找）和自己的 mod 目录，之后面板里搜索、选中、加载即可，不用翻文件夹。
+
+索引扫整个 `gfx/`，分类按文件所在目录自动分好，每个分类右边是条目数，点掉眼睛图标就整类隐藏，`Mod only` 只看自己 mod 的内容。装了新 mod 按 `Rescan` 重建。原版规模下建索引约 3 秒。手动选文件保留了，在面板底部的 `Load from file ...`。
 
 粒子时间按秒走，固定 1 秒 = 60 帧，与场景帧率无关。
 
@@ -59,9 +63,9 @@ git clone https://github.com/Axis-qc/io_pdx_mesh_for_blender.git
 
 导入会自动挑一帧粒子最多的画面，不用手动找。`Seed` 控制每颗粒子的随机量（寿命、速度、发射位置、朝向、颜色），同一个种子结果完全一样，改完按旁边的刷新按钮重载才生效；默认 0 按子系统序号自动错开。
 
-已知限制：`childsystem` 嵌套子系统只解析并在日志里提示，不参与渲染；`local_space` 不影响预览。
+已知限制：`childsystem` 嵌套子系统只解析并在日志里提示，不参与渲染；`local_space` 不影响预览。`Entity` 那一栏目前只做到「模型导入 + 粒子按时起播」，粒子还落在原点，按 entity 的挂点定位尚未实现。
 
-`version` 为 0.96.15，`current_git_tag` 保持 0.91 不动，让插件内置更新器仍以官方 0.91 为参照。
+`version` 为 0.97.0，`current_git_tag` 保持 0.91 不动，让插件内置更新器仍以官方 0.91 为参照。
 
 ### 使用注意事项
 

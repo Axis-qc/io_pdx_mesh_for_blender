@@ -45,9 +45,13 @@ Fixed missing textures. The texture filenames inside a `.mesh` are not necessari
 
 Adapted for Blender 5.x animation data access, and `imp` replaced with `importlib` (removed in Python 3.12).
 
-### Particle preview
+### Asset browser and particle preview
 
-Import a `.gfx` registration or `.asset` particle system and scrub it on the timeline. The panel is under `PDX Blender Tools > Particles` in the sidebar: add a scan folder and press `Scan`, then `Preview selected` on a list entry, or use `Load from file ...` directly. Press `Reload from source` after editing a `.asset`.
+The panel lives under `PDX Blender Tools > Particles` in the sidebar and has three tabs: `Models`, `Particles` and `Entity` — a model on its own, a particle system on its own, or a model together with its mount-point particles.
+
+First set the game folder (there is a `Detect` button) and your own mod folders under `Edit > Preferences > Add-ons > IO PDX Mesh`. After that you search, pick and load from the panel instead of browsing folders by hand.
+
+The index covers the whole `gfx/` tree and groups entries by the folder they live in; each category shows its entry count and can be hidden by clicking its eye icon, and `Mod only` keeps just your own mod's content. Press `Rescan` after installing a new mod. Building the index takes about 3 seconds for the vanilla game. Picking a file by hand is still there under `Load from file ...` at the bottom of the panel.
 
 Particle timing is in seconds at a fixed 60 frames per second, independent of the scene frame rate.
 
@@ -59,9 +63,9 @@ Particles share the model's axes, so a preview lines up with an imported ship fo
 
 Import picks the busiest frame automatically. The `Seed` field controls per-particle randomness (lifetime, speed, spawn position, orientation, colour); the same seed always reproduces the same result, and the refresh button next to it reloads after a change. The default 0 staggers subsystems by index.
 
-Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered; `local_space` has no effect on the preview.
+Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered; `local_space` has no effect on the preview. The `Entity` tab currently imports the model and starts the particles on their event time only — particles still sit at the origin, as mount-point placement is not implemented yet.
 
-`version` is 0.96.15, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
+`version` is 0.97.0, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
 
 ### Usage notes
 

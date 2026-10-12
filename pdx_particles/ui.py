@@ -16,20 +16,26 @@ from bpy.app.handlers import persistent  # type: ignore
 from bpy.props import (  # type: ignore
     BoolProperty,
     CollectionProperty,
+    EnumProperty,
     IntProperty,
     StringProperty,
 )
 from bpy.types import Operator, Panel, PropertyGroup, UIList  # type: ignore
 
-from .. import IO_PDX_LOG, IO_PDX_SETTINGS
+from .. import IO_PDX_INFO, IO_PDX_LOG, IO_PDX_SETTINGS
 from .parser import (
     ParticleLibrary,
     _infer_root,
-    build_catalog,
     detect_game_roots,
     looks_like_game_root,
     parse_entity_events,
     parse_gfx_registrations,
+)
+from .index import (
+    KIND_ENTITY,
+    KIND_MODEL,
+    KIND_PARTICLE,
+    PDXIndex,
 )
 from .simulator import PARTICLE_FPS
 from .blender_preview import PreviewScene, view_rotation_key
@@ -498,19 +504,184 @@ class IOPDX_OT_particle_ref_sphere_hide(Operator):
 
 
 # ----------------------------------------------------------------------------------------------------------------------
-# 目录扫描与注册项列表
+# 全局索引（模型 / 粒子 / 实体）
 # ----------------------------------------------------------------------------------------------------------------------
 
-# 扫描结果（模块级；UIList 只显示过滤后的子集，全量留在这里）
-_CATALOG = []
-_LIBRARY = None
 MAX_LIST_ROWS = 20000   # 近万条填充实测 <10ms，留个上限只为防病态数据
+
+# 索引与当前展示结果（模块级；跨 .blend 不持久化，重开文件会自动重建）
+_INDEX = None
+_INDEX_KEY = None
+_SHOWN = []             # 与列表行一一对应，供加载时取回原始条目
+_REBUILDING = False     # 重建分类列表期间抑制 enabled 回调（见 _category_enabled_update）
 
 # 选帧时的模拟采样次数上限：整条时间轴按步长抽样，避免秒数很长时逐帧推进。
 SAMPLE_BUDGET = 2400
 # 复核候选帧的次数上限（每次要从 reset 直跳到目标帧，在上千粒子的系统上很贵，
 # 实测 2400 粒子跑一次约 0.7s）。估算已经相当准，通常第一个候选就命中。
 REPLAY_TRIES = 3
+
+
+def _addon_prefs():
+    """取本插件的偏好对象，取不到返回 None。
+
+    扩展安装时 addons 键是 "bl_ext.user_default.io_pdx_mesh"（顶层包名），
+    不是 manifest 里的短 id；按短 id 查会永远拿到 None，表现为偏好里的设置
+    完全不生效但也不报错。两种装法（扩展 / 传统 addon）都要覆盖，故两级回退。
+    """
+    addons = bpy.context.preferences.addons
+    # __package__ 在这里是 "<插件包>.pdx_particles"，去掉末级才是 addons 的键：
+    # 传统安装是 "io_pdx_mesh"，扩展安装是 "bl_ext.user_default.io_pdx_mesh"。
+    top = __package__.rsplit(".", 1)[0] if "." in __package__ else __package__
+    for key in (top, IO_PDX_INFO["id"]):
+        entry = addons.get(key)
+        prefs = getattr(entry, "preferences", None) if entry is not None else None
+        if prefs is not None:
+            return prefs
+    return None
+
+
+def _pref_roots():
+    """从插件偏好取 (额外索引目录, 原版根)，带回退。
+
+    偏好由 IOPDX_AddonPreferences 提供（blender_ui.py）；旧版把根放在场景属性
+    与 settings.json 里，这里一并读入，老配置不会因为改版而失效。
+    """
+    extra, vanilla = [], ""
+    prefs = _addon_prefs()
+    if prefs is not None:
+        for entry in getattr(prefs, "extra_roots", []):
+            p = bpy.path.abspath(entry.path) if entry.path else ""
+            if p and os.path.isdir(p) and p not in extra:
+                extra.append(p)
+        v = getattr(prefs, "vanilla_root", "") or ""
+        if v:
+            v = bpy.path.abspath(v)
+            if os.path.isdir(v):
+                vanilla = v
+    for p in _roots():
+        if p not in extra and p != vanilla:
+            extra.append(p)
+    if not vanilla:
+        vanilla = _vanilla_root()
+    return extra, vanilla
+
+
+def _ensure_index(force=False):
+    """按当前配置建索引；配置没变就复用。
+
+    原版根排在最后：PDXIndex 用 setdefault 收本体，先扫到的优先，mod 排前面
+    才能覆盖原版同名资源。
+    """
+    global _INDEX, _INDEX_KEY
+    extra, vanilla = _pref_roots()
+    key = (tuple(extra), vanilla)
+    if force or _INDEX is None or _INDEX_KEY != key:
+        roots = list(extra)
+        if vanilla and vanilla not in roots:
+            roots.append(vanilla)
+        _INDEX = PDXIndex(roots, vanilla_root=vanilla).build()
+        _INDEX_KEY = key
+        IO_PDX_LOG.info("asset index: %s", _INDEX.stats)
+    return _INDEX
+
+
+def _disabled_for(scene, kind):
+    """当前分类下被禁用的目录名集合。"""
+    return {d.category for d in scene.io_pdx_index_disabled if d.kind == kind}
+
+
+def _set_category_enabled(scene, kind, category, enabled):
+    for i, d in enumerate(scene.io_pdx_index_disabled):
+        if d.kind == kind and d.category == category:
+            if not enabled:
+                return
+            scene.io_pdx_index_disabled.remove(i)
+            return
+    if not enabled:
+        d = scene.io_pdx_index_disabled.add()
+        d.kind = kind
+        d.category = category
+
+
+def _detail_text(entry):
+    """列表右侧的一行说明。"""
+    d = entry.detail
+    if entry.kind == KIND_MODEL:
+        names = d.get("pdxmesh") or []
+        return names[0] if names else ""
+    if entry.kind == KIND_PARTICLE:
+        n = d.get("type") or ""
+        return n if d.get("resolved") else "{0} (no body)".format(n)
+    bits = []
+    if d.get("pdxmesh"):
+        bits.append(d["pdxmesh"])
+    if d.get("particles"):
+        bits.append("{0} particle(s)".format(len(d["particles"])))
+    return "  ".join(bits)
+
+
+def _rebuild_categories(context):
+    """按当前标签页重建分类列表，保留本类已禁用的目录。"""
+    global _REBUILDING
+    scene = context.scene
+    kind = scene.io_pdx_asset_tab
+    index = _ensure_index()
+    disabled = _disabled_for(scene, kind)
+    _REBUILDING = True
+    try:
+        scene.io_pdx_index_categories.clear()
+        for name, count in index.categories(kind).items():
+            item = scene.io_pdx_index_categories.add()
+            item.kind = kind
+            item.category = name
+            item.name = name
+            item.count = count
+            item.enabled = name not in disabled
+        scene.io_pdx_index_category_index = 0
+    finally:
+        _REBUILDING = False
+
+
+def _rebuild_asset_list(context):
+    """按标签页、搜索词、禁用目录与 mod-only 过滤，填充列表。"""
+    global _SHOWN
+    scene = context.scene
+    kind = scene.io_pdx_asset_tab
+    index = _ensure_index()
+    # 实体页只列带粒子的：本页的用途就是「模型 + 粒子一起看」
+    require_particle = kind == KIND_ENTITY
+    entries = index.query(
+        kind,
+        text=scene.io_pdx_asset_filter or "",
+        disabled=_disabled_for(scene, kind),
+        mod_only=scene.io_pdx_index_mod_only,
+        require_particle=require_particle,
+    )
+    _SHOWN = entries[:MAX_LIST_ROWS]
+    scene.io_pdx_asset_items.clear()
+    for e in _SHOWN:
+        item = scene.io_pdx_asset_items.add()
+        item.name = e.name
+        item.detail = _detail_text(e)
+        item.category = e.category
+        item.vanilla = e.is_vanilla
+    total = len(entries)
+    scene.io_pdx_asset_index = 0
+    scene.io_pdx_index_status = "{0} shown / {1} matched  ·  index {2} files in {3}s".format(
+        len(_SHOWN), total, index.stats.get("files", 0), index.stats.get("seconds", 0))
+    return len(_SHOWN)
+
+
+def _asset_filter_update(self, context):
+    _rebuild_asset_list(context)
+
+
+def _asset_tab_update(self, context):
+    context.scene.io_pdx_asset_filter = ""
+    _rebuild_categories(context)
+    _rebuild_asset_list(context)
+
 
 
 def _count_now(previews):
@@ -619,64 +790,59 @@ def _pick_frame(previews, fps, max_end):
     return (order[0] if order else 1) + 1, 0
 
 
-def _rebuild_list(scene):
-    """按搜索词把 _CATALOG 过滤进场景列表。"""
-    text = (scene.io_pdx_particle_filter or "").strip().lower()
-    scene.io_pdx_particle_items.clear()
-    shown = 0
-    for e in _CATALOG:
-        if text and text not in e.name.lower() and text not in (e.type or "").lower():
-            continue
-        item = scene.io_pdx_particle_items.add()
-        item.name = e.name
-        item.type = e.type or ""
-        item.source = os.path.basename(e.source_file or "")
-        item.resolved = e.resolved
-        shown += 1
-        if shown >= MAX_LIST_ROWS:
-            break
-    return shown
-
-
-def _filter_update(self, context):
-    _rebuild_list(context.scene)
-
-
-def _scan_roots(context):
-    """按配置的根目录扫描，填充 _CATALOG。返回 (条目数, 解析数)。"""
-    global _CATALOG, _LIBRARY
-    roots = _roots()
-    if not roots:
-        _CATALOG, _LIBRARY = [], None
-        return 0, 0
-    # 索引要连原版根一起建：列表只列扫描根里的注册项，但贴图解析与本体回退
-    # 都可能落在原版目录，且 mod 粒子常引用原版贴图。
-    _CATALOG, _LIBRARY = build_catalog(roots, roots_for_index=_texture_roots())
-    n_res = sum(1 for e in _CATALOG if e.resolved)
-    return len(_CATALOG), n_res
-
-
-def _library_now():
-    """当前扫描根 + 原版根对应的索引；根变了就重建。
-
-    典型顺序是先 Scan（此时只加了 mod 目录）再按 Detect 配原版根。缓存的索引里
-    没有新根，贴图会一直解析不到，所以这里比对根列表，不一致就重建。
-    """
-    global _LIBRARY
-    roots_now = _texture_roots()
-    if _LIBRARY is None or list(_LIBRARY.roots) != roots_now:
-        _LIBRARY = ParticleLibrary(roots_now).scan()
-    return _LIBRARY
-
-
 class ParticleRoot(PropertyGroup):
     path: StringProperty(name="Root", subtype="DIR_PATH")  # noqa: F821
 
 
-class ParticleListItem(PropertyGroup):
-    type: StringProperty()      # noqa: F821
-    source: StringProperty()    # noqa: F821
-    resolved: BoolProperty()    # noqa: F821
+def _category_enabled_update(self, context):
+    """分类眼睛图标切换后重建列表（并记进禁用集合）。
+
+    重建分类列表时也会写 enabled，那时必须跳过本回调：否则会往禁用集合里
+    重复追加同一条。_REBUILDING 就是给这种情况用的。
+    """
+    if _REBUILDING:
+        return
+    _set_category_enabled(context.scene, self.kind, self.category, self.enabled)
+    _rebuild_asset_list(context)
+
+
+class IndexCategory(PropertyGroup):
+    """分类列表里的显示行（不持久化，每次由索引重建）。"""
+    kind: StringProperty()      # noqa: F821
+    category: StringProperty()  # noqa: F821
+    name: StringProperty()      # noqa: F821  展示用目录名
+    count: IntProperty()        # noqa: F821  该类条目数
+    enabled: BoolProperty(default=True, update=_category_enabled_update)  # noqa: F821
+
+
+class DisabledCategory(PropertyGroup):
+    """被关掉的分类（无回调，只作记录）。"""
+    kind: StringProperty()      # noqa: F821
+    category: StringProperty()  # noqa: F821
+
+
+class AssetListItem(PropertyGroup):
+    """列表里的一行（对应 _SHOWN 里的一个索引条目）。"""
+    name: StringProperty()      # noqa: F821
+    detail: StringProperty()    # noqa: F821
+    category: StringProperty()  # noqa: F821
+    vanilla: BoolProperty()     # noqa: F821
+
+
+class IOPDX_UL_asset_items(UIList):
+    """条目列表：名字 + 右侧说明，来源是原版时标一个标记。"""
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_prop,
+                  index, flt_flag):
+        row = layout.row(align=True)
+        row.label(text=item.name, icon=self._icon(context))
+        row.label(text=item.detail)
+        if item.vanilla:
+            row.label(text="game", icon="PACKAGE")
+
+    def _icon(self, context):
+        kind = context.scene.io_pdx_asset_tab
+        return {"model": "MESH_CUBE", "particle": "PARTICLE_POINT"}.get(kind, "OUTLINER_OB_EMPTY")
 
 
 class IOPDX_UL_particle_roots(UIList):
@@ -688,15 +854,17 @@ class IOPDX_UL_particle_roots(UIList):
                      icon="FILE_FOLDER")
 
 
-class IOPDX_UL_particle_catalog(UIList):
-    """注册项列表：显示注册名，右侧标出无本体的条目。"""
+class IOPDX_UL_index_categories(UIList):
+    """分类列表：一眼是目录名，右侧数字是该类条目数，眼睛图标切换启用。"""
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_prop,
                   index, flt_flag):
         row = layout.row(align=True)
-        ic = "PARTICLE_POINT" if item.resolved else "ERROR"
-        row.label(text=item.name, icon=ic)
-        row.label(text=item.source)
+        row.label(text=item.name, icon="FILE_FOLDER")
+        row.label(text=str(item.count))
+        row.prop(item, "enabled", text="", icon="HIDE_OFF" if item.enabled else "HIDE_ON",
+                 emboss=False)
+
 
 
 class IOPDX_OT_particle_add_root(Operator):
@@ -792,63 +960,163 @@ class IOPDX_OT_particle_add_vanilla(Operator):
         return {"FINISHED"}
 
 
-class IOPDX_OT_particle_scan(Operator):
-    """Scan all listed folders and list every registered particle"""
-    bl_idname = "io_pdx_particles.scan"
-    bl_label = "Scan"
-    bl_description = "Scan the folders above and list all registered particles"
+class IOPDX_OT_index_rescan(Operator):
+    """Rebuild the asset index from the configured folders"""
+    bl_idname = "io_pdx_particles.rescan"
+    bl_label = "Rescan"
+    bl_description = "Rebuild the asset index (run after installing or updating mods)"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        scene = context.scene
-        total, resolved = _scan_roots(context)
-        if total == 0:
-            _rebuild_list(scene)
-            self.report({"ERROR"}, "Nothing found — add a game or mod folder first")
+        index = _ensure_index(force=True)
+        _rebuild_categories(context)
+        _rebuild_asset_list(context)
+        if not index.stats.get("files"):
+            self.report({"ERROR"}, "Nothing found — set the game folder or add a mod folder")
             return {"CANCELLED"}
-        _rebuild_list(scene)
-        self.report({"INFO"}, "{0} particles ({1} without a body)".format(
-            total, total - resolved))
+        self.report({"INFO"}, "Indexed {0} files in {1}s".format(
+            index.stats.get("files"), index.stats.get("seconds")))
         return {"FINISHED"}
 
 
-class IOPDX_OT_particle_preview_item(Operator):
-    """Preview the selected particle"""
-    bl_idname = "io_pdx_particles.preview_item"
-    bl_label = "Preview selected"
-    bl_description = "Build a preview for the selected particle"
+class IOPDX_OT_index_all_categories(Operator):
+    """Enable every category of the current tab"""
+    bl_idname = "io_pdx_particles.all_categories"
+    bl_label = "Enable all"
+    bl_description = "Turn every category back on"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         scene = context.scene
-        idx = scene.io_pdx_particle_index
-        if not _CATALOG:
-            self.report({"ERROR"}, "Scan first")
-            return {"CANCELLED"}
-        item = scene.io_pdx_particle_items[idx] if 0 <= idx < len(scene.io_pdx_particle_items) else None
-        if item is None:
-            self.report({"WARNING"}, "Select a particle in the list")
-            return {"CANCELLED"}
+        kind = scene.io_pdx_asset_tab
+        for i in range(len(scene.io_pdx_index_disabled) - 1, -1, -1):
+            if scene.io_pdx_index_disabled[i].kind == kind:
+                scene.io_pdx_index_disabled.remove(i)
+        _rebuild_categories(context)
+        _rebuild_asset_list(context)
+        return {"FINISHED"}
 
-        target = None
-        for e in _CATALOG:
-            if e.name == item.name and os.path.basename(e.source_file) == item.source:
-                target = e
-                break
-        if target is None:
-            self.report({"ERROR"}, "Entry not found")
-            return {"CANCELLED"}
-        if target.system is None:
-            self.report({"ERROR"}, "No body found for type '{0}'".format(target.type))
-            return {"CANCELLED"}
 
-        scene.io_pdx_particle_entries.clear()
-        _clear_previews()
-        ok = _import_one(context, target.system, _library_now())
+class IOPDX_OT_asset_filter_update(Operator):
+    """Apply the search box"""
+    bl_idname = "io_pdx_particles.filter_update"
+    bl_label = "Search"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        _rebuild_asset_list(context)
+        return {"FINISHED"}
+
+
+def _selected_entry(scene):
+    """当前列表选中行对应的索引条目；没有则 None。"""
+    idx = scene.io_pdx_asset_index
+    if not (0 <= idx < len(_SHOWN)):
+        return None
+    return _SHOWN[idx]
+
+
+def _load_mesh_path(path):
+    """导入 .mesh（复用模型导入流程）。
+
+    延迟 import：pdx_blender 包在导入期会回头 import 本模块，模块级互相引用会成环。
+    """
+    from ..pdx_blender.blender_import_export import import_meshfile
+    import_meshfile(path)
+
+
+def _resolve_system(index, name):
+    """名字（注册名或本体名）→ 粒子本体，取不到返回 None。
+
+    entity 事件里写的是 .gfx 注册名，本体名常与它不同
+    （plasma_cannon_medium_hit_effect → plasma_cannon_hit_effect），
+    必须经注册表换算，否则实体一个粒子都点不亮。
+    """
+    return index.system_for_registration(name)
+
+
+def _load_particle_system(context, name, index):
+    """按注册名或本体名建粒子预览。"""
+    system = _resolve_system(index, name)
+    if system is None:
+        return False
+    return _import_one(context, system, index.library)
+
+
+def _load_entity(context, entry, index):
+    """entity → 导入模型 + 挂点粒子（挂点定位见后续版本）。
+
+    本轮只做到「模型进场景、粒子按事件 time 起播」，粒子位于原点：
+    node 挂点解析是下一轮的工作。
+    """
+    detail = entry.detail
+    mesh = detail.get("mesh") or ""
+    loaded_any = False
+    if mesh and os.path.isfile(mesh):
+        try:
+            _load_mesh_path(mesh)
+            loaded_any = True
+        except Exception as err:  # noqa: BLE001
+            IO_PDX_LOG.error("entity mesh import failed: %s (%s)", mesh, err)
+    scene = context.scene
+    scene.io_pdx_particle_entries.clear()
+    _clear_previews()
+    loaded = []
+    missing = []
+    for pname in detail.get("particles") or []:
+        system = _resolve_system(index, pname)
+        if system is None:
+            missing.append(pname)
+            continue
+        loaded.append((system, 0.0))
+    if loaded:
+        _import_loaded(context, loaded, missing, index.library)
+        loaded_any = True
+    if missing:
+        IO_PDX_LOG.warning("entity particle(s) not found: %s", ", ".join(sorted(set(missing))))
+    return loaded_any
+
+
+class IOPDX_OT_asset_load(Operator):
+    """Load whatever the selected list entry points at"""
+    bl_idname = "io_pdx_particles.load_selected"
+    bl_label = "Load selected"
+    bl_description = "Load the selected model / particle / entity"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        entry = _selected_entry(scene)
+        if entry is None:
+            self.report({"WARNING"}, "Select an entry in the list first")
+            return {"CANCELLED"}
+        index = _ensure_index()
+
+        if entry.kind == KIND_MODEL:
+            try:
+                _load_mesh_path(entry.path)
+            except Exception as err:  # noqa: BLE001
+                self.report({"ERROR"}, "Mesh import failed: {0}".format(err))
+                return {"CANCELLED"}
+            self.report({"INFO"}, "Loaded model {0}".format(entry.name))
+            return {"FINISHED"}
+
+        if entry.kind == KIND_PARTICLE:
+            typ = entry.detail.get("type") or ""
+            scene.io_pdx_particle_entries.clear()
+            _clear_previews()
+            if not _load_particle_system(context, typ, index):
+                self.report({"ERROR"}, "No body found for type '{0}'".format(typ))
+                return {"CANCELLED"}
+            self.report({"INFO"}, "Previewing {0}".format(entry.name))
+            return {"FINISHED"}
+
+        ok = _load_entity(context, entry, index)
         if not ok:
-            self.report({"ERROR"}, "Preview build failed for {0}".format(target.name))
+            self.report({"ERROR"}, "Entity '{0}' has no loadable mesh or particle".format(entry.name))
             return {"CANCELLED"}
-        self.report({"INFO"}, "Previewing {0}".format(target.name))
+        n = len(entry.detail.get("particles") or [])
+        self.report({"INFO"}, "Loaded entity {0} ({1} particle(s))".format(entry.name, n))
         return {"FINISHED"}
 
 
@@ -856,6 +1124,7 @@ def _import_one(context, system, library):
     """装载单个系统的预览（列表选中即预览走这条）。"""
     loaded = [(system, 0.0)]
     return _import_loaded(context, loaded, [], library)
+
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -873,46 +1142,53 @@ class IOPDX_PT_PDXparticles(Panel):
         layout = self.layout
         scene = context.scene
 
-        # ---- 扫描根目录 ----
-        layout.label(text="Scan folders:", icon="FILE_FOLDER")
-        rows = layout.row(align=True)
-        rows.template_list("IOPDX_UL_particle_roots", "", scene, "io_pdx_particle_roots",
-                           scene, "io_pdx_particle_root_index", rows=3)
-        btns = rows.column(align=True)
-        btns.operator("io_pdx_particles.add_root", icon="ADD", text="")
-        btns.operator("io_pdx_particles.remove_root", icon="REMOVE", text="")
-        layout.operator("io_pdx_particles.scan", icon="VIEWZOOM", text="Scan")
+        # ---- 三个入口：模型 / 粒子 / 实体 ----
+        row = layout.row(align=True)
+        row.prop(scene, "io_pdx_asset_tab", expand=True)
 
-        # 原版根：只用于回退找 mod 没自带的贴图。默认空，靠 Detect 或手填，
-        # 插件里不写死任何本机路径，装到别人机器上也是干净的。
-        box2 = layout.box()
-        box2.label(text="Game folder (texture fallback):", icon="FILE_FOLDER")
-        row = box2.row(align=True)
-        row.prop(scene, "io_pdx_particle_vanilla_root", text="")
-        row.operator("io_pdx_particles.detect_game", icon="VIEWZOOM", text="Detect")
-        if _vanilla_root():
-            box2.operator("io_pdx_particles.add_vanilla_to_scan",
-                          icon="ADD", text="Also list game's own particles")
-        else:
-            box2.label(text="Unset — only mod textures resolve", icon="INFO")
+        # ---- 索引状态与重建 ----
+        index = _ensure_index()
+        # 两个都要判：分类列表为空（首次打开 / 重开 .blend 后模块级索引丢了），
+        # 或索引本身换了内容（用户在偏好里改了游戏目录或增删了 mod 目录）——
+        # 后者若只看「列表是否为空」会漏掉，表现为面板还列着旧目录的内容。
+        token = repr(_INDEX_KEY)
+        if not scene.io_pdx_index_categories or scene.io_pdx_index_token != token:
+            scene.io_pdx_index_token = token
+            _rebuild_categories(context)
+            _rebuild_asset_list(context)
+        row = layout.row(align=True)
+        row.label(text="Game folder:", icon="FILE_FOLDER")
+        row.operator("io_pdx_particles.rescan", icon="FILE_REFRESH", text="Rescan")
+        if not index.stats.get("files"):
+            box = layout.box()
+            box.label(text="No folder configured yet.", icon="INFO")
+            box.label(text="Set it in Preferences > Add-ons > IO PDX Mesh,")
+            box.label(text="or add a mod folder there, then Rescan.")
+            return
 
-        # ---- 注册项列表 ----
-        if _CATALOG:
-            layout.prop(scene, "io_pdx_particle_filter", text="", icon="VIEWZOOM")
-            layout.label(text="{0} shown / {1} registered".format(
-                len(scene.io_pdx_particle_items), len(_CATALOG)))
-            layout.template_list("IOPDX_UL_particle_catalog", "", scene,
-                                 "io_pdx_particle_items", scene, "io_pdx_particle_index",
-                                 rows=6)
-            layout.operator("io_pdx_particles.preview_item", icon="PARTICLES",
-                            text="Preview selected")
-        elif scene.io_pdx_particle_items:
-            # 重开 .blend 后模块级扫描结果就没了，但场景里的行还在
-            layout.label(text="Stale list — press Scan again", icon="ERROR")
-        else:
-            layout.label(text="No scan yet — add a folder, then Scan", icon="INFO")
+        # ---- 搜索 ----
+        layout.prop(scene, "io_pdx_asset_filter", text="", icon="VIEWZOOM")
 
-        layout.separator()
+        # ---- 分类（可整类禁用）----
+        box = layout.box()
+        head = box.row(align=True)
+        n_dis = len(_disabled_for(scene, scene.io_pdx_asset_tab))
+        head.label(text="Categories ({0} off):".format(n_dis), icon="FILE_FOLDER")
+        head.operator("io_pdx_particles.all_categories", text="All", icon="HIDE_OFF")
+        rows = box.row(align=True)
+        rows.template_list("IOPDX_UL_index_categories", "", scene,
+                           "io_pdx_index_categories", scene, "io_pdx_index_category_index",
+                           rows=5)
+        box.prop(scene, "io_pdx_index_mod_only", text="Mod only")
+        box.label(text="Untick a category to hide it", icon="INFO")
+
+        # ---- 条目列表 ----
+        layout.label(text=scene.io_pdx_index_status, icon="INFO")
+        layout.template_list("IOPDX_UL_asset_items", "", scene,
+                             "io_pdx_asset_items", scene, "io_pdx_asset_index", rows=8)
+        row = layout.row(align=True)
+        row.operator("io_pdx_particles.load_selected", icon="IMPORT",
+                     text="Load selected")
         layout.operator("io_pdx_particles.import", icon="FILEBROWSER",
                         text="Load from file ...")
 
@@ -1010,9 +1286,12 @@ class IOPDX_PT_PDXparticles(Panel):
 classes = (
     ParticlePreviewEntry,
     ParticleRoot,
-    ParticleListItem,
+    IndexCategory,
+    DisabledCategory,
+    AssetListItem,
     IOPDX_UL_particle_roots,
-    IOPDX_UL_particle_catalog,
+    IOPDX_UL_index_categories,
+    IOPDX_UL_asset_items,
     IOPDX_OT_import_particle,
     IOPDX_OT_particle_reload,
     IOPDX_OT_particle_clear,
@@ -1022,8 +1301,10 @@ classes = (
     IOPDX_OT_particle_remove_root,
     IOPDX_OT_particle_detect_game,
     IOPDX_OT_particle_add_vanilla,
-    IOPDX_OT_particle_scan,
-    IOPDX_OT_particle_preview_item,
+    IOPDX_OT_index_rescan,
+    IOPDX_OT_index_all_categories,
+    IOPDX_OT_asset_filter_update,
+    IOPDX_OT_asset_load,
     IOPDX_PT_PDXparticles,
 )
 
@@ -1074,6 +1355,14 @@ def _load_post_handler(dummy=None):
         _start_view_poll()
 
 
+def _tab_items():
+    return [
+        (KIND_MODEL, "Models", "Load a .mesh on its own"),
+        (KIND_PARTICLE, "Particles", "Preview a particle system on its own"),
+        (KIND_ENTITY, "Entity", "Load a model together with its mount-point particles"),
+    ]
+
+
 def register():
     IO_PDX_LOG.info("Loading particle preview.")
     for cls in classes:
@@ -1081,14 +1370,6 @@ def register():
     bpy.types.Scene.io_pdx_particle_entries = CollectionProperty(type=ParticlePreviewEntry)
     bpy.types.Scene.io_pdx_particle_roots = CollectionProperty(type=ParticleRoot)
     bpy.types.Scene.io_pdx_particle_root_index = IntProperty(default=0)
-    bpy.types.Scene.io_pdx_particle_items = CollectionProperty(type=ParticleListItem)
-    bpy.types.Scene.io_pdx_particle_index = IntProperty(default=0)
-    bpy.types.Scene.io_pdx_particle_filter = StringProperty(  # type: ignore
-        name="Filter",
-        description="Show only registrations whose name or type contains this text",
-        default="",
-        update=_filter_update,
-    )
     bpy.types.Scene.io_pdx_particle_face_view = BoolProperty(  # type: ignore
         name="Face the viewport",
         description="Turn billboard particles toward the 3D viewport camera "
@@ -1108,6 +1389,34 @@ def register():
                     "same result every time; change it to reshuffle every system",
         default=0,
     )
+    # 三入口标签页 + 索引列表
+    bpy.types.Scene.io_pdx_asset_tab = EnumProperty(  # type: ignore
+        name="Tab",
+        description="What to browse and load",
+        items=_tab_items(),
+        default=KIND_MODEL,
+        update=_asset_tab_update,
+    )
+    bpy.types.Scene.io_pdx_asset_items = CollectionProperty(type=AssetListItem)
+    bpy.types.Scene.io_pdx_asset_index = IntProperty(default=0)
+    bpy.types.Scene.io_pdx_asset_filter = StringProperty(  # type: ignore
+        name="Search",
+        description="Show only entries whose name, pdxmesh name or particle name contains this",
+        default="",
+        update=_asset_filter_update,
+    )
+    bpy.types.Scene.io_pdx_index_categories = CollectionProperty(type=IndexCategory)
+    bpy.types.Scene.io_pdx_index_category_index = IntProperty(default=0)
+    bpy.types.Scene.io_pdx_index_disabled = CollectionProperty(type=DisabledCategory)
+    bpy.types.Scene.io_pdx_index_mod_only = BoolProperty(  # type: ignore
+        name="Mod only",
+        description="Hide entries that come from the game install and keep only mod content",
+        default=False,
+        update=_asset_filter_update,
+    )
+    bpy.types.Scene.io_pdx_index_status = StringProperty(default="")  # type: ignore
+    # 列表对应的索引标识；与当前索引不一致时 draw() 会重建列表
+    bpy.types.Scene.io_pdx_index_token = StringProperty(default="")  # type: ignore
     # 帧处理器：先清掉同名残留（重载/重装会留下引用旧模块的旧对象），再挂当前的。
     # append 前用 _find_stale_handlers 去重是必要的：处理器现在是 @persistent 的，
     # 会跨文件存活，不去重就会越积越多。
@@ -1136,11 +1445,15 @@ def unregister():
     del bpy.types.Scene.io_pdx_particle_entries
     del bpy.types.Scene.io_pdx_particle_roots
     del bpy.types.Scene.io_pdx_particle_root_index
-    del bpy.types.Scene.io_pdx_particle_items
-    del bpy.types.Scene.io_pdx_particle_index
-    del bpy.types.Scene.io_pdx_particle_filter
     if hasattr(bpy.types.Scene, "io_pdx_particle_face_view"):
         del bpy.types.Scene.io_pdx_particle_face_view
     del bpy.types.Scene.io_pdx_particle_vanilla_root
+    for name in ("io_pdx_asset_tab", "io_pdx_asset_items", "io_pdx_asset_index",
+                 "io_pdx_asset_filter", "io_pdx_index_categories",
+                 "io_pdx_index_category_index", "io_pdx_index_disabled",
+                 "io_pdx_index_mod_only", "io_pdx_index_status",
+                 "io_pdx_index_token"):
+        if hasattr(bpy.types.Scene, name):
+            delattr(bpy.types.Scene, name)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
