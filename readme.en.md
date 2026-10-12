@@ -3,90 +3,69 @@
 
 ## io_pdx_mesh for Blender
 
-A Blender add-on for editing the mesh and animation files used by the various [Clausewitz Engine games](https://en.wikipedia.org/wiki/Paradox_Development_Studio#List_of_games_developed) made by [Paradox Development Studios](https://www.paradoxplaza.com).
+A Blender add-on for editing the mesh and animation files used by the various [Clausewitz Engine games](https://en.wikipedia.org/wiki/Paradox_Development_Studio#List_of_games_developed).
 
-This is a Blender-only fork of [ross-g/io_pdx_mesh](https://github.com/ross-g/io_pdx_mesh). Upstream also ships Maya tooling; this repository keeps only the Blender part and has removed `pdx_maya`. It is based on the upstream 0.91.0 release, with adaptations and fixes for Blender 5.2. See the change list below.
-
-Chinese version: [readme.md](readme.md).
+This is a Blender-only fork of [ross-g/io_pdx_mesh](https://github.com/ross-g/io_pdx_mesh); the upstream Maya tooling has been removed. It is based on upstream 0.91.0, adapted and fixed for Blender 5.2. Chinese version: [readme.md](readme.md).
 
 ### Tested version
 
-This fork has only been tested on **Blender 5.2.2 LTS**. Other versions are untested and may not work: Blender's Python API changes between major releases, and this fork targets the 5.2 API. It is not backward compatible, so use other versions at your own risk.
-
-The manifest declares a minimum of Blender 4.2.0, but that only makes the add-on installable; it does not mean it works.
+Tested only on Blender 5.2.2 LTS. It targets the 5.2 API and is not backward compatible. The manifest's minimum of 4.2.0 only makes the add-on installable, not functional.
 
 ### Installation
 
-There is no published release for this repository yet, so there is no packaged zip to download. Install from source instead.
-
-On the repository page, click `Code` then `Download ZIP` and unpack it, or clone the repository:
+There is no published release yet, so install from source. Download the ZIP and unpack it, or:
 
 ```
 git clone https://github.com/Axis-qc/io_pdx_mesh_for_blender.git
 ```
 
-Then install it in Blender. Open Blender, go to `Edit > Preferences`, switch to the `Get Extensions` category and choose `Install from Disk...` from the dropdown corner menu, then pick the repository root (the folder containing `blender_manifest.toml`). Alternatively, copy the whole folder into Blender's extensions directory:
+In Blender go to `Edit > Preferences > Get Extensions > Install from Disk...` and pick the repository root (the folder holding `blender_manifest.toml`). Alternatively, copy the whole folder into Blender's extensions directory:
 
 ```
 %APPDATA%\Blender Foundation\Blender\5.2\extensions\user_default\io_pdx_mesh
 ```
 
-Enable the check box afterwards, and a `PDX Blender Tools` tab appears in the `Sidebar` of the `3D Viewport` (`View > Sidebar` if it is closed).
-
-Restart Blender after installing for the first time.
+Enable it and a `PDX Blender Tools` tab appears in the `Sidebar` of the `3D Viewport`. Restart Blender after installing for the first time.
 
 ![UI](https://raw.githubusercontent.com/wiki/ross-g/io_pdx_mesh/images/blender/tool_ui_01.png)
 
 ### Changes since upstream 0.91.0
 
-Animation import is dramatically faster. Keyframes go straight to the action curves instead of forcing a full scene evaluation per frame; a 33-bone / 900-frame clip dropped from about 51 seconds to about 1 second. The old method is kept as a fallback and is used automatically for rigs with non-default bone inheritance settings.
+Animation import is dramatically faster. Keyframes go straight to the action curves instead of forcing a full scene evaluation per frame; a 33-bone / 900-frame clip dropped from about 51 seconds to about 1 second. The add-on switches back to the old method automatically for rigs with non-default bone inheritance settings.
 
-Duplicate bone names no longer break animations. Some vanilla skeletons share one name across several bones, and Blender forces unique bone names by adding a suffix on import. The importer used to index bones by name and collapse duplicates. It now matches by name plus occurrence order and restores the original names on export. When making your own models, avoid duplicate bone names in the skeleton so this cannot come up in the first place.
+Duplicate bone names no longer break animations. Vanilla skeletons share one name across several bones, and Blender forces unique names by adding a suffix on import, which used to collapse them into one bone when indexing by name; it now matches by name plus occurrence order and restores the original names on export. When making your own models, avoid duplicate bone names in the skeleton.
 
 Fractional playback speed is no longer rounded away (such as 15.06), and is restored on export when the scene fps was not changed.
 
-Locator export no longer depends on the rig's current pose. Previously, exporting a `.mesh` from a rig that was not in its rest pose baked that pose into any locator parented to a bone.
+Locator export no longer depends on the rig's current pose.
 
-Fixed two import crashes. A `.mesh` that holds only locators and no geometry (the various `_frame.mesh` files) used to abort because no `<object>` element was found, and joining several meshes into one material object used the pre-2.8 context-passing form, which always fails on 5.x. Locator-only files now import as such, and the join uses `temp_override`, keeping separate objects instead of aborting the whole import if it fails.
+Fixed two import crashes. A `.mesh` holding only locators and no geometry (the various `_frame.mesh` files) used to abort outright, and joining several meshes into one material object always fails on 5.x. Locator-only files now import as such, and the join uses `temp_override`, keeping separate objects if it fails.
 
-Fixed missing textures. The texture filenames stored inside a `.mesh` are not necessarily next to the file itself; plenty of vanilla models keep their textures in a sibling style directory. The importer previously looked only in the mesh's own directory and left magenta textures behind. It now falls back to searching the asset root's `gfx` tree by filename, preferring the match whose directory corresponds to the model when several share a name.
+Fixed missing textures. The texture filenames inside a `.mesh` are not necessarily next to the file; the importer previously looked only in the mesh's own directory and left magenta textures behind. It now falls back to searching the asset root's `gfx` tree by filename.
 
-Adapted for Blender 5.x animation data access, and `imp` replaced with `importlib` (the old module was removed in Python 3.12).
+Adapted for Blender 5.x animation data access, and `imp` replaced with `importlib` (removed in Python 3.12).
 
 ### Particle preview
 
-Added preview import for `.gfx` registrations and `.asset` particle systems, scrub-able on the timeline once imported. Particle timing is in seconds at a fixed 60 frames per second, independent of the scene frame rate (changing the scene fps will not speed particles up or slow them down).
+Import a `.gfx` registration or `.asset` particle system and scrub it on the timeline. The panel is under `PDX Blender Tools > Particles` in the sidebar: add a scan folder and press `Scan`, then `Preview selected` on a list entry, or use `Load from file ...` directly. Press `Reload from source` after editing a `.asset`.
 
-Supported features: billboard and fixed orientation, sphere/box/point emitters (including all three box axes), emitter rotation, per-particle variance, pulsed emission, three-axis spin, animation curves (size/alpha/colour), textures and sprite sheets, and force fields (`point` / `planar` / `vortex` / `spin` / `turbulence` / `friction`).
+Particle timing is in seconds at a fixed 60 frames per second, independent of the scene frame rate.
 
-Billboard particles face the **actual viewport camera** (the 3D view's own view), not a camera object placed in the scene; the scene camera is only a fallback when there is no 3D viewport. With several windows open it follows the viewport of the active window. Rotating the view refreshes once the camera settles, rather than recomputing while you drag; if the view never settles (viewport camera animation, continuous navigation) it falls back to refreshing once per second so it never stops following entirely. The `Face the viewport` toggle in the panel turns this off, after which the scene camera is used. Particles with `billboard=no` keep their own fixed orientation and never follow the camera.
+Supported: billboards and fixed orientation, point/sphere/box emitters, emitter rotation, per-particle variance, pulsed emission, three-axis spin, size/alpha/colour animation curves, textures and sprite sheets, and the `point` / `planar` / `vortex` / `spin` / `turbulence` / `friction` force fields.
 
-Particles share the model's axes: positions are mapped with the same (x, z, y) conversion the `.mesh` importer uses, so a preview lines up with an imported ship fore/aft and up/down (-Z is forward in model space, which lands on Blender -Y). A subsystem's `position` block uses a different axis order from the world: write `position.z` for world +X and the negated `position.x` for world +Z. Fixed-orientation (`billboard=no`) particles follow their own `particle_yaw` / `particle_pitch`: with both at 0 the quad stands upright with the texture arrow pointing along +X and the texture top edge along +Y (engine space, i.e. +X / +Z once imported). `particle_yaw` rotates about world +Y, while `particle_pitch` spins the quad about its own long axis (it is really a roll: it does not change where the arrow points, it only tips the quad flat). Each of the two fields also carries a second value, which is the **random jitter amplitude**: `{ 90 90 }` means a 90° base that lays the quad flat, plus a per-particle offset of up to ±90° picked once at spawn and then frozen. About a thousand subsystems use it — that is how `fallen_empire_01_colossus_energy_effect` gets its beams to tumble. `billboard=yes` particles always face the camera, and both fields are ignored entirely for them.
+Billboard particles face the viewport camera, not a camera object placed in the scene (the scene camera is used only when there is no viewport); the `Face the viewport` toggle turns this off. Particles with `billboard=no` keep their own fixed orientation and never follow the camera.
 
-Import picks the busiest frame automatically, so you do not have to hunt for one. Scrubbing backwards only rewinds to the nearest checkpoint rather than replaying from the start. The checkpoint interval is tuned to half a second based on measurements: rewinding by a second now takes a few milliseconds instead of hundreds, at the cost of roughly 240 MB of extra memory when the heaviest systems are all loaded. Subsystems with `vortex` / `spin` force fields now also use the vectorised integrator, same as `point` / `turbulence`, bit-for-bit identical (around 1.6~1.8x on large systems like astral_rift).
+Particles share the model's axes, so a preview lines up with an imported ship fore/aft and up/down.
 
-The `Seed` field in the panel controls the per-particle randomness (lifetime, speed, spawn position, orientation, colour). The same seed always reproduces the same result, and changing it reshuffles everything; press the refresh button next to it to reload. The default 0 staggers subsystems by index so two identical subsystems do not look the same. It is worth trying a few seeds on systems with few particles: the less randomness there is to spread, the more the choice of seed shows.
+Import picks the busiest frame automatically. The `Seed` field controls per-particle randomness (lifetime, speed, spawn position, orientation, colour); the same seed always reproduces the same result, and the refresh button next to it reloads after a change. The default 0 staggers subsystems by index.
 
-Many particle fields are written as `{ base variance }`, and **how the second value is used differs per field** — there is no single global rule:
+Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered; `local_space` has no effect on the preview.
 
-- **Signed values** (the angle fields `sphere_emitter_yaw/pitch`, `velocity_yaw/pitch`, `emitter_yaw/pitch`, `particle_yaw/pitch`, `rotation`, `rotation_speed*`, plus `velocity` itself) use `base ± variance`, giving base−variance ~ base+variance. `sphere_emitter_pitch={ 60 80 }` yields −20~140, reaching into the lower hemisphere; a negative `velocity` means motion in the opposite direction.
-- **Length and scalar fields** (`sphere_emitter_radius`, `box_emitter_*`, `life`, `size`, `alpha`, `color` channels) use `base + variance × random` (random in 0~1), giving base ~ base+variance. The dust field `sphere_emitter_radius={ 0 18 }` yields a radius of 0~18.
-
-The rule table lives in `_VAR_RULES` in `simulator.py`, one line per field, so changing one field's semantics does not affect any other. Every per-particle value is picked once at spawn and then frozen. `start` is special: its variance is rolled **once for the whole subsystem**, so `start={ 0 4 }` means the emitter starts after a random delay of 0~4 seconds rather than each particle being staggered.
-
-A sphere emitter's spawn area is bounded by `sphere_emitter_yaw` / `sphere_emitter_pitch`: both angles are picked on the sphere of the given radius, so a narrow range gives an arc band, making only one axis omni gives a ring, and only reaching ±180 on both fills the whole sphere.
-
-Particle bodies are indexed from **every** `.asset` under `gfx/`, not just `gfx/particles/` — so a hand-made particle placed under `gfx/models/` and the like can be previewed from the list too (otherwise the registration shows up but previewing it reports "No body found"). Model, light and animation `.asset` files have non-particle top-level keys and are not picked up.
-
-`test/` contains the self-check and benchmark scripts for the particle preview: `check_particle_features.py` is the feature regression (currently 128 checks passing, roughly 1.5 minutes for a full run, so split it into chunks when a single tool call times out). Point the `IO_PDX_TEST_PROBE_ROOT` environment variable at the mod root holding your own calibration asset to also run the assertions specific to it; without it those few fall back to in-game samples of the same shape. `bench_checkpoint_stride.py` and `bench_vortex_vec.py` are the measurement scripts behind two earlier tunings and can be re-run.
-
-Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered (only 15 occurrences in the whole game, 6 of them `hide=yes`); `local_space` has no effect on the preview, as the preview has no transformed parent entity.
-
-`version` is 0.96.8, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
+`version` is 0.96.15, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
 
 ### Usage notes
 
-Uniform scale on export, bone naming, import order, writing translation, coordinate mapping, and the order to debug an animation that misbehaves in game are covered in [使用注意事项.md](使用注意事项.md) (Chinese).
+Uniform scale on export, bone naming, import order, writing translation, coordinate mapping, particle field variance, and the order to debug an animation that misbehaves in game are covered in [使用注意事项.md](使用注意事项.md) (Chinese).
 
 ### License and credits
 
