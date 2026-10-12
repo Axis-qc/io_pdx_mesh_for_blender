@@ -553,14 +553,17 @@ else:
 
 print()
 print("=" * 78)
-print("B2. 发射器形态：sphere 各向同性（哈希权重回归）")
+print("B2. 发射器形态：sphere 整球均匀（哈希权重回归）")
 print("=" * 78)
+print("   球面发射器在整球上均匀取点。sphere_emitter_yaw / _pitch 是发射器**自身**")
+print("   的偏航/俯仰，球旋转对称 → 不改变分布，因此不参与取点（曾误当「散布范围」，")
+print("   那会给出环或半球）。半径按「基准 + 方差*U」取，不是「基准 ± 方差」。")
 
 sph_pick = None
 for nm, sy in lib.systems.items():
     for sb in sy.subsystems:
         if (not sb.hide and sb.emitter_type == "sphere"
-                and sb.sphere_radius[0] > 0 and sb.sphere_pitch[1] > 90.0):
+                and (sb.sphere_radius[0] > 0 or sb.sphere_radius[1] > 0)):
             sph_pick = (nm, sy, sb)
             break
     if sph_pick:
@@ -578,13 +581,11 @@ if sph_pick:
             st._spawn(0.0)
         pts = list(st.particles)
         signs = [sum(1 for p in pts if p[2 + k] > 0) / float(len(pts)) for k in range(3)]
-        print("  样本: {0} / {1}  r={2:g} pitch范围={3}".format(
-            nm[:34], sb.name, sb.sphere_radius[0], sb.sphere_pitch))
+        print("  样本: {0} / {1}  radius={2}".format(nm[:34], sb.name, sb.sphere_radius))
         print("    三轴符号比 x/y/z = {0}".format([round(v, 3) for v in signs]))
-        # 各向同性：三轴符号都应接近 0.5。旧的「同序列加偏移」写法会给出
-        # 0.866/0.5/0.366 这类明显偏斜（点集退化成一条测地线）。
+        # 整球均匀：三轴符号都应接近 0.5（半球或环会明显偏斜）
         worst = max(abs(v - 0.5) for v in signs)
-        check("sphere 发射各向同性（三轴符号均≈0.5）", worst < 0.08,
+        check("sphere 发射整球均匀（三轴符号均≈0.5）", worst < 0.08,
               "最大偏差 {0:.3f}".format(worst))
         # 球面网格覆盖率：退化的写法只有约 11%
         NP, NY = 18, 36
@@ -598,6 +599,17 @@ if sph_pick:
         cov = len(grid) / float(NP * NY)
         print("    球面网格覆盖 {0:.1f}%  (退化写法约 11%)".format(cov * 100))
         check("sphere 球面覆盖 > 60%", cov > 0.60, "{0:.1f}%".format(cov * 100))
+        # 半径必须非负且落在 [基准, 基准+方差] 内：旧「基准 ± 方差」会有一半
+        # 半径为负被钳到 0，堆在原点（实测 DustParticlesOrange 达 48.5%）。
+        rs = [math.sqrt(p[2] ** 2 + p[3] ** 2 + p[4] ** 2) for p in pts]
+        _r0, _rv = sb.sphere_radius
+        _at0 = sum(1 for r in rs if r < 1e-9)
+        check("sphere 半径无原点堆积（区间语义）", _at0 == 0,
+              "{0}/{1} 颗在原点，半径 {2:.2f}~{3:.2f}".format(
+                  _at0, len(rs), min(rs), max(rs)))
+        check("sphere 半径落在 [基准, 基准+方差] 内",
+              all(_r0 - 1e-6 <= r <= _r0 + _rv + 1e-6 for r in rs),
+              "基准 {0:g} 方差 {1:g}，实测 {2:.3f}~{3:.3f}".format(_r0, _rv, min(rs), max(rs)))
 else:
     check("找到 sphere 样本", False)
 
@@ -1571,6 +1583,110 @@ if _start_var:
           "基准 {0} 实测 {1}".format(_base0, round(_aa.start, 3) if _aa else None))
 else:
     check("找到带 start 方差的样本", False)
+
+print()
+print("=" * 78)
+print("14. 二元组语义统一为「基准 + 方差×U」（U ∈ [0,1)）")
+print("=" * 78)
+print("   不是「基准 ± 方差」。旧实现在半径上会让一半取到负值、被钳到原点。")
+
+# 14a 逐字段验证：取值必须落在 [基准, 基准+方差] 内，且能覆盖整个区间
+_sem_sys = None
+for _n, _sy in lib.systems.items():
+    for _sb in _sy.subsystems:
+        if (not _sb.hide and _sb.life[1] > 0.2
+                and _sb.emission[0] >= 5.0 and _sb.max_amount >= 20):
+            _sem_sys = (_n, _sb)
+            break
+    if _sem_sys:
+        break
+if _sem_sys:
+    _n0, _sb0 = _sem_sys
+    _sim = S.SystemSim(lib.systems[_n0])
+    _st = next((x for x in _sim.subs if x.sub.name == _sb0.name), None)
+    if _st is not None:
+        for _i in range(400):
+            _st.spawn_count = _i
+            _st._spawn(0.0)
+        _lives = [p[1] for p in _st.particles]
+        _lo, _hi = _sb0.life[0], _sb0.life[0] + _sb0.life[1]
+        check("life 落在 [基准, 基准+方差] 内",
+              bool(_lives) and all(_lo - 1e-6 <= v <= _hi + 1e-6 for v in _lives),
+              "基准 {0:g} 方差 {1:g} 实测 {2:.3f}~{3:.3f}".format(
+                  _sb0.life[0], _sb0.life[1], min(_lives), max(_lives)))
+        check("life 不跨到基准以下（旧 ± 语义会）",
+              bool(_lives) and min(_lives) >= _lo - 1e-6,
+              "最小 {0:.3f} vs 基准 {1:.3f}".format(min(_lives), _lo))
+        # 覆盖度：400 颗应该铺满整个区间（分 4 段都有）
+        _seg = [0, 0, 0, 0]
+        for v in _lives:
+            _seg[min(int((v - _lo) / max(_hi - _lo, 1e-9) * 4), 3)] += 1
+        check("life 铺满区间（4 段都有样本）", min(_seg) > 0, "{0}".format(_seg))
+else:
+    check("找到 life 方差样本", False)
+
+# 14b 球面半径在区间语义下不应有原点堆积（用户报的 bug 的直接判据）
+_dust2 = ("infernal_system_crisis_star_file", "DustParticlesOrange")
+if _dust2[0] in lib.systems:
+    _sim = S.SystemSim(lib.systems[_dust2[0]])
+    _st = next((x for x in _sim.subs if x.name == _dust2[1]), None)
+    if _st is not None:
+        for _i in range(400):
+            _st.spawn_count = _i
+            _st._spawn(0.0)
+        _rs = [math.sqrt(p[2] ** 2 + p[3] ** 2 + p[4] ** 2) for p in _st.particles]
+        _at0 = sum(1 for r in _rs if r < 1e-9)
+        check("DustParticlesOrange 无原点堆积（0/400）", _at0 == 0,
+              "{0}/400 在原点，半径 {1:.2f}~{2:.2f}".format(_at0, min(_rs), max(_rs)))
+        _rv = _st.sub.sphere_radius[1]
+        check("DustParticlesOrange 半径落在 0~方差 内",
+              all(-1e-6 <= r <= _rv + 1e-6 for r in _rs),
+              "方差 {0:g} 实测 {1:.3f}~{2:.3f}".format(_rv, min(_rs), max(_rs)))
+
+# 14c 整球均匀：球面发射器不能是半球（用户举例 b_class_star_file）
+_star = ("b_class_star_file", "Surface_fire")
+if _star[0] in lib.systems:
+    _sim = S.SystemSim(lib.systems[_star[0]])
+    _st = next((x for x in _sim.subs if x.name == _star[1]), None)
+    if _st is not None:
+        for _i in range(2000):
+            _st.spawn_count = _i
+            _st._spawn(0.0)
+        _pts = [(p[2], p[3], p[4]) for p in _st.particles]
+        _oct = set()
+        for _x, _y, _z in _pts:
+            _oct.add((_x > 0, _y > 0, _z > 0))
+        check("b_class_star_file/Surface_fire 覆盖全部 8 个卦限（整球，不是半球）",
+              len(_oct) == 8, "{0}/8 个卦限，{1} 颗".format(len(_oct), len(_pts)))
+else:
+    print("  (跳过 b_class_star_file：未找到该系统)")
+
+# 14d box 只写方差时应铺开且以原点为中心（不是偏在一侧）
+_box2 = None
+for _n, _sy in lib.systems.items():
+    for _sb in _sy.subsystems:
+        if (not _sb.hide and _sb.emitter_type == "box"
+                and _sb.box_y[0] <= 0 and _sb.box_y[1] > 0):
+            _box2 = (_n, _sb)
+            break
+    if _box2:
+        break
+if _box2:
+    _sim = S.SystemSim(lib.systems[_box2[0]])
+    _st = next((x for x in _sim.subs if x.name == _box2[1].name), None)
+    if _st is not None:
+        for _i in range(300):
+            _st.spawn_count = _i
+            _st._spawn(0.0)
+        _ys = [p[3] for p in _st.particles]
+        _pos = sum(1 for v in _ys if v > 0)
+        _rv = _box2[1].box_y[1]
+        check("box 轴只写方差时以原点为中心（两侧都有）",
+              0 < _pos < len(_ys) and max(_ys) <= _rv + 1e-6 and min(_ys) >= -_rv - 1e-6,
+              "+Y {0} / -Y {1}，范围 {2:.2f}~{3:.2f}，方差 {4:g}".format(
+                  _pos, len(_ys) - _pos, min(_ys), max(_ys), _rv))
+else:
+    check("找到 box 只写方差的样本", False)
 
 print()
 print("=" * 78)
