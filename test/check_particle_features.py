@@ -1688,6 +1688,59 @@ if _box2:
 else:
     check("找到 box 只写方差的样本", False)
 
+# 14e 球面发射器的朝向角叠加到初速度方向（sphere 角 + velocity 角）
+_sphdir = None
+for _n, _sy in lib.systems.items():
+    for _sb in _sy.subsystems:
+        if (not _sb.hide and _sb.emitter_type == "sphere"
+                and abs(_sb.sphere_yaw[0]) > 1e-9 and abs(_sb.sphere_yaw[1]) < 1e-9
+                and abs(_sb.velocity_yaw[0]) < 1e-9 and abs(_sb.velocity_yaw[1]) < 1e-9
+                and abs(_sb.velocity[0]) > 1e-9):
+            _sphdir = (_n, _sb)
+            break
+    if _sphdir:
+        break
+if _sphdir:
+    _sim = S.SystemSim(lib.systems[_sphdir[0]])
+    _st = next((x for x in _sim.subs if x.sub.name == _sphdir[1].name), None)
+    if _st is not None:
+        _sb0 = _sphdir[1]
+        # 取一个 sphere_yaw 固定、且 sphere_pitch 也无散布的样本才能得到唯一基准方向；
+        # 若 pitch 有散布，则逐粒子方向不同，改为验「方向确实随 pitch 散开」。
+        _yaw0 = _sb0.sphere_yaw[0]
+        for _i in range(50):
+            _st.spawn_count = _i
+            _st._spawn(0.0)
+        _dirs = []
+        for _p in _st.particles:
+            _L = math.sqrt(_p[5] ** 2 + _p[6] ** 2 + _p[7] ** 2)
+            if _L > 1e-9:
+                _dirs.append((_p[5] / _L, _p[6] / _L, _p[7] / _L))
+        if _sb0.sphere_pitch[1] < 1e-9:
+            # 唯一方向：应等于 _emit_dir(sphere_pitch[0], sphere_yaw[0])，符号由
+            # 速度大小的正负决定（负速度整体反向）。
+            _exp = S._emit_dir(_sb0.sphere_pitch[0], _yaw0)
+            _sgn = -1.0 if _sb0.velocity[0] < 0 else 1.0
+            _exp = tuple(_sgn * c for c in _exp)
+            _ok = bool(_dirs) and all(
+                all(abs(d[k] - _exp[k]) < 0.05 for k in range(3)) for d in _dirs)
+            check("sphere 朝向角决定初速度方向（基准单一）", _ok,
+                  "sphere_yaw={0:g} pitch={1:g} 期望 {2}".format(
+                      _yaw0, _sb0.sphere_pitch[0], [round(c, 3) for c in _exp]))
+        else:
+            # 有散布：方向必须铺开，且每个方向的 yaw 分量都符合 sphere_yaw=90
+            # （_emit_dir 在 yaw=90 时 x 分量为 -cos(pitch)、z 分量为 0）
+            _uniq = len(set((round(d[0], 3), round(d[1], 3), round(d[2], 3)) for d in _dirs))
+            _z_ok = all(abs(d[2]) < 1e-6 for d in _dirs)
+            check("sphere 朝向角散布进初速度方向（方向随 pitch 铺开）",
+                  _uniq > 1 and _z_ok,
+                  "yaw={0:g} 固定，pitch方差={1:g}，{2} 颗 {3} 种方向，z 全为 0={4}".format(
+                      _yaw0, _sb0.sphere_pitch[1], len(_dirs), _uniq, _z_ok))
+        print("  （{0}/{1}，{2} 颗粒子）".format(
+            _sphdir[0][:26], _sb0.name, len(_dirs)))
+else:
+    check("找到 sphere 朝向角样本", False)
+
 print()
 print("=" * 78)
 print("结果: {0} passed, {1} failed".format(len(PASS), len(FAIL)))

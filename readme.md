@@ -71,9 +71,9 @@ git clone https://github.com/Axis-qc/io_pdx_mesh_for_blender.git
 
 粒子的许多字段都写成 `{ 基准 方差 }` 两个值，含义是**最终值 = 基准 + 方差 × 随机数**（随机数在 0~1 之间），每颗粒子在发射时定死、之后不再变。适用字段：发射尺寸（`box_emitter_*` 三轴、`sphere_emitter_radius`）、颜色（`color` 的 x/y/z 三通道）、初速方向与大小、寿命、尺寸、面片朝向、自转角与角速度。写成 `{ 0 方差 }` 的（基准 0、只给上限）在库里很常见，比如尘埃场 `sphere_emitter_radius={ 0 18 }` 就是半径 0~18，`particle_yaw={ 0 360 }` 就是转满一圈。注意这**不是**「基准 ± 方差」：按 ± 算半径会有一半取到负值，只能在原点附近堆着。`start` 的方差是个例外，它是**整个子系统摇一次**：`start={ 0 4 }` 表示这个发射器随机延迟 0~4 秒才开始工作，而不是每颗粒子各自错开。
 
-球面发射器在**整球**上均匀撒点。`sphere_emitter_yaw` / `sphere_emitter_pitch` 是发射器**自身**的偏航与俯仰（和 `emitter_yaw` / `emitter_pitch` 同类），球是旋转对称的，转动它不改变粒子分布，这两个字段不参与取点。
+球面发射器在**整球**上均匀撒点。`sphere_emitter_yaw` / `sphere_emitter_pitch` 是发射器**自身**的偏航与俯仰：球是旋转对称的，所以它们不影响粒子出生在哪里，但会作为**初速度方向的基准**——最终方向 = `sphere_emitter` 角 + `velocity_yaw` / `velocity_pitch` 角。所以球面发射器即使 `velocity` 的方向角都写 0，粒子也会沿着发射器朝向飞出去。
 
-`test/` 里有粒子功能的自检与基准脚本：`check_particle_features.py` 是特征回归（当前 74 项通过，整轮约 1 分钟，超过单次工具调用上限时要分段跑），`bench_checkpoint_stride.py` 与 `bench_vortex_vec.py` 是此前两项调优的实测脚本，可复跑。
+`test/` 里有粒子功能的自检与基准脚本：`check_particle_features.py` 是特征回归（当前 75 项通过，整轮约 1 分钟，超过单次工具调用上限时要分段跑），`bench_checkpoint_stride.py` 与 `bench_vortex_vec.py` 是此前两项调优的实测脚本，可复跑。
 
 已知限制：`childsystem` 嵌套子系统只解析并在日志里提示，不参与渲染（全库仅 15 处，其中 6 处是 `hide=yes`）；`local_space` 不影响预览，因为预览里没有带变换的父实体。
 

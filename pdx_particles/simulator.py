@@ -60,8 +60,9 @@ def _emit_dir(pitch_deg, yaw_deg):
         pitch=90 → +Y       pitch=-90 → -Y       pitch=45 → +Z/+Y 斜上
 
     velocity_* / emitter_* 两个入口共用这一套（标定件里明确注为「同一套球面角」）。
-    球面发射器的取点不走本函数：它在整球上均匀取方向（见 _spawn），
-    sphere_emitter_yaw/_pitch 是发射器自身的偏航/俯仰，球旋转对称、与取点无关。
+    球面发射器的出生点不走本函数：它在整球上均匀取方向（见 _spawn）。
+    sphere_emitter_yaw/_pitch 不参与取点（球旋转对称），但会作为初速度方向的
+    基准叠加在 velocity 的角度上。
     """
     p = math.radians(pitch_deg)
     y = math.radians(yaw_deg)
@@ -336,8 +337,9 @@ class SubsystemSim:
         self.sphere_r_var = sr[1] if sub.emitter_type == "sphere" else 0.0
         self.sphere_yaw = sub.sphere_yaw
         self.sphere_pitch = sub.sphere_pitch
-        # 注：sphere_yaw / sphere_pitch 是发射器自身的偏航与俯仰（与 emitter_* 同类）。
-        # 球旋转对称，转动它不改变粒子分布，所以取点时不用它们（曾误当散布范围用）。
+        # 注：sphere_yaw / sphere_pitch 是球发射器自身的偏航与俯仰。球旋转对称，
+        # 所以它们不影响出生点分布（出生点另算整球均匀），但会作为初速度方向的
+        # 基准使用（见 _spawn 里 p / y 的算法）。
 
         # 颜色抖动：每颗粒子在基色上叠加 0~方差 的随机偏移（原版 R/G/B 各约 570~660 个
         # 子系统写了非零方差）。parser 层曾只取 [0] 把这部分整个丢掉。
@@ -565,6 +567,8 @@ class SubsystemSim:
         w_box1 = self._w(i, 14)                  # box 盒内位置 X
         w_box2 = self._w(i, 15)                  # box 盒内位置 Y
         w_box3 = self._w(i, 16)                  # box 盒内位置 Z
+        w_sph_y = self._w(i, 17)                 # 球面发射器朝向 yaw 的取角
+        w_sph_p = self._w(i, 18)                 # 球面发射器朝向 pitch 的取角
 
         w0 = w_life
         life = self.life + self.life_var * w0
@@ -587,8 +591,8 @@ class SubsystemSim:
             # 一半半径为负、被钳到 0 堆在原点（实测 48.5% 的粒子落在原点）。
             r = self.sphere_r + self.sphere_r_var * w_pos1
             # 方向：整球均匀（sin(pitch) 均匀 + yaw 均匀）。
-            # sphere_emitter_yaw / _pitch 是**发射器自身的偏航/俯仰**，球旋转对称，
-            # 转动它不改变点的分布，所以不参与取点（它们不是「散布范围」）。
+            # sphere_emitter_yaw / _pitch 不影响出生点（球旋转对称），它们的作用
+            # 是给粒子提供默认移动方向，在下面算初速度方向时用。
             sp = math.degrees(math.asin(_clamp(2.0 * w_pos3 - 1.0, -1.0, 1.0)))
             sy = 360.0 * w_pos2
             d = _emit_dir(sp, sy)
@@ -598,9 +602,17 @@ class SubsystemSim:
         else:
             px = py = pz = 0.0
 
-        # 初速度方向（与 emitter/sphere 共用 probe 实测的那套仰角+方位角）
-        p = self.pitch[0] + self.pitch[1] * w_dir1
-        y = self.yaw[0] + self.yaw[1] * w_dir2
+        # 初速度方向：**球面发射器的朝向角 + velocity 的方向角**（用户实测口径）。
+        # sphere_emitter_yaw / _pitch 是球发射器自身的偏航/俯仰，给粒子提供默认
+        # 移动方向；球旋转对称，所以它对「出生点分布」没有影响（出生点另算整球
+        # 均匀），但方向要用上。velocity_yaw / _pitch 是叠加在它上面的偏移。
+        # point / box 发射器没有这层基准，sphere 角为 0 时与旧行为一致。
+        # 用独立的 salt（17/18），不能复用发射点的 w_pos*：共用维度会让出生点与
+        # 方向联动，点集退化成低维曲面。
+        base_y = self.sphere_yaw[0] + self.sphere_yaw[1] * w_sph_y
+        base_p = self.sphere_pitch[0] + self.sphere_pitch[1] * w_sph_p
+        p = base_p + self.pitch[0] + self.pitch[1] * w_dir1
+        y = base_y + self.yaw[0] + self.yaw[1] * w_dir2
         d = _emit_dir(p, y)
         v = self.vel + self.vel_var * w_speed
 
