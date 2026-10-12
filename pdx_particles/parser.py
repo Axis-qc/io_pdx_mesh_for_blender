@@ -320,20 +320,16 @@ class PdxSubsystem:
         self.emitter_type = str(et.value).strip('"') if et is not None and et.value is not None else "point"
         self.box_x = _pair(node.child("box_emitter_x"))
         self.box_y = _pair(node.child("box_emitter_y"))
-        # box_emitter_z 原先没解析，直接进 unknown_keys 被丢掉，模拟里 pz 写死 0，
-        # 于是所有 box 发射器塌成一个平面矩形。原版有 748 个子系统用到它。
+        # 三个轴都要读；只读 x/y 会让 box 发射器塌成一个平面矩形（原版 748 个用到 z）。
         self.box_z = _pair(node.child("box_emitter_z"))
         self.sphere_radius = _pair(node.child("sphere_emitter_radius"))
         self.sphere_yaw = _pair(node.child("sphere_emitter_yaw"))
         self.sphere_pitch = _pair(node.child("sphere_emitter_pitch"))
-        # emitter_yaw / emitter_pitch：整个发射体相对子系统原点的旋转。
-        # 这两个键原先在 known 集合里，所以既不生效也不进 unknown_keys——属于
-        # 「静默丢弃」，比未解析更难发现（没有任何诊断痕迹）。
-        # 用量（口径：仅原版，不含 mod）：写了键 2790，其中显式写 0 有 2376、
-        # 非零 414；完全没写 2332。含 mod 时分别为 2801 / 2387 / 414 / 2369。
+        # emitter_yaw / emitter_pitch：发射体相对子系统原点的旋转。
+        # 用量（仅原版）：写了键 2790（显式写 0 有 2376、非零 414），没写 2332。
         #
-        # has_emitter_rot 区分「显式写 0」与「根本没写」：实测两者语义不同
-        # （见 simulator._emit_rot_matrix 的推导），必须分开记录。
+        # has_emitter_rot：记下「键写没写」，供统计与面板展示。写 0 时旋转矩阵是
+        # 单位阵，与完全没写的效果相同（见 simulator._emit_rot_matrix）。
         ey_node = node.child("emitter_yaw")
         ep_node = node.child("emitter_pitch")
         self.emitter_yaw = _pair(ey_node)
@@ -380,8 +376,7 @@ class PdxSubsystem:
         self.particle_pitch = _pair(node.child("particle_pitch"))
         self.rotation = _pair(node.child("rotation"))
         self.rotation_speed = _pair(node.child("rotation_speed"))
-        # 三轴自转角速度。原版 182 个子系统用到（pitch 75 / yaw 70 / roll 37），
-        # 原先只在 unknown_keys 里被丢弃，粒子只会绕视线轴自转，另外两轴不动。
+        # 三轴自转角速度。原版 182 个子系统用到（pitch 75 / yaw 70 / roll 37）。
         self.rotation_speed_pitch = _pair(node.child("rotation_speed_pitch"))
         self.rotation_speed_yaw = _pair(node.child("rotation_speed_yaw"))
         self.rotation_speed_roll = _pair(node.child("rotation_speed_roll"))

@@ -247,10 +247,8 @@ def _build_arrays_py(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
             colors[o + 3] = a
         ubase = i * 8
         if do_sheet:
-            # cell<0 表示贴图集没配动画（spritesheet_animation=no）：实机定案是
-            # **默认只取第 1 帧**，所以退回 cell 0，而不是铺满整张贴图。
-            # 修前这里对 anim=no 显示整图，444 个多帧贴图的子系统全是错的
-            # （单帧贴图写 x=2 时表现为「显示错位的半张」）。
+            # cell<0 = 贴图集没配动画（spritesheet_animation=no）：实机读数是
+            # 默认只取第 1 帧，所以退回 cell 0，而不是铺满整张贴图。
             cell_i = cell if cell >= 0 else 0
             cx = cell_i % sheet_x
             cy = cell_i // sheet_x
@@ -268,12 +266,7 @@ def _build_arrays_py(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
 
 
 def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
-    """numpy 向量化组数组。
-
-    与纯 Python 版逐位等价（perf-tester 对照实测 maxdiff=0.00e+00）。改动只针对
-    「怎么拼数组」：原先是每颗粒子跑一次 Python 循环写 3 个 list，粒子上万时这
-    一步比 foreach_set 本身还贵。
-    """
+    """numpy 向量化组数组，与纯 Python 版逐位等价。"""
     np = _NP
     # snap 是 list[tuple]，转成 (n,12) 一次成型；多余容量留 0（与纯 Python 版
     # 初始化为 0 的语义一致——mesh 顶点数固定为 cap，未用到的槽位保持原值/0）。
@@ -331,9 +324,8 @@ def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
     colors[:n, :, 3] = a[:, None]
 
     if do_sheet:
-        # cell<0 = 没配 spritesheet_animation：实机定案是**默认只取第 1 帧**，
-        # 所以退回 cell 0，而不是铺满整张贴图。修前这里对 cell<0 把 du/dv 设成
-        # 1.0（整图），与纯 Python 版的行为不一致——两版都改过后才对齐。
+        # cell<0 = 没配 spritesheet_animation：实机读数是默认只取第 1 帧，
+        # 所以退回 cell 0，而不是铺满整张贴图。
         cell_i = cell.astype(np.int64)
         safe = np.where(cell_i >= 0, cell_i, 0)
         cx = safe % sheet_x
@@ -508,19 +500,13 @@ class SubsystemPreview:
         if cap <= 0:
             return 0
 
-        # 立牌基向量二选一，按粒子自身的朝向声明决定：
-        # - billboard=no：固定朝向，不跟随镜头。朝向由 particle_yaw / particle_pitch
-        #   唯一决定（含 pitch=90 的平铺姿态，_fixed_quad_basis 已能算出来）；
-        # - billboard=yes：恒正面朝镜头，**完全忽略** particle_yaw / particle_pitch。
-        #
-        # 实机定案（pdx_axis_probe）：billboard=yes 的 base / yaw=90 / pitch=90
-        # 三组显示完全一致，说明这两个字段对 billboard 粒子无效。
-        #
-        # 修前这里先判 `flat`（|pitch-90|<1）再判 billboard，导致 129 个同时写了
-        # billboard=yes 与 particle_pitch≈90 的子系统被当成平铺环，面片被摁平在
-        # 水平面上、不再面向镜头——而它们本该忽略 pitch 正常朝镜头。
-        # billboard=no 的平铺姿态不再需要单独分支：pitch=90 经 _fixed_quad_basis
-        # 的「绕长轴自转」自然得到水平面（法线 +Z），与原实现结果一致。
+        # 立牌基向量二选一：
+        # - billboard=no：固定朝向，不跟随镜头，朝向由 particle_yaw / particle_pitch
+        #   决定（pitch=90 的平铺姿态由 _fixed_quad_basis 算出水平面）；
+        # - billboard=yes：恒正面朝镜头，忽略 particle_yaw / particle_pitch
+        #   （标定件：billboard=yes 的 base / yaw=90 / pitch=90 三组显示完全一致）。
+        # 判断顺序必须先看 billboard：先判 pitch≈90 会把 129 个两者都写的子系统
+        # 摁平在水平面上，而它们本该正常朝镜头。
         if not sub.billboard:
             right, up = _fixed_quad_basis(sub.particle_yaw[0], sub.particle_pitch[0])
         elif cam_basis is not None:
@@ -531,10 +517,8 @@ class SubsystemPreview:
 
         sheet_x = max(sub.sheet_x, 1)
         sheet_y = max(sub.sheet_y, 1)
-        # 贴图集只要 >1 帧就要按格取 UV（do_sheet），与 spritesheet_animation 无关：
-        # anim=no 时 snapshot 给的 cell 为 -1，组数组里退回第 1 帧——这正是实机
-        # 读数（默认只取第 1 帧）。修前 do_sheet 带上 sheet_anim 条件，anim=no 的
-        # 444 个子系统会把整张贴图铺在一个面片上。
+        # 贴图集只要 >1 帧就按格取 UV，与 spritesheet_animation 无关：anim=no 时
+        # snapshot 给的 cell 为 -1，组数组里退回第 1 帧（实机读数即默认只取第 1 帧）。
         do_sheet = (sheet_x * sheet_y) > 1
 
         coords = [0.0] * (cap * 12)

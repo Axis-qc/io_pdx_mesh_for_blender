@@ -788,7 +788,7 @@ if colossus:
             check("带方差的发射体逐粒子散开（非单一方向/位置）", False,
                   "所有带方差样本都退化")
 
-    # 没写键的必须保持原 +Y 基准（不受影响）
+    # 没写键的子系统不建旋转矩阵，出射方向保持 velocity 的原值
     kept = 0
     tot2 = 0
     for sy in lib.systems.values():
@@ -797,7 +797,7 @@ if colossus:
                 tot2 += 1
                 if s.emit_rot is None:
                     kept += 1
-    check("没写键的子系统不被旋转（保持 +Y）", kept == tot2,
+    check("没写 emitter 键的子系统不建旋转矩阵", kept == tot2,
           "{0}/{1}".format(kept, tot2))
 
 # ---------------------------------------------------------------- 脉冲发射

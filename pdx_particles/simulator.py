@@ -34,22 +34,13 @@ PARTICLE_FPS = 60
 # 预览时长上限（秒）：防病态参数（极低 emission）拉出几万帧的时间轴。
 MAX_PREVIEW_SECONDS = 60.0
 
-# 回退重放的关键帧间隔（子步数）。时间轴往回拖时，不必从 0 重放全程：模拟是
-# 确定性的，状态完全由 (n_sub, spawn_count, particles) 决定，所以每隔这么多子步
-# 存一份状态快照，回退时从最近的一份往后重放即可。
+# 回退重放的关键帧间隔（子步数）。模拟是确定性的，状态完全由
+# (n_sub, spawn_count, particles) 决定，所以每隔这么多子步存一份快照，
+# 时间轴往回拖时从最近的那份重放，不必从 0 重来。
 #
-# 原先 advance() 遇到 `t_target < self.t` 就 self.reset() 全量重放，实测代价：
-# 回退 1 帧（1200→1199）par_01(10010 粒子) 要 3931ms、magnetic_storm_2 要
-# 10993ms；1800→1799 更是 8149ms / 20292ms，而同帧重刷只要 32ms / 17ms。
-#
-# 间隔取 60 子步（= 0.5 秒），单次回退最多重放 0.5 秒。实测（16 个最重系统两档
-# 对比，标量路径，test/bench_checkpoint_stride.py）：
-# - 回退 1 秒从数百 ms 压到 1~9ms（纯关键帧恢复，中位加速 ~225x，最好 604x）；
-# - 回退 1 帧平均 ~2.5x，最坏与 240 档持平（目标帧恰落两档同余点时重放步数相同，
-#   不劣化）；
-# - 代价是内存：top10 重系统同时装载净增约 +244MB，单系统最大 +143MB（par_01
-#   万粒系统）；粒子表本身两档完全相同，无确定性/视觉差异。
-# 曾用 240 子步（= 2 秒）：内存省一半，但 1 秒级回退最多要重放 2 秒（几百 ms）。
+# 取 60 子步（0.5 秒）：回退 1 秒约 1~9ms，单次回退最多重放 0.5 秒；代价是
+# 最重的 10 个系统同时装载多占约 244MB。取 240（2 秒）省一半内存，但 1 秒级
+# 回退最多要重放 2 秒。
 CHECKPOINT_STRIDE = 60
 
 
@@ -76,12 +67,7 @@ def _emit_dir(pitch_deg, yaw_deg):
     emitter_* 与 velocity_* 明确注为「同一套球面角」，sphere 的 {0 180} 全向
     也靠这套角度铺满整球）。
 
-    【修前错误】原先这里写的是 `(cos p·cos y, sin p, cos p·sin y)`，即方位基准取
-    +X、且 pitch 直接当 y 分量——水平方向整体偏 90°，而且 pitch=0 时 yaw 失效。
-    出错原因是照抄了 `sph_to_dir`（极角模型）的结论：它把 yaw 当绕 +Y 的极角，
-    与实机不符。同时 `_spawn` 里 velocity / sphere 两处却用的是 sph_to_dir，
-    与 emitter 的 _emit_dir 各说各话，等于同一份数据里有两套互相矛盾的语义。
-    现统一到上面这一套。
+    注意别照搬 sph_to_dir 的极角模型：它把 yaw 当绕 +Y 的极角，与实机不符。
     """
     p = math.radians(pitch_deg)
     y = math.radians(yaw_deg)
@@ -103,22 +89,12 @@ def _axis_angle_matrix(axis, angle_rad):
 
 
 def _emit_rot_matrix(pitch_deg, yaw_deg):
-    """发射体旋转矩阵：把局部基准前向 **+Z** 转到 _emit_dir(pitch, yaw)。
+    """发射体旋转矩阵：把局部基准前向 +Z 转到 _emit_dir(pitch, yaw)。
 
-    基准取 +Z 的理由是「写 0 = 不旋转」这条通用语义必须成立：
-      d(0,0) = +Z（probe 实测表：velocity_yaw=0 → +Z），
-    所以只有当基准也是 +Z 时，emitter_yaw=emitter_pitch=0 才等价于单位阵。
-    全库 2376 个子系统显式写了 emitter_yaw=0（其中 1241 个同时有非零 velocity，
-    826 个速度角也全 0），里面 222 个是尾焰/引擎类（fire_flare、fire_backblast…）——
-    尾焰必须朝船尾喷，若「写 0」被解释成整体扭转 90°，这些全都会喷错方向。
-
-    【为什么不用 +X】曾按 +X 作基准以迁就 fallen_empire_*_colossus_energy_effect：
-    那 3 个球的 emitter_yaw 恰好等于「球→中心」方位角，用 +X 基准能让它们全部朝内
-    （实机截图确实向中心汇聚）。但 +X 基准会让 d(0,0)=+Z 变成一次 90° 旋转，直接
-    破坏上面 2376 个「写 0」子系统的语义。两者不可兼得，取覆盖面大的一条；
-    colossus 三球按本实现方向会偏 90°，属已知偏差（该效果是能量聚合，视觉上
-    三束光仍朝中心区域，偏差可接受）。真要修 colossus，应改它的数据或另立语义，
-    不能为了 3 个样本牺牲 2376 个。
+    基准取 +Z，因为 d(0,0) 就是 +Z（标定件：emitter_yaw 与 velocity_yaw 同零点），
+    于是 emitter_yaw=emitter_pitch=0 等价于单位阵——写 0 的子系统不会被动旋转。
+    原版 2376 个子系统显式写 0，其中 222 个是尾焰类（fire_flare、fire_backblast…），
+    整体扭转 90° 会让它们全部喷错方向。
 
     取绕轴 (base × d) 转 base 与 d 夹角这一支（最短路径）。
     """
@@ -196,19 +172,14 @@ def _norm3(v):
 
 # ---- 向量化力场（numpy 可选）----
 #
-# 逐位一致的前提已验证：numpy 的 sin/cos/sqrt 与 math 模块逐位相同
-# （20 万随机点 0 处差异，1200 子步累加后终点逐位相同，sha256 级别比对通过）。
-# 因此这里可以放心用 numpy，不会破坏「到达同一 n_sub 状态相同」的确定性契约。
+# 用 numpy 不破坏确定性：numpy 的 sin/cos/sqrt 与 math 模块逐位相同
+# （20 万随机点 0 处差异，1200 子步累加后终点逐位相同）。
 #
-# 带这些力场的子系统走向量化：point/turbulence 是逐粒子大量三角函数，vortex/spin
-# 是逐粒子叉积乘加。实测（test/bench_vortex_vec.py，17 系统逐位比对 + 38 系统普查）：
-# astral_rift/scar 等峰值 500+ 粒的纯 vortex 系统 1.6~1.8x，storm 族 1.0~1.15x；
-# 无热点子系统的系统 0.94~1.02（B 与 A 做功相同，噪声内），粒子 <64 触不到
-# _VEC_MIN_PARTICLES 门槛的系统完全等价、零代价。实测无力场时向量化反而慢
-# （每子步建数组的开销没人分摊），所以仍按力场类型把关。
+# 只对 point/turbulence/vortex/spin 走向量化（逐粒子三角函数与叉积乘加是热点）。
+# 实测：峰值 500+ 粒的纯 vortex 系统 1.6~1.8x，无力场时反而慢（建数组开销没人
+# 分摊），故由力场类型与粒子数共同把关。
 _VEC_FORCE_TYPES = ("turbulence", "point", "vortex", "spin")
-# 向量化有固定开销（每子步建数组），粒子太少时得不偿失。实测 1200 颗粒子有
-# turbulence 时 3.65x；无力场时不划算，故由 use_vec 一并把关。
+# 向量化每子步要建数组，粒子太少得不偿失（1200 颗有 turbulence 时 3.65x）。
 _VEC_MIN_PARTICLES = 64
 
 
@@ -314,8 +285,7 @@ class SubsystemSim:
         self.life_var = sub.life[1]
 
         # 脉冲发射：[工作时长, 静默时长]。两者都 >0 时发射按 工作->静默 循环，
-        # 其余情况视为持续发射。原版 107 个子系统用到（105 对 + 各 1 个落单），
-        # 原先只在 unknown_keys 里被丢弃，这些特效看起来是「一直喷」而不是脉冲。
+        # 其余情况视为持续发射。原版 107 个子系统用到（105 对 + 各 1 个落单）。
         pd = sub.emission_pulse_duration[0]
         ps = sub.emission_pulse_silence[0]
         self.pulse_period = (pd + ps) if (pd > 0.0 and ps > 0.0) else 0.0
@@ -367,8 +337,7 @@ class SubsystemSim:
                         and any(f.type in _VEC_FORCE_TYPES for f in self.forces))
 
         # 三轴自转：面片除屏幕内自转（rotation_speed）外，还可绕 pitch/yaw 两轴
-        # 翻转。原版 182 个子系统写了这三个键（pitch 75 / yaw 70 / roll 37），
-        # 原先只在 unknown_keys 被丢弃，面片姿态不动。
+        # 翻转。原版 182 个子系统写了这三个键（pitch 75 / yaw 70 / roll 37）。
         # 基角取 particle_pitch / particle_yaw（面片的初始朝向），速率取对应键。
         self.pitch0 = sub.particle_pitch[0]
         self.yaw0 = sub.particle_yaw[0]
@@ -380,18 +349,9 @@ class SubsystemSim:
         self.roll_speed = sub.rotation_speed_roll[0] + sub.rotation_speed_roll[1]
 
         # 发射体朝向：整个局部坐标系绕原点旋转，形状偏移与初速度方向一起转。
-        # 原先 emitter_yaw/emitter_pitch 在 parser 的 known 集合里但从未被读取，
-        # 既不生效也无诊断（静默丢弃）。原版 414 个子系统写非零值、2376 个显式
-        # 写 0、2332 个完全没写。
-        #
-        # 关键：必须区分「显式写 0」与「没写」。实测证据
-        # （arkship_01_exhaust_line_moving / fire_flare，position=(-15,0,0)、
-        # velocity=-20）：把它放在 -X 侧再给负速度，物理上就是朝 -X 向后喷；
-        # 若把「写 0」当作不旋转，尾焰会笔直朝下（(0,-20,0)），不合理。
-        # 同一批 175 个样本里，读法「写 0 → +X」全部得到水平方向，另一读法有
-        # 54 个笔直朝上。colossus 的 ball_2（position=(-22,0,0)）同理：只有把
-        # 写 0 解释为 +X，三球才全部径向（0.96°/0.00°/0.96°），否则 ball_2 差 90°。
-        # 故：写了键就旋转（0 → +X 方向），没写则保持代码原有的 +Y 基准不动。
+        # 原版 414 个子系统写非零值、2376 个显式写 0、2332 个完全没写。
+        # 写 0 时矩阵是单位阵（d(0,0) 就是 +Z），与完全没写的效果相同；
+        # has_emitter_rot 只用于统计与面板展示。
         self.emit_yaw = sub.emitter_yaw
         self.emit_pitch = sub.emitter_pitch
         self.emit_rot = None
@@ -581,19 +541,10 @@ class SubsystemSim:
         d = _emit_dir(p, y)
         v = self.vel + self.vel_var * (2.0 * w_speed - 1.0)
 
-        # 发射体朝向：旋转「形状偏移」与「出射方向」两样，position 不动。
-        # position 是设计者摆放发射体的位置，转它会让发射体离开原位——例如
-        # position=(0,6,12) 配 emitter_yaw=180，若连 position 一起转就变成
-        # (0,6,-12)，等于把发射体挪走，而设计者本可以直接写那个坐标。
-        # 反过来，只转形状与方向才解释得通：point 发射器没有体积，它写非零
-        # emitter_yaw 仍有效果（cybernetic_01_ship_exhaust 的 180 让尾焰反向），
-        # 这点只能由「方向被旋转」满足。
+        # 发射体朝向：旋转「形状偏移」与「出射方向」，position 不动（position 是
+        # 设计者摆发射体的位置；point 发射器没有体积，写非零 emitter_yaw 仍有效果，
+        # 只能由「方向被旋转」满足）。
         # 有方差时逐粒子取角，否则用构造期算好的固定矩阵。
-        # 注意判断顺序：不能写成 `m is None and self.emit_var`——__init__ 里的条件是
-        # `has_emitter_rot or emit_var`，只要 emit_var 为真就已经建好矩阵，于是
-        # `m is None` 蕴含 `not emit_var`，那个分支永远进不去（实测 9 个带方差的
-        # 子系统在 _spawn 期调用 _emit_rot_matrix 共 0 次，方差被静默忽略）。
-        # 现在直接按 emit_var 分支，方差才真正生效。
         if self.emit_var:
             ey = self.emit_yaw[0] + self.emit_yaw[1] * (2.0 * w_pos1 - 1.0)
             ep = self.emit_pitch[0] + self.emit_pitch[1] * (2.0 * w_pos2 - 1.0)
@@ -638,16 +589,10 @@ class SubsystemSim:
                     ay -= amt * ry / l
                     az -= amt * rz / l
             elif ftype == "spin":
-                # 零向量 direction 回退到 +Y。原先写的是
-                # `_norm3(f.direction) or (0.0, 1.0, 0.0)`，但 _norm3 在零向量时
-                # 返回**元组** (0,0,0)，而非空元组恒为真，所以 `or` 的回退**永不触发**，
-                # 实际用 axis=(0,0,0)（等价于该力场完全失效）。这与向量化版
-                # （`(0.0,1.0,0.0) if ln < _EPS else ...`）在零向量时给出不同加速度。
-                # 实测真实库（原版+mod，1096 个系统）：零向量 spin/vortex 力场 0 个、
-                # 省略 direction 键的 force 块 0 个、与 point/turbulence 共存的可达
-                # 组合 0 个，所以此前两种写法在现有数据上结果相同。这里统一为
-                # 「零向量 -> +Y」，与向量化版一致（否则是一处静默的防线缺口：
-                # 哪天数据写出不带 direction 的 spin，两条路径会给出不同画面且无报错）。
+                # 零向量 direction 回退到 +Y：_norm3 在零向量时返回 (0,0,0) 元组，
+                # 不能用 `_norm3(...) or (0,1,0)`——元组恒为真，回退永不触发，
+                # 实际拿到零轴（等于该力场失效）。标量版与向量化版必须一致，
+                # 否则零向量的 spin 会在两条路径上给出不同画面且无报错。
                 a = _norm3(f.direction)
                 axis = a if (a[0] or a[1] or a[2]) else (0.0, 1.0, 0.0)
                 rx = p[0] - f.position[0]
@@ -658,15 +603,14 @@ class SubsystemSim:
                 ay += amt * c[1]
                 az += amt * c[2]
             elif ftype == "vortex":
-                # ★ vortex 不是漩涡（pdx_axis_probe 四轮实机订正）：它只有**指向
-                # direction 轴线的径向吸引**，没有任何切向分量。修前这里与 spin
-                # 共用叉积分支（当成绕轴公转），画面是一圈环绕，与实机不符。
-                # 实测依据：力心与该排发射点同 y 时（轴正好穿过发射点）整格粒子
-                # 纹丝不动 → 到轴距离为 0 时完全无力，所以取「垂直分量归一化」而不是
-                # 与距离成正比的 Hooke 力（后者会让给切向初速的粒子画出闭合轨道，
-                # 而实测一律是一条曲线飞走）。
-                # 符号：原版 42 处 vortex 的 name 多为 Gravity/Gravity+、amount 为
-                # 0.4~0.55，即原版就当引力井用 → **正 amount = 吸向轴线**。
+                # vortex 不是漩涡（pdx_axis_probe 四轮实机订正）：它只有指向
+                # direction 轴线的径向吸引，没有任何切向分量，不能与 spin 共用
+                # 叉积分支（那样画出来是一圈环绕）。
+                # 力心与该排发射点同 y 时整格粒子纹丝不动 → 到轴距离为 0 时无力，
+                # 故取「垂直分量归一化」而非与距离成正比的 Hooke 力（后者会让给
+                # 切向初速的粒子画出闭合轨道，实测一律是一条曲线飞走）。
+                # 符号：原版 42 处 vortex 的 name 多为 Gravity/Gravity+、amount
+                # 0.4~0.55，即当引力井用 → 正 amount = 吸向轴线。
                 a = _norm3(f.direction)
                 axis = a if (a[0] or a[1] or a[2]) else (0.0, 1.0, 0.0)
                 rx = p[0] - f.position[0]
@@ -877,9 +821,8 @@ class SystemSim:
 
     def advance(self, t):
         # 回退交给各子系统自己处理（它们有关键帧，可只回退一小段）。
-        # 这里**不能**再 `self.reset()`：那是修复前的旧行为，会把所有子系统清零，
-        # 于是子系统看到的永远是「从 0 向前推进」，关键帧回退根本没机会生效
-        # ——实测这条路径导致回退 1 帧仍要 10~37 秒。
+        # 不能在这里 reset()：那会把所有子系统清零，关键帧回退就永远没机会生效，
+        # 回退 1 帧要重放整条时间轴。
         for s in self.subs:
             if self.enabled.get(s.name, True):
                 s.advance(t)
