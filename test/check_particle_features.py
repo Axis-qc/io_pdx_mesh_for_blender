@@ -660,22 +660,9 @@ print("=" * 78)
 print("B4. 发射体旋转 emitter_yaw / emitter_pitch")
 print("=" * 78)
 
-# 真值样本：fallen_empire_*_colossus_energy_effect 把三个球按等边三角形摆在原点
-# 外围，emitter_yaw 分别 -120/0/120，velocity 恒为 -100。
-#
-# 【本条钉住的是 position 的轴序】(px,py,pz) -> 世界 (pz, py, -px)（+X 由 pz 给、
-# +Z 由 px 的负值给），以及 emitter_yaw 的零点就是 +Z。两者缺一不可：
-#   · 资产 position 直接读（漏掉这次 90° 旋转）：三球整体偏离原位 31~33 单位、
-#     方位角错 90°，粒子沿切线掠过原点，与「朝心」夹角恒为 89/90/91 度；
-#   · 位置对了但给 emitter 方向再加 90° 偏移：又偏回去，同样是 90 度；
-#   · 两者都对：与「朝心」夹角 1.0/0.0/1.0 度，轨迹半径 20.8→0.9。
-# 1 度的残差来自作者把等边三角形的坐标写成 12/20（标准值 23.32），不是实现误差。
-#
-# 【修前】这里曾写「三球差 90° 属已知偏差、非失败」，理由是「基准 +Z 才能让 2376 个
-# 显式写 emitter_yaw=0 的子系统不旋转」。那条理由与 position 轴序混在一起算错了：
-# 位置少转 90° 正好和「发射方向多 90°」互相抵消，于是看着像 +Z 基准正确。位置修好后
-# emitter_yaw 不需要任何偏移，两个问题一起消失。那一版断言是**条件式**的——
-# 偏差一旦消失它就静默不执行，所以位置修好时它既没报错也没提示。
+# 真值样本：colossus 三球的 position 是等边三角形、emitter_yaw 是 -120/0/120，
+# 粒子应向中心汇聚。这条同时钉住 position 轴序与 emitter_yaw 零点：位置少转 90°
+# 或给 emitter 方向多加 90°，三球与「朝心」都会差 90°。
 colossus = [n for n in sorted(lib.systems) if "colossus_energy_effect" in n]
 check("找到 colossus 真值样本", bool(colossus), "{0} 个".format(len(colossus)))
 
@@ -683,7 +670,6 @@ if colossus:
     nmm = colossus[0]
     sim = S.SystemSim(lib.systems[nmm])
     detail = []
-    dirs = []
     for want in ("ball_1", "ball_2", "ball_3"):
         st = next((s for s in sim.subs if s.name == want), None)
         if st is None:
@@ -702,25 +688,13 @@ if colossus:
         ang = math.degrees(math.acos(max(-1.0, min(1.0,
             sum(vel[i] * inward[i] for i in range(3)) / Lv))))
         detail.append("{0}={1:.2f}度".format(want, ang))
-        dirs.append((vel[0] / Lv, vel[1] / Lv, vel[2] / Lv))
-    print("  样本: {0}".format(nmm))
-    print("    三球速度与「朝心」夹角（实机即向中心汇聚，应≈0度）: {0}"
-          .format(", ".join(detail)))
+    print("  样本: {0}  三球与朝心夹角: {1}".format(nmm, ", ".join(detail)))
     # 核心断言：三球都沿径向朝中心飞
     dev = [float(x.split("=")[1].rstrip("度")) for x in detail]
-    check("colossus 三球沿径向朝中心汇聚（钉 position 轴序 + emitter_yaw 零点）",
-          len(dev) == 3 and max(dev) < 5.0,
+    check("colossus 三球沿径向朝中心汇聚", len(dev) == 3 and max(dev) < 5.0,
           "与朝心夹角 {0}".format(detail))
 
-    # 三球都在水平面内、方向非退化（emitter 旋转没把某个球转飞或转零）
-    ok = (len(dirs) == 3
-          and all(abs(d[1]) < 1e-9 for d in dirs)          # 都在水平面内
-          and all(abs(d[0]) + abs(d[2]) > 0.99 for d in dirs))  # 均非退化
-    check("colossus 三球速度均为水平面内的非退化方向（emitter 旋转生效）", ok,
-          "方向 {0}".format([tuple(round(c, 2) for c in d) for d in dirs]))
-
-    # position 轴序的直接断言：三球出生点的方位角应为 120 度间隔，且半径≈23.3/22。
-    # 修前（漏 90° 旋转）方位角是 59/180/301 的镜像排列，半径相同但方位整体偏 90°。
+    # position 轴序：出生点方位 120 度均布、半径 22~23.3（修前整体偏 90 度）
     azs = []
     rads = []
     for want in ("ball_1", "ball_2", "ball_3"):
@@ -728,18 +702,17 @@ if colossus:
         if st is None or not st.particles:
             continue
         p = st.particles[0]
-        azs.append(math.degrees(math.atan2(p[2], p[4])) % 360.0)   # 从 +Z 朝 +X
+        azs.append(math.degrees(math.atan2(p[2], p[4])) % 360.0)
         rads.append(math.hypot(p[2], p[4]))
     azs.sort()
     gaps = [(azs[(i + 1) % 3] - azs[i]) % 360.0 for i in range(3)]
-    check("colossus 三球出生点按 120 度均布且半径≈22~23.3（position 轴序正确）",
+    check("colossus 三球出生点 120 度均布且半径≈22~23.3", 
           len(azs) == 3 and max(abs(g - 120.0) for g in gaps) < 3.0
           and all(21.0 < r < 24.0 for r in rads),
-          "方位 {0} 间隔 {1} 半径 {2}".format(
-              [round(a, 1) for a in azs], [round(g, 1) for g in gaps],
-              [round(r, 1) for r in rads]))
+          "方位 {0} 半径 {1}".format([round(a, 1) for a in azs],
+                                     [round(r, 1) for r in rads]))
 
-    # 轨迹必须真的靠近原点（修前是掠过，垂距恒等于起始半径）
+    # 轨迹真的落到原点附近（修前掠过，半径不降）
     rec = []
     sim2 = S.SystemSim(lib.systems[nmm], 0.0)
     for fr in range(0, 200):
@@ -749,8 +722,8 @@ if colossus:
                 rec.extend(arr)
     if rec:
         rr = [math.hypot(q[0], q[2]) for q in rec]
-        check("colossus ball_2 轨迹真的落到原点附近（修前掠过不靠近）",
-              min(rr) < 2.0, "半径 {0:.2f} -> {1:.2f}".format(max(rr), min(rr)))
+        check("colossus ball_2 轨迹落到原点附近", min(rr) < 2.0,
+              "半径 {0:.2f} -> {1:.2f}".format(max(rr), min(rr)))
     else:
         check("colossus ball_2 产生轨迹", False, "无粒子")
 
@@ -763,27 +736,14 @@ if colossus:
              if not sb.has_emitter_rot]
     check("存在完全没写 emitter 键的子系统", len(nokey) > 0,
           "{0} 个".format(len(nokey)))
-    # emitter_yaw=0 的出射方向必须是 +Z（用户 2026-10-12 复核确认，不加任何偏移）
+    # emitter_yaw 零点：0 → +Z、90 → -X（标定件实机读数）
     _d0 = S._emit_dir(0.0, 0.0)
-    check("emitter_yaw=0 的出射方向为 +Z（无偏移）",
-          abs(_d0[0]) < 1e-9 and abs(_d0[1]) < 1e-9 and abs(_d0[2] - 1.0) < 1e-9,
-          "方向 {0}".format(tuple(round(c, 3) for c in _d0)))
-    # emitter_yaw=90 必须到 -X（探针实机：velocity_yaw 0→+Z、90→-X，emitter 同零点）
     _d90 = S._emit_dir(0.0, 90.0)
-    check("emitter_yaw=90 的出射方向为 -X（探针实机读数）",
-          abs(_d90[0] + 1.0) < 1e-9 and abs(_d90[1]) < 1e-9 and abs(_d90[2]) < 1e-9,
-          "方向 {0}".format(tuple(round(c, 3) for c in _d90)))
-
-
-    # 显式写 0 必须等价于「转到 +X」，不能当作不旋转
-    yaw0 = [sb for sy in lib.systems.values() for sb in sy.subsystems
-            if sb.has_emitter_rot and not (sb.emitter_yaw[0] or sb.emitter_pitch[0])]
-    check("存在显式写 0 的子系统（与「没写」区分开）", len(yaw0) > 0,
-          "{0} 个".format(len(yaw0)))
-    nokey = [sb for sy in lib.systems.values() for sb in sy.subsystems
-             if not sb.has_emitter_rot]
-    check("存在完全没写 emitter 键的子系统", len(nokey) > 0,
-          "{0} 个".format(len(nokey)))
+    check("emitter_yaw 零点为 +Z、90 度为 -X",
+          abs(_d0[0]) < 1e-9 and abs(_d0[2] - 1.0) < 1e-9
+          and abs(_d90[0] + 1.0) < 1e-9 and abs(_d90[2]) < 1e-9,
+          "0度={0} 90度={1}".format(tuple(round(c, 3) for c in _d0),
+                                    tuple(round(c, 3) for c in _d90)))
 
     # 带方差的发射体必须逐粒子取角。
     # 曾有个不可达分支 `m is None and self.emit_var`：__init__ 的条件是

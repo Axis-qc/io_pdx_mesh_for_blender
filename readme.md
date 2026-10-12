@@ -63,7 +63,7 @@ git clone https://github.com/Axis-qc/io_pdx_mesh_for_blender.git
 
 立牌粒子朝向**界面里的实际镜头**（3D 视口视角），不是场景里摆的摄像机；没有 3D 视口时才退回场景摄像机。多开窗口时跟当前活动窗口的视口。转动视角时等镜头停稳再刷新，拖动过程中不重算；镜头一直转不停（视口相机动画、连续导航）则每秒兜底刷一次，不会完全不跟随。面板里的 `Face the viewport` 可关掉这个行为，关掉后按场景摄像机处理。写了 `billboard=no` 的固定朝向粒子不跟随镜头。
 
-粒子的坐标与朝向跟模型走同一套轴：坐标映射和 `.mesh` 导入一样是 (x, z, y)，所以粒子在预览里的前后、上下与导入的舰船一致（模型空间 -Z 是船头，导入后船头在 Blender -Y）。子系统 `position` 的轴序和世界不同，要先转一次 `(px, py, pz) → (pz, py, -px)` 再按上面的映射走：想要世界 +X 就写 `position.z`，想要世界 +Z 就写 `position.x` 的负值。`billboard=no` 的固定朝向粒子按 `particle_yaw` / `particle_pitch` 摆：默认（都写 0）是竖直立着的面片，贴图箭头朝 +X、贴图上边朝 +Y（引擎空间，即导入后的 +X 与 +Z）；`particle_yaw` 绕世界 +Y 转，`particle_pitch` 绕面片自身长轴自转（它其实是 roll：不改变箭头指向，只把面片翻成水平）。`billboard=yes` 的粒子恒正面朝镜头，此时这两个字段完全无效。
+粒子的坐标与朝向跟模型走同一套轴：坐标映射和 `.mesh` 导入一样是 (x, z, y)，所以粒子在预览里的前后、上下与导入的舰船一致（模型空间 -Z 是船头，导入后船头在 Blender -Y）。子系统 `position` 的轴序与世界不同，要先转一次：想要 world +X 写 `position.z`，想要 world +Z 写 `position.x` 的负值。`billboard=no` 的固定朝向粒子按 `particle_yaw` / `particle_pitch` 摆：默认（都写 0）是竖直立着的面片，贴图箭头朝 +X、贴图上边朝 +Y（引擎空间，即导入后的 +X 与 +Z）；`particle_yaw` 绕世界 +Y 转，`particle_pitch` 绕面片自身长轴自转（它其实是 roll：不改变箭头指向，只把面片翻成水平）。`billboard=yes` 的粒子恒正面朝镜头，此时这两个字段完全无效。
 
 导入会自动挑一帧粒子最多的画面，不必手动找。时间轴往回拖只回退到最近的检查点，不会从头重算。回退关键帧间隔按实测调到 0.5 秒一档：1 秒级回退从几百毫秒降到几毫秒，代价是最重的几个系统同时载入时多占约 240MB 内存。`vortex` / `spin` 力场的子系统也走向量化积分，与 `point` / `turbulence` 同等待遇，逐位一致（astral_rift 等大粒子系统约 1.6~1.8 倍）。
 
