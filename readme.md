@@ -71,14 +71,16 @@ git clone https://github.com/Axis-qc/io_pdx_mesh_for_blender.git
 
 粒子的许多字段都写成 `{ 基准 方差 }` 两个值。**第二个值怎么用，逐字段有各自的规则**，不是一套统一语义：
 
-- **角度类**（`sphere_emitter_yaw/pitch`、`velocity_yaw/pitch`、`emitter_yaw/pitch`、`particle_yaw/pitch`、`rotation`、`rotation_speed*`）用 `基准 ± 方差`，取值 基准−方差 ~ 基准+方差。例如 `sphere_emitter_pitch={ 60 80 }` 得到 −20~140，向下能探到下半球。
-- **长度与标量类**（`sphere_emitter_radius`、`box_emitter_*`、`life`、`size`、`alpha`、`color` 三通道、`velocity` 大小）用 `基准 + 方差 × 随机数`（随机数 0~1），取值 基准 ~ 基准+方差。例如尘埃场 `sphere_emitter_radius={ 0 18 }` 得到半径 0~18。
+- **有符号量**（角度类 `sphere_emitter_yaw/pitch`、`velocity_yaw/pitch`、`emitter_yaw/pitch`、`particle_yaw/pitch`、`rotation`、`rotation_speed*`，以及速度 `velocity` 本身）用 `基准 ± 方差`，取值 基准−方差 ~ 基准+方差。例如 `sphere_emitter_pitch={ 60 80 }` 得到 −20~140，向下能探到下半球；`velocity` 取负值就是反方向运动。
+- **长度与标量类**（`sphere_emitter_radius`、`box_emitter_*`、`life`、`size`、`alpha`、`color` 三通道）用 `基准 + 方差 × 随机数`（随机数 0~1），取值 基准 ~ 基准+方差。例如尘埃场 `sphere_emitter_radius={ 0 18 }` 得到半径 0~18。
 
 规则表在 `simulator.py` 的 `_VAR_RULES` 里，一个字段一行；改某个字段的语义不会波及其它字段。每颗粒子的取值都在发射时定死、之后不再变。`start` 比较特别：它的方差是**整个子系统摇一次**，`start={ 0 4 }` 表示这个发射器随机延迟 0~4 秒才开始工作，而不是每颗粒子各自错开。
 
 球面发射器的出生区域由 `sphere_emitter_yaw` / `sphere_emitter_pitch` 划定：两个角都在半径给定的球面上取，范围窄就得到一条弧带，只给一个轴全向会得到环，两个都取到 ±180 才铺满整球。
 
-`test/` 里有粒子功能的自检与基准脚本：`check_particle_features.py` 是特征回归（当前 82 项通过，整轮约 1 分钟，超过单次工具调用上限时要分段跑），`bench_checkpoint_stride.py` 与 `bench_vortex_vec.py` 是此前两项调优的实测脚本，可复跑。
+扫描粒子本体时会搜整个 `gfx/` 下的 `.asset`，不限于 `gfx/particles/`——自建的粒子如果放在 `gfx/models/` 之类的位置，也能在列表里预览（否则注册项能列出来、点预览却报 "No body found"）。模型、灯光、动画的 `.asset` 顶层键不是粒子，不会被收进来。
+
+`test/` 里有粒子功能的自检与基准脚本：`check_particle_features.py` 是特征回归（当前 128 项通过，整轮约 1.5 分钟，超过单次工具调用上限时要分段跑）。环境变量 `IO_PDX_TEST_PROBE_ROOT` 指向自建标定件所在的 mod 根时，会多跑几条针对标定件的真值断言；不设也能跑，只是那几条退回游戏内同特征样本。`bench_checkpoint_stride.py` 与 `bench_vortex_vec.py` 是此前两项调优的实测脚本，可复跑。
 
 已知限制：`childsystem` 嵌套子系统只解析并在日志里提示，不参与渲染（全库仅 15 处，其中 6 处是 `hide=yes`）；`local_space` 不影响预览，因为预览里没有带变换的父实体。
 

@@ -47,6 +47,13 @@ from io_pdx_mesh.pdx_particles import blender_preview as BP  # noqa: E402
 GAME = os.environ.get(
     "IO_PDX_TEST_GAME", r"G:\SteamLibrary\steamapps\common\Stellaris")
 
+# 可选：用户自建的标定件 mod 根。标定件（pdx_axis_probe）常放在 gfx/models 下，
+# 索引范围已放宽到整个 gfx/ 所以能被收进来；设了这个环境变量就能跑那几条真值断言，
+# 没设就退回游戏内同特征样本。默认读到已知路径就用，读不到不影响其它检查。
+PROBE_ROOT = os.environ.get(
+    "IO_PDX_TEST_PROBE_ROOT",
+    r"C:\Users\hp\Documents\Paradox Interactive\Stellaris\mod\stellaris_godie")
+
 # 抽样规模。区分两类检查：
 #   - 解析层（读 .asset、数键、查字段）：全量扫，成本是秒级，全量更可信。
 #   - 模拟层（SystemSim + advance 跑物理）：**必须抽样**。单次 advance 是数百
@@ -78,8 +85,11 @@ print("=" * 78)
 print("A. 解析层：字段是否被收下（不是丢进 unknown_keys）")
 print("=" * 78)
 
-lib = P.ParticleLibrary([GAME]).scan()
-print("  索引系统数: {0}".format(len(lib.systems)))
+_roots = [PROBE_ROOT] if os.path.isdir(PROBE_ROOT) else []
+_roots.append(GAME)
+lib = P.ParticleLibrary(_roots).scan()
+print("  索引系统数: {0}（根: {1}）".format(
+    len(lib.systems), ", ".join(os.path.basename(r) for r in _roots)))
 
 subs = [sb for sy in lib.systems.values() for sb in sy.subsystems]
 print("  子系统总数: {0}".format(len(subs)))
@@ -1708,32 +1718,63 @@ if _probe[0] in lib.systems and any(s.name == "test_2" for s in lib.systems[_pro
         for _i in range(2000):
             _st.spawn_count = _i
             _st._spawn(0.0)
-        _pt = [(p[2], p[3], p[4]) for p in _st.particles]
-        _pit_l, _yaw_l = [], []
-        for _x, _y, _z in _pt:
-            _L = math.sqrt(_x * _x + _y * _y + _z * _z) or 1e-9
-            _pit_l.append(math.degrees(math.asin(max(-1.0, min(1.0, _y / _L)))))
-            _yaw_l.append(math.degrees(math.atan2(-_x / _L, _z / _L)) % 360.0)
+        # 出生点要**减去 position 偏移**再归一化：p[2..4] 是引擎绝对坐标，含
+        # 子系统 position（test_2 的 position.y=20）。直接用绝对坐标算方向会被
+        # 偏移带歪，判负半球也会永远判不到。
+        _pos = _sb.position
+        _pt = [(p[2] - _pos[0], p[3] - _pos[1], p[4] - _pos[2]) for p in _st.particles]
         # 区间按**规则表**推：sphere_emitter_yaw/pitch 是角度类（±）
         _plo = _sb.sphere_pitch[0] - _sb.sphere_pitch[1]
         _phi = _sb.sphere_pitch[0] + _sb.sphere_pitch[1]
         _ylo = _sb.sphere_yaw[0] - _sb.sphere_yaw[1]
         _yhi = _sb.sphere_yaw[0] + _sb.sphere_yaw[1]
-        _in_p = all(_plo - 0.5 <= v <= _phi + 0.5 for v in _pit_l)
-        # yaw 是环绕量：±20 时区间 -10~30，等价于 350~360 + 0~30
-        _in_y = all((_ylo - 0.5) % 360.0 <= v <= (_yhi + 0.5) % 360.0
-                    or v >= (_ylo - 0.5) % 360.0 or v <= (_yhi + 0.5) % 360.0
-                    for v in _yaw_l)
+        # 判定方式：把每颗方向反解回 (pitch, yaw)，再检查是否存在**同一区间内**
+        # 的一组角度能产生它。_emit_dir 的水平朝向 = (-sin yaw, cos yaw) 乘
+        # cos(pitch)；pitch 跨 90 时 cos 变号，水平朝向翻转 180°。所以按
+        # cos(pitch) 的符号分两支：正号组要求 yaw 落在区间内，负号组要求
+        # yaw+180 落在区间内（等价于 yaw ∈ 区间+180）。
+        _bad = 0
+        for _x, _y, _z in _pt:
+            _L = math.sqrt(_x * _x + _y * _y + _z * _z) or 1e-9
+            _uy, _ux, _uz = _y / _L, _x / _L, _z / _L
+            # 由 sin(pitch) = uy 得 pitch 候选（主值与补角，后者对应 cos 变号）
+            _sp = max(-1.0, min(1.0, _uy))
+            _p1 = math.degrees(math.asin(_sp))
+            _p2 = 180.0 - _p1
+            _horiz = math.sqrt(max(0.0, 1.0 - _sp * _sp))
+            if _horiz < 1e-6:
+                _yaws = (0.0,)                      # 正上/正下，yaw 无意义
+            else:
+                _yaws = (math.degrees(math.atan2(-_ux / _horiz, _uz / _horiz)) % 360.0,)
+            _ok_one = False
+            for _pp in (_p1, _p2):
+                if not (_plo - 1e-6 <= _pp <= _phi + 1e-6):
+                    continue
+                _sign = 1.0 if math.cos(math.radians(_pp)) >= 0 else -1.0
+                for _yy in _yaws:
+                    # cos(pitch) 为负时水平朝向整体翻转，等价 yaw 加 180
+                    _eff = _yy if _sign >= 0 else (_yy + 180.0) % 360.0
+                    _w = (_eff - _ylo) % 360.0
+                    if _w <= (_yhi - _ylo) + 1e-6:
+                        _ok_one = True
+                        break
+                if _ok_one:
+                    break
+            if not _ok_one:
+                _bad += 1
         _oct = set((_x > 0, _y > 0, _z > 0) for _x, _y, _z in _pt)
+        _neg_y = sum(1 for _x, _y, _z in _pt if _y < 0)
         check("标定件 test_2 出生点全部落在 yaw/pitch 划定的弧带内",
-              bool(_pt) and _in_p and _in_y,
-              "pitch 实测 {0:.1f}~{1:.1f}（设定 {2:g}~{3:g}）yaw 实测 {4:.1f}~{5:.1f}"
-              "（设定 {6:g}~{7:g}）".format(
-                  min(_pit_l), max(_pit_l), _plo, _phi,
-                  min(_yaw_l), max(_yaw_l), _ylo, _yhi))
+              bool(_pt) and _bad == 0,
+              "pitch[{0:g},{1:g}] yaw[{2:g},{3:g}]，{4} 颗中 {5} 颗越界"
+              "（{6} 颗伸到引擎 y<0）".format(
+                  _plo, _phi, _ylo, _yhi, len(_pt), _bad, _neg_y))
         # 区域受限 → 只覆盖少数卦限，绝不可能是整球（8 个）
         check("标定件 test_2 只覆盖部分卦限（弧带而非整球）", 0 < len(_oct) < 8,
               "{0}/8 个卦限，{1} 颗".format(len(_oct), len(_pt)))
+        # 角度类必须是 ±：pitch={60 80} 要能下探到负仰角（进下半球）
+        check("标定件 test_2 的 pitch 下探到下半球", _neg_y > 0,
+              "{0}/{1} 颗在引擎 y<0".format(_neg_y, len(_pt)))
 else:
     print("  (跳过 test_2：未找到 pdx_axis_probe 标定件)")
 
@@ -1845,6 +1886,8 @@ _rule_expect = {
     "sphere_emitter_pitch": "pm", "sphere_emitter_yaw": "pm",
     "velocity_pitch": "pm", "velocity_yaw": "pm",
     "particle_pitch": "pm", "particle_yaw": "pm", "rotation": "pm",
+    # velocity 是有符号的：负值表示反方向运动（用户实机确认）
+    "velocity": "pm",
     "sphere_emitter_radius": "interval", "box_emitter_x": "interval",
     "box_emitter_y": "interval", "box_emitter_z": "interval",
     "life": "interval", "size": "interval", "alpha": "interval",
@@ -1864,6 +1907,41 @@ check("pm 规则下 u=0/1 得到 基准-方差 / 基准+方差",
 check("interval 规则下 u=0/1 得到 基准 / 基准+方差",
       S._pick(10.0, 20.0, 0.0, "interval") == 10.0
       and S._pick(10.0, 20.0, 1.0, "interval") == 30.0)
+
+# 15b2 velocity 是有符号量（±）：负基准表示反方向运动，浮动应跨在基准两侧
+check("velocity 规则是有符号的 ±",
+      S._rule_of("velocity") == "pm"
+      and S._pick(-10.0, 2.0, 0.0, "pm") == -12.0
+      and S._pick(-10.0, 2.0, 1.0, "pm") == -8.0
+      and S._pick(-10.0, 2.0, 0.5, "pm") == -10.0,
+      "-10±2 端点应为 -12 / -8")
+
+# 真样本：库里存在负基准的 velocity，取到的速度应正负都出现（围绕基准浮动）
+_negv = None
+for _n, _sy in lib.systems.items():
+    for _s in _sy.subsystems:
+        if not _s.hide and _s.velocity[0] < 0 and _s.velocity[1] > 0:
+            _negv = (_n, _s)
+            break
+    if _negv:
+        break
+if _negv:
+    _sim = S.SystemSim(lib.systems[_negv[0]])
+    _st = next((x for x in _sim.subs if x.name == _negv[1].name), None)
+    if _st is not None:
+        for _i in range(300):
+            _st.spawn_count = _i
+            _st._spawn(0.0)
+        _speeds = [math.sqrt(p[5] ** 2 + p[6] ** 2 + p[7] ** 2) for p in _st.particles]
+        _v0, _vv = _negv[1].velocity
+        check("负基准 velocity 围绕基准浮动（± 而非单向区间）",
+              bool(_speeds)
+              and all(abs(_v0) - _vv - 1e-6 <= v <= abs(_v0) + _vv + 1e-6 for v in _speeds)
+              and min(_speeds) < abs(_v0) < max(_speeds),
+              "基准 {0:g} 方差 {1:g}，速度 {2:.3f}~{3:.3f}".format(
+                  _v0, _vv, min(_speeds), max(_speeds)))
+else:
+    check("找到负基准 velocity 样本", False)
 
 # 15c 真值：pitch 基准 + 方差跨过 90 的球面发射器，角度类必须是 ± 才能进下半球。
 #     优先用标定件 test_2（pitch={60 80}）；标定件在用户 mod 目录下、测试库只扫

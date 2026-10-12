@@ -69,14 +69,16 @@ The `Seed` field in the panel controls the per-particle randomness (lifetime, sp
 
 Many particle fields are written as `{ base variance }`, and **how the second value is used differs per field** — there is no single global rule:
 
-- **Angle fields** (`sphere_emitter_yaw/pitch`, `velocity_yaw/pitch`, `emitter_yaw/pitch`, `particle_yaw/pitch`, `rotation`, `rotation_speed*`) use `base ± variance`, giving base−variance ~ base+variance. `sphere_emitter_pitch={ 60 80 }` yields −20~140, reaching into the lower hemisphere.
-- **Length and scalar fields** (`sphere_emitter_radius`, `box_emitter_*`, `life`, `size`, `alpha`, `color` channels, `velocity` magnitude) use `base + variance × random` (random in 0~1), giving base ~ base+variance. The dust field `sphere_emitter_radius={ 0 18 }` yields a radius of 0~18.
+- **Signed values** (the angle fields `sphere_emitter_yaw/pitch`, `velocity_yaw/pitch`, `emitter_yaw/pitch`, `particle_yaw/pitch`, `rotation`, `rotation_speed*`, plus `velocity` itself) use `base ± variance`, giving base−variance ~ base+variance. `sphere_emitter_pitch={ 60 80 }` yields −20~140, reaching into the lower hemisphere; a negative `velocity` means motion in the opposite direction.
+- **Length and scalar fields** (`sphere_emitter_radius`, `box_emitter_*`, `life`, `size`, `alpha`, `color` channels) use `base + variance × random` (random in 0~1), giving base ~ base+variance. The dust field `sphere_emitter_radius={ 0 18 }` yields a radius of 0~18.
 
 The rule table lives in `_VAR_RULES` in `simulator.py`, one line per field, so changing one field's semantics does not affect any other. Every per-particle value is picked once at spawn and then frozen. `start` is special: its variance is rolled **once for the whole subsystem**, so `start={ 0 4 }` means the emitter starts after a random delay of 0~4 seconds rather than each particle being staggered.
 
 A sphere emitter's spawn area is bounded by `sphere_emitter_yaw` / `sphere_emitter_pitch`: both angles are picked on the sphere of the given radius, so a narrow range gives an arc band, making only one axis omni gives a ring, and only reaching ±180 on both fills the whole sphere.
 
-`test/` contains the self-check and benchmark scripts for the particle preview: `check_particle_features.py` is the feature regression (currently 82 checks passing, roughly a minute for a full run, so split it into chunks when a single tool call times out); `bench_checkpoint_stride.py` and `bench_vortex_vec.py` are the measurement scripts behind two earlier tunings and can be re-run.
+Particle bodies are indexed from **every** `.asset` under `gfx/`, not just `gfx/particles/` — so a hand-made particle placed under `gfx/models/` and the like can be previewed from the list too (otherwise the registration shows up but previewing it reports "No body found"). Model, light and animation `.asset` files have non-particle top-level keys and are not picked up.
+
+`test/` contains the self-check and benchmark scripts for the particle preview: `check_particle_features.py` is the feature regression (currently 128 checks passing, roughly 1.5 minutes for a full run, so split it into chunks when a single tool call times out). Point the `IO_PDX_TEST_PROBE_ROOT` environment variable at the mod root holding your own calibration asset to also run the assertions specific to it; without it those few fall back to in-game samples of the same shape. `bench_checkpoint_stride.py` and `bench_vortex_vec.py` are the measurement scripts behind two earlier tunings and can be re-run.
 
 Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered (only 15 occurrences in the whole game, 6 of them `hide=yes`); `local_space` has no effect on the preview, as the preview has no transformed parent entity.
 
