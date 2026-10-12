@@ -553,17 +553,21 @@ else:
 
 print()
 print("=" * 78)
-print("B2. 发射器形态：sphere 整球均匀（哈希权重回归）")
+print("B2. 发射器形态：sphere 出生区域与半径（哈希权重回归）")
 print("=" * 78)
-print("   球面发射器在整球上均匀取点。sphere_emitter_yaw / _pitch 是发射器**自身**")
-print("   的偏航/俯仰，球旋转对称 → 不改变分布，因此不参与取点（曾误当「散布范围」，")
-print("   那会给出环或半球）。半径按「基准 + 方差*U」取，不是「基准 ± 方差」。")
+print("   每个二元组字段的取数规则见 simulator._VAR_RULES：角度类用「基准 ± 方差」，")
+print("   长度/标量类用「基准 + 方差*U」。球面出生区域由 sphere_emitter_yaw / _pitch")
+print("   划定（角度类）：两轴都取到 ±180 才铺满整球；窄的范围得到一段弧带")
+print("   （标定件 test_2 的 yaw={10 20} pitch={60 80}，pitch 下探到 -20 会伸进下半球）。")
 
 sph_pick = None
 for nm, sy in lib.systems.items():
     for sb in sy.subsystems:
+        # 必须挑「两个轴的散布都够大」的样本才是整球：窄区域的样本（如 test_2）
+        # 本来就只出一条弧带，用整球判据会误判。
         if (not sb.hide and sb.emitter_type == "sphere"
-                and (sb.sphere_radius[0] > 0 or sb.sphere_radius[1] > 0)):
+                and (sb.sphere_radius[0] > 0 or sb.sphere_radius[1] > 0)
+                and sb.sphere_yaw[1] >= 170.0 and sb.sphere_pitch[1] >= 170.0):
             sph_pick = (nm, sy, sb)
             break
     if sph_pick:
@@ -583,11 +587,44 @@ if sph_pick:
         signs = [sum(1 for p in pts if p[2 + k] > 0) / float(len(pts)) for k in range(3)]
         print("  样本: {0} / {1}  radius={2}".format(nm[:34], sb.name, sb.sphere_radius))
         print("    三轴符号比 x/y/z = {0}".format([round(v, 3) for v in signs]))
-        # 整球均匀：三轴符号都应接近 0.5（半球或环会明显偏斜）
-        worst = max(abs(v - 0.5) for v in signs)
-        check("sphere 发射整球均匀（三轴符号均≈0.5）", worst < 0.08,
+        # 三轴符号比要与「yaw/pitch 区域」相符：yaw 只覆盖部分方位时，符号会偏斜
+        # （这是区域受限应有的结果，不是退化）。区域必须按**规则表**推：角度字段
+        # 用 ± 时区间是 [基准-方差, 基准+方差]，用区间时是 [基准, 基准+方差]。
+        def _span(base, var, rule):
+            if rule == "pm":
+                return base - var, base + var
+            return base, base + var
+
+        _ylo, _yhi = _span(sb.sphere_yaw[0], sb.sphere_yaw[1],
+                           S._rule_of("sphere_emitter_yaw"))
+        _plo, _phi = _span(sb.sphere_pitch[0], sb.sphere_pitch[1],
+                           S._rule_of("sphere_emitter_pitch"))
+        _exp_sign = []
+        for _k in range(3):
+            _pos = 0
+            _tot = 0
+            for _a in range(37):
+                for _b in range(37):
+                    _yy = _ylo + (_yhi - _ylo) * (_a / 36.0)
+                    _pp = _plo + (_phi - _plo) * (_b / 36.0)
+                    _dd = S._emit_dir(_pp, _yy)
+                    _tot += 1
+                    if _dd[_k] > 0:
+                        _pos += 1
+            _exp_sign.append(_pos / float(_tot))
+        print("    区域 yaw[{0:g},{1:g}] pitch[{2:g},{3:g}]（按规则表推）".format(
+            _ylo, _yhi, _plo, _phi))
+        print("    三轴符号比 x/y/z = {0}  区域期望 {1}".format(
+            [round(v, 3) for v in signs], [round(v, 3) for v in _exp_sign]))
+        worst = max(abs(signs[k] - _exp_sign[k]) for k in range(3))
+        check("sphere 三轴符号与 yaw/pitch 区域相符", worst < 0.08,
               "最大偏差 {0:.3f}".format(worst))
-        # 球面网格覆盖率：退化的写法只有约 11%
+        # 覆盖率应与「yaw/pitch 划定的区域」相符：yaw 跨度占 360 的比例 ×
+        # pitch 跨度占 180 的比例。yaw={0 180} 只覆盖半个方位 → 期望约 50%；
+        # yaw={0 360}+pitch={0 180} 才是整球 → 期望 100%。
+        # 网格用 acos(vy/L) 作极角、atan2(vz,vx) 作方位，与 _emit_dir 的
+        # pitch/yaw 只差一个常数偏移（极角 = 90 - pitch，方位 = 90 + yaw），
+        # 所以跨度不变。
         NP, NY = 18, 36
         grid = set()
         for p in pts:
@@ -597,8 +634,15 @@ if sph_pick:
             yaw = math.degrees(math.atan2(vz / L, vx / L)) % 360.0
             grid.add((int(pit / (180.0 / NP)), int(yaw / (360.0 / NY))))
         cov = len(grid) / float(NP * NY)
-        print("    球面网格覆盖 {0:.1f}%  (退化写法约 11%)".format(cov * 100))
-        check("sphere 球面覆盖 > 60%", cov > 0.60, "{0:.1f}%".format(cov * 100))
+        # 期望覆盖率按规则表推出的实际区间算（角度类 ± 时区间更宽）
+        _yspan = min((_yhi - _ylo), 360.0) / 360.0
+        _pspan = min((_phi - _plo), 180.0) / 180.0
+        _expect = max(0.0, min(1.0, _yspan)) * max(0.0, min(1.0, _pspan))
+        print("    区域 yaw 跨度 {0:g}° / pitch 跨度 {1:g}° → 期望覆盖 {2:.0%}，实测 {3:.1f}%".format(
+            _yhi - _ylo, _phi - _plo, _expect, cov * 100))
+        check("sphere 覆盖率与 yaw/pitch 区域相符",
+              _expect > 0 and 0.70 * _expect <= cov <= min(1.0, 1.05 * _expect),
+              "期望 {0:.0%} 实测 {1:.1f}%".format(_expect, cov * 100))
         # 半径必须非负且落在 [基准, 基准+方差] 内：旧「基准 ± 方差」会有一半
         # 半径为负被钳到 0，堆在原点（实测 DustParticlesOrange 达 48.5%）。
         rs = [math.sqrt(p[2] ** 2 + p[3] ** 2 + p[4] ** 2) for p in pts]
@@ -1505,7 +1549,7 @@ else:
 _dust = ("infernal_system_crisis_star_file", "DustParticlesOrange")
 if _dust[0] in lib.systems:
     _nn, _pp, _ = _spread_of(*_dust, team=80)
-    check("DustParticlesOrange 从原点改为球壳发射", _pp > 1,
+    check("DustParticlesOrange 从原点改为球面区域散布", _pp > 1,
           "{0} 颗 {1} 个位置".format(_nn, _pp))
 else:
     print("  (跳过 DustParticlesOrange：未找到该系统)")
@@ -1643,23 +1687,55 @@ if _dust2[0] in lib.systems:
               all(-1e-6 <= r <= _rv + 1e-6 for r in _rs),
               "方差 {0:g} 实测 {1:.3f}~{2:.3f}".format(_rv, min(_rs), max(_rs)))
 
-# 14c 整球均匀：球面发射器不能是半球（用户举例 b_class_star_file）
-_star = ("b_class_star_file", "Surface_fire")
-if _star[0] in lib.systems:
-    _sim = S.SystemSim(lib.systems[_star[0]])
-    _st = next((x for x in _sim.subs if x.name == _star[1]), None)
+# 14c 出生区域必须是「一段带」而不是整球：用标定件 test_2 的参数
+#     （yaw={10 20}、pitch={60 80}，用户实机确认是一条弧带）复现。
+_probe = ("pdx_axis_probe", "test_2")
+_sim_probe = None
+for _n, _sy in lib.systems.items():
+    if "pdx_axis_probe" in _n:
+        for _sb in _sy.subsystems:
+            if _sb.name == "test_2":
+                _probe = (_n, _sb)
+                break
+    if _sim_probe is None and _probe[1] is not None:
+        break
+if _probe[0] in lib.systems and any(s.name == "test_2" for s in lib.systems[_probe[0]].subsystems):
+    _sy = lib.systems[_probe[0]]
+    _sb = next(s for s in _sy.subsystems if s.name == "test_2")
+    _sim = S.SystemSim(_sy)
+    _st = next((x for x in _sim.subs if x.name == "test_2"), None)
     if _st is not None:
         for _i in range(2000):
             _st.spawn_count = _i
             _st._spawn(0.0)
-        _pts = [(p[2], p[3], p[4]) for p in _st.particles]
-        _oct = set()
-        for _x, _y, _z in _pts:
-            _oct.add((_x > 0, _y > 0, _z > 0))
-        check("b_class_star_file/Surface_fire 覆盖全部 8 个卦限（整球，不是半球）",
-              len(_oct) == 8, "{0}/8 个卦限，{1} 颗".format(len(_oct), len(_pts)))
+        _pt = [(p[2], p[3], p[4]) for p in _st.particles]
+        _pit_l, _yaw_l = [], []
+        for _x, _y, _z in _pt:
+            _L = math.sqrt(_x * _x + _y * _y + _z * _z) or 1e-9
+            _pit_l.append(math.degrees(math.asin(max(-1.0, min(1.0, _y / _L)))))
+            _yaw_l.append(math.degrees(math.atan2(-_x / _L, _z / _L)) % 360.0)
+        # 区间按**规则表**推：sphere_emitter_yaw/pitch 是角度类（±）
+        _plo = _sb.sphere_pitch[0] - _sb.sphere_pitch[1]
+        _phi = _sb.sphere_pitch[0] + _sb.sphere_pitch[1]
+        _ylo = _sb.sphere_yaw[0] - _sb.sphere_yaw[1]
+        _yhi = _sb.sphere_yaw[0] + _sb.sphere_yaw[1]
+        _in_p = all(_plo - 0.5 <= v <= _phi + 0.5 for v in _pit_l)
+        # yaw 是环绕量：±20 时区间 -10~30，等价于 350~360 + 0~30
+        _in_y = all((_ylo - 0.5) % 360.0 <= v <= (_yhi + 0.5) % 360.0
+                    or v >= (_ylo - 0.5) % 360.0 or v <= (_yhi + 0.5) % 360.0
+                    for v in _yaw_l)
+        _oct = set((_x > 0, _y > 0, _z > 0) for _x, _y, _z in _pt)
+        check("标定件 test_2 出生点全部落在 yaw/pitch 划定的弧带内",
+              bool(_pt) and _in_p and _in_y,
+              "pitch 实测 {0:.1f}~{1:.1f}（设定 {2:g}~{3:g}）yaw 实测 {4:.1f}~{5:.1f}"
+              "（设定 {6:g}~{7:g}）".format(
+                  min(_pit_l), max(_pit_l), _plo, _phi,
+                  min(_yaw_l), max(_yaw_l), _ylo, _yhi))
+        # 区域受限 → 只覆盖少数卦限，绝不可能是整球（8 个）
+        check("标定件 test_2 只覆盖部分卦限（弧带而非整球）", 0 < len(_oct) < 8,
+              "{0}/8 个卦限，{1} 颗".format(len(_oct), len(_pt)))
 else:
-    print("  (跳过 b_class_star_file：未找到该系统)")
+    print("  (跳过 test_2：未找到 pdx_axis_probe 标定件)")
 
 # 14d box 只写方差时应铺开且以原点为中心（不是偏在一侧）
 _box2 = None
@@ -1688,58 +1764,157 @@ if _box2:
 else:
     check("找到 box 只写方差的样本", False)
 
-# 14e 球面发射器的朝向角叠加到初速度方向（sphere 角 + velocity 角）
-_sphdir = None
+# 14e sphere_emitter_yaw / _pitch 划定**出生区域**，且不影响初速度方向
+_sphregion = None
 for _n, _sy in lib.systems.items():
     for _sb in _sy.subsystems:
         if (not _sb.hide and _sb.emitter_type == "sphere"
-                and abs(_sb.sphere_yaw[0]) > 1e-9 and abs(_sb.sphere_yaw[1]) < 1e-9
-                and abs(_sb.velocity_yaw[0]) < 1e-9 and abs(_sb.velocity_yaw[1]) < 1e-9
-                and abs(_sb.velocity[0]) > 1e-9):
-            _sphdir = (_n, _sb)
+                and _sb.sphere_radius[0] > 0
+                and (_sb.sphere_yaw[1] > 1e-9 or _sb.sphere_pitch[1] > 1e-9)):
+            _sphregion = (_n, _sb)
             break
-    if _sphdir:
+    if _sphregion:
         break
-if _sphdir:
-    _sim = S.SystemSim(lib.systems[_sphdir[0]])
-    _st = next((x for x in _sim.subs if x.sub.name == _sphdir[1].name), None)
+if _sphregion:
+    _sim = S.SystemSim(lib.systems[_sphregion[0]])
+    _st = next((x for x in _sim.subs if x.sub.name == _sphregion[1].name), None)
     if _st is not None:
-        _sb0 = _sphdir[1]
-        # 取一个 sphere_yaw 固定、且 sphere_pitch 也无散布的样本才能得到唯一基准方向；
-        # 若 pitch 有散布，则逐粒子方向不同，改为验「方向确实随 pitch 散开」。
-        _yaw0 = _sb0.sphere_yaw[0]
-        for _i in range(50):
+        _sb0 = _sphregion[1]
+        _sim2 = S.SystemSim(lib.systems[_sphregion[0]])
+        _st2 = next((x for x in _sim2.subs if x.sub.name == _sb0.name), None)
+        for _i in range(300):
             _st.spawn_count = _i
             _st._spawn(0.0)
-        _dirs = []
+            _st2.spawn_count = _i
+            _st2._spawn(0.0)
+        # 出生点必须全部落在球面上（半径 = sphere_radius 基准，此样本方差为 0）
+        _rr = _sb0.sphere_radius[0]
+        _on_sphere = all(abs(math.sqrt(p[2] ** 2 + p[3] ** 2 + p[4] ** 2) - _rr) < 1e-6
+                         for p in _st.particles)
+        check("球面出生点半径一致", bool(_st.particles) and _on_sphere,
+              "半径 {0:g}，{1} 颗".format(_rr, len(_st.particles)))
+        # 出生区域必须被 yaw/pitch 的范围约束住：把每个出生点反解成球面角，
+        # 应落在规则表推出的区间内（角度类是 ±；yaw 允许环绕）。
+        _ylo = _sb0.sphere_yaw[0] - _sb0.sphere_yaw[1]
+        _yhi = _sb0.sphere_yaw[0] + _sb0.sphere_yaw[1]
+        _plo = _sb0.sphere_pitch[0] - _sb0.sphere_pitch[1]
+        _phi = _sb0.sphere_pitch[0] + _sb0.sphere_pitch[1]
+        _bad = 0
+        _dirs = set()
         for _p in _st.particles:
-            _L = math.sqrt(_p[5] ** 2 + _p[6] ** 2 + _p[7] ** 2)
-            if _L > 1e-9:
-                _dirs.append((_p[5] / _L, _p[6] / _L, _p[7] / _L))
-        if _sb0.sphere_pitch[1] < 1e-9:
-            # 唯一方向：应等于 _emit_dir(sphere_pitch[0], sphere_yaw[0])，符号由
-            # 速度大小的正负决定（负速度整体反向）。
-            _exp = S._emit_dir(_sb0.sphere_pitch[0], _yaw0)
-            _sgn = -1.0 if _sb0.velocity[0] < 0 else 1.0
-            _exp = tuple(_sgn * c for c in _exp)
-            _ok = bool(_dirs) and all(
-                all(abs(d[k] - _exp[k]) < 0.05 for k in range(3)) for d in _dirs)
-            check("sphere 朝向角决定初速度方向（基准单一）", _ok,
-                  "sphere_yaw={0:g} pitch={1:g} 期望 {2}".format(
-                      _yaw0, _sb0.sphere_pitch[0], [round(c, 3) for c in _exp]))
-        else:
-            # 有散布：方向必须铺开，且每个方向的 yaw 分量都符合 sphere_yaw=90
-            # （_emit_dir 在 yaw=90 时 x 分量为 -cos(pitch)、z 分量为 0）
-            _uniq = len(set((round(d[0], 3), round(d[1], 3), round(d[2], 3)) for d in _dirs))
-            _z_ok = all(abs(d[2]) < 1e-6 for d in _dirs)
-            check("sphere 朝向角散布进初速度方向（方向随 pitch 铺开）",
-                  _uniq > 1 and _z_ok,
-                  "yaw={0:g} 固定，pitch方差={1:g}，{2} 颗 {3} 种方向，z 全为 0={4}".format(
-                      _yaw0, _sb0.sphere_pitch[1], len(_dirs), _uniq, _z_ok))
-        print("  （{0}/{1}，{2} 颗粒子）".format(
-            _sphdir[0][:26], _sb0.name, len(_dirs)))
+            _L = math.sqrt(_p[2] ** 2 + _p[3] ** 2 + _p[4] ** 2) or 1e-9
+            _pit = math.degrees(math.asin(max(-1.0, min(1.0, _p[3] / _L))))
+            _yaw = math.degrees(math.atan2(-_p[2] / _L, _p[4] / _L))
+            _dirs.add((round(_pit, 1), round(_yaw % 360.0, 1)))
+            if not (_plo - 0.5 <= _pit <= _phi + 0.5):
+                _bad += 1
+            # yaw 环绕：区间可能跨 0（如 -10~30），按环绕宽度判定
+            _yw = (_yaw - _ylo) % 360.0
+            if not (0.0 <= _yw <= (_yhi - _ylo) + 0.5):
+                _bad += 1
+        check("出生点被 sphere_yaw/pitch 范围约束",
+              bool(_st.particles) and _bad == 0 and len(_dirs) > 1,
+              "pitch[{0:g},{1:g}] yaw[{2:g},{3:g}]，{4} 颗中 {5} 颗越界，{6} 种朝向".format(
+                  _plo, _phi, _ylo, _yhi, len(_st.particles), _bad, len(_dirs)))
+        # 方向不受 sphere_emitter 角影响：同一参数两次构建，方向分布应只由
+        # velocity_* 决定。这里直接验「方向与该子系统的 velocity 角一致」。
+        _vbad = 0
+        for _p in _st.particles:
+            _L = math.sqrt(_p[5] ** 2 + _p[6] ** 2 + _p[7] ** 2) or 1e-9
+            _dp = math.degrees(math.asin(max(-1.0, min(1.0, _p[6] / _L))))
+            if not (min(_st.pitch[0], _st.pitch[0] + _st.pitch[1]) - 0.5
+                    <= _dp <= max(_st.pitch[0], _st.pitch[0] + _st.pitch[1]) + 0.5):
+                _vbad += 1
+        check("初速度方向只由 velocity_pitch 决定（sphere 角不参与）", _vbad == 0,
+              "{0} 颗中 {1} 颗方向越界；velocity_pitch 区间 [{2:g},{3:g}]".format(
+                  len(_st.particles), _vbad, _st.pitch[0], _st.pitch[0] + _st.pitch[1]))
+        print("  （{0}/{1}，{2} 颗粒子 {3} 种出生朝向）".format(
+            _sphregion[0][:26], _sb0.name, len(_st.particles), len(_dirs)))
 else:
-    check("找到 sphere 朝向角样本", False)
+    check("找到 sphere 出生区域样本", False)
+
+print()
+print("=" * 78)
+print("15. 二元组取数规则表（每字段一条规则）")
+print("=" * 78)
+print("   规则表存在的意义：改一个字段的语义不波及其它字段。历史上两次踩坑都是")
+print("   因为硬套统一语义（统一 ± 让半径算出负值；统一区间让 pitch 进不了下半球）。")
+
+# 15a 规则表本身：角度类必须 pm、长度类必须 interval
+_rule_expect = {
+    "sphere_emitter_pitch": "pm", "sphere_emitter_yaw": "pm",
+    "velocity_pitch": "pm", "velocity_yaw": "pm",
+    "particle_pitch": "pm", "particle_yaw": "pm", "rotation": "pm",
+    "sphere_emitter_radius": "interval", "box_emitter_x": "interval",
+    "box_emitter_y": "interval", "box_emitter_z": "interval",
+    "life": "interval", "size": "interval", "alpha": "interval",
+}
+_bad_rule = [k for k, v in _rule_expect.items() if S._rule_of(k) != v]
+check("规则表逐字段登记正确", not _bad_rule, "不符: {0}".format(_bad_rule))
+
+# 15b _pick 两种规则的实际取值域
+_ok_pm = all(abs(S._pick(10.0, 20.0, u, "pm") - (10.0 + 20.0 * (2 * u - 1.0))) < 1e-12
+             for u in (0.0, 0.25, 0.5, 0.75, 1.0))
+_ok_iv = all(abs(S._pick(10.0, 20.0, u, "interval") - (10.0 + 20.0 * u)) < 1e-12
+             for u in (0.0, 0.25, 0.5, 0.75, 1.0))
+check("_pick 的 pm 规则实现正确", _ok_pm)
+check("_pick 的 interval 规则实现正确", _ok_iv)
+check("pm 规则下 u=0/1 得到 基准-方差 / 基准+方差",
+      S._pick(10.0, 20.0, 0.0, "pm") == -10.0 and S._pick(10.0, 20.0, 1.0, "pm") == 30.0)
+check("interval 规则下 u=0/1 得到 基准 / 基准+方差",
+      S._pick(10.0, 20.0, 0.0, "interval") == 10.0
+      and S._pick(10.0, 20.0, 1.0, "interval") == 30.0)
+
+# 15c 真值：pitch 基准 + 方差跨过 90 的球面发射器，角度类必须是 ± 才能进下半球。
+#     优先用标定件 test_2（pitch={60 80}）；标定件在用户 mod 目录下、测试库只扫
+#     游戏根目录时取不到，则退回游戏内同特征的样本。
+_cross = None
+for _n, _sy in lib.systems.items():
+    if "pdx_axis_probe" in _n:
+        for _s in _sy.subsystems:
+            if _s.name == "test_2":
+                _cross = (_n, _s)
+                break
+    if _cross:
+        break
+_cross_src = "标定件 test_2"
+if _cross is None:
+    for _n, _sy in lib.systems.items():
+        for _s in _sy.subsystems:
+            if (not _s.hide and _s.emitter_type == "sphere"
+                    and _s.sphere_pitch[0] > 0
+                    and _s.sphere_pitch[0] + _s.sphere_pitch[1] > 95.0
+                    and _s.sphere_pitch[0] - _s.sphere_pitch[1] < 0.0):
+                _cross = (_n, _s)
+                break
+        if _cross:
+            break
+    _cross_src = "游戏内样本"
+if _cross is not None:
+    _sy_c, _sb_c = lib.systems[_cross[0]], _cross[1]
+    _sim = S.SystemSim(_sy_c)
+    _st = next((x for x in _sim.subs if x.name == _sb_c.name), None)
+    if _st is not None:
+        for _i in range(2000):
+            _st.spawn_count = _i
+            _st._spawn(0.0)
+        _pos = _st.sub.position
+        _ys = [p[3] - _pos[1] for p in _st.particles]
+        _neg = sum(1 for v in _ys if v < 0)
+        check("pitch 跨 90 的球面发射器延伸到下半球（角度类必须是 ±）",
+              bool(_ys) and _neg > 0,
+              "{0} pitch={1}，{2}/{3} 颗在引擎 y<0".format(
+                  _cross_src, list(_sb_c.sphere_pitch), _neg, len(_ys)))
+        # 同一样本的半径是长度类：必须恒为正、落在 [基准, 基准+方差]
+        _rs = [math.sqrt((p[2] - _pos[0]) ** 2 + (p[3] - _pos[1]) ** 2
+                         + (p[4] - _pos[2]) ** 2) for p in _st.particles]
+        _r0, _rv = _sb_c.sphere_radius
+        check("同一样本半径恒为正且落在区间内（长度类是区间）",
+              bool(_rs) and all(r > 0 and _r0 - 1e-6 <= r <= _r0 + _rv + 1e-6 for r in _rs),
+              "{0:.2f}~{1:.2f}（基准 {2:g} 方差 {3:g}）".format(
+                  min(_rs), max(_rs), _r0, _rv))
+else:
+    check("找到 pitch 跨 90 的球面样本", False)
 
 print()
 print("=" * 78)

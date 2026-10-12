@@ -69,11 +69,16 @@ git clone https://github.com/Axis-qc/io_pdx_mesh_for_blender.git
 
 面板上的 `Seed` 控制每颗粒子的随机量（寿命、速度、发射位置、朝向、颜色）。同一个种子每次结果完全一样，换个数字全部重排；改完按旁边的刷新按钮重新载入才生效。默认 0 是按子系统序号自动错开，同参数的两个子系统不会长得一模一样。粒子数很少的系统尤其值得试几个种子：随机量少的时候，不同种子之间的观感差别最大。
 
-粒子的许多字段都写成 `{ 基准 方差 }` 两个值，含义是**最终值 = 基准 + 方差 × 随机数**（随机数在 0~1 之间），每颗粒子在发射时定死、之后不再变。适用字段：发射尺寸（`box_emitter_*` 三轴、`sphere_emitter_radius`）、颜色（`color` 的 x/y/z 三通道）、初速方向与大小、寿命、尺寸、面片朝向、自转角与角速度。写成 `{ 0 方差 }` 的（基准 0、只给上限）在库里很常见，比如尘埃场 `sphere_emitter_radius={ 0 18 }` 就是半径 0~18，`particle_yaw={ 0 360 }` 就是转满一圈。注意这**不是**「基准 ± 方差」：按 ± 算半径会有一半取到负值，只能在原点附近堆着。`start` 的方差是个例外，它是**整个子系统摇一次**：`start={ 0 4 }` 表示这个发射器随机延迟 0~4 秒才开始工作，而不是每颗粒子各自错开。
+粒子的许多字段都写成 `{ 基准 方差 }` 两个值。**第二个值怎么用，逐字段有各自的规则**，不是一套统一语义：
 
-球面发射器在**整球**上均匀撒点。`sphere_emitter_yaw` / `sphere_emitter_pitch` 是发射器**自身**的偏航与俯仰：球是旋转对称的，所以它们不影响粒子出生在哪里，但会作为**初速度方向的基准**——最终方向 = `sphere_emitter` 角 + `velocity_yaw` / `velocity_pitch` 角。所以球面发射器即使 `velocity` 的方向角都写 0，粒子也会沿着发射器朝向飞出去。
+- **角度类**（`sphere_emitter_yaw/pitch`、`velocity_yaw/pitch`、`emitter_yaw/pitch`、`particle_yaw/pitch`、`rotation`、`rotation_speed*`）用 `基准 ± 方差`，取值 基准−方差 ~ 基准+方差。例如 `sphere_emitter_pitch={ 60 80 }` 得到 −20~140，向下能探到下半球。
+- **长度与标量类**（`sphere_emitter_radius`、`box_emitter_*`、`life`、`size`、`alpha`、`color` 三通道、`velocity` 大小）用 `基准 + 方差 × 随机数`（随机数 0~1），取值 基准 ~ 基准+方差。例如尘埃场 `sphere_emitter_radius={ 0 18 }` 得到半径 0~18。
 
-`test/` 里有粒子功能的自检与基准脚本：`check_particle_features.py` 是特征回归（当前 75 项通过，整轮约 1 分钟，超过单次工具调用上限时要分段跑），`bench_checkpoint_stride.py` 与 `bench_vortex_vec.py` 是此前两项调优的实测脚本，可复跑。
+规则表在 `simulator.py` 的 `_VAR_RULES` 里，一个字段一行；改某个字段的语义不会波及其它字段。每颗粒子的取值都在发射时定死、之后不再变。`start` 比较特别：它的方差是**整个子系统摇一次**，`start={ 0 4 }` 表示这个发射器随机延迟 0~4 秒才开始工作，而不是每颗粒子各自错开。
+
+球面发射器的出生区域由 `sphere_emitter_yaw` / `sphere_emitter_pitch` 划定：两个角都在半径给定的球面上取，范围窄就得到一条弧带，只给一个轴全向会得到环，两个都取到 ±180 才铺满整球。
+
+`test/` 里有粒子功能的自检与基准脚本：`check_particle_features.py` 是特征回归（当前 82 项通过，整轮约 1 分钟，超过单次工具调用上限时要分段跑），`bench_checkpoint_stride.py` 与 `bench_vortex_vec.py` 是此前两项调优的实测脚本，可复跑。
 
 已知限制：`childsystem` 嵌套子系统只解析并在日志里提示，不参与渲染（全库仅 15 处，其中 6 处是 `hide=yes`）；`local_space` 不影响预览，因为预览里没有带变换的父实体。
 

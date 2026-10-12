@@ -60,9 +60,8 @@ def _emit_dir(pitch_deg, yaw_deg):
         pitch=90 → +Y       pitch=-90 → -Y       pitch=45 → +Z/+Y 斜上
 
     velocity_* / emitter_* 两个入口共用这一套（标定件里明确注为「同一套球面角」）。
-    球面发射器的出生点不走本函数：它在整球上均匀取方向（见 _spawn）。
-    sphere_emitter_yaw/_pitch 不参与取点（球旋转对称），但会作为初速度方向的
-    基准叠加在 velocity 的角度上。
+    球面发射器的出生点不走本函数取方向：它由 sphere_emitter_yaw / _pitch 划定
+    球面区域（见 _spawn），本函数只负责把角度换算成方向向量。
     """
     p = math.radians(pitch_deg)
     y = math.radians(yaw_deg)
@@ -140,6 +139,79 @@ def _hash01(x):
 
 def _clamp(x, a, b):
     return a if x < a else (b if x > b else x)
+
+
+# ---------------------------------------------------------------------------
+# 二元组取数规则表
+# ---------------------------------------------------------------------------
+# 每个 `{ 基准 方差 }` 字段各有一条自己的规则，**不共用一个全局语义**。
+# 原因：不同字段量纲不同（角度可正可负、半径与寿命不能为负），硬套同一个
+# 公式必然有一类出错。历史上两次踩坑都源于此：
+#   · 统一按「基准 ± 方差」→ 半径算出一半负值、被钳到原点
+#     （DustParticlesOrange 实测 48.5% 的粒子堆在原点）
+#   · 统一按「基准 + 方差×U」→ sphere_emitter_pitch 进不了下半球
+#     （用户实机：+Z 的延伸要到下半球）
+#
+# 规则只有两个字面量：
+#   "pm"       基准 ± 方差：基准 + 方差·(2U-1)，U∈[0,1) → 基准-方差 ~ 基准+方差
+#   "interval" 基准 + 方差：基准 + 方差·U，      U∈[0,1) → 基准 ~ 基准+方差
+#
+# 改某个字段的规则只影响它自己，不波及其它字段——这正是本表存在的意义。
+_RULE_PM = "pm"
+_RULE_INTERVAL = "interval"
+
+_VAR_RULES = {
+    # —— 角度类：可正可负，用 ± ——
+    # sphere_emitter_pitch={ 60 80 } 必须能到下半球：± 时 pitch ∈ -20~140，
+    # sin(pitch) 最低 -0.342（进下半球）；区间时 ∈ 60~140，sin 恒 >= 0.643
+    # （永远进不去）。用户实机「+Z 的延伸到下半球」→ 只能是 ±。
+    "sphere_emitter_pitch": _RULE_PM,
+    "sphere_emitter_yaw": _RULE_PM,
+    "velocity_pitch": _RULE_PM,
+    "velocity_yaw": _RULE_PM,
+    "emitter_pitch": _RULE_PM,
+    "emitter_yaw": _RULE_PM,
+    "particle_pitch": _RULE_PM,
+    "particle_yaw": _RULE_PM,
+    "rotation": _RULE_PM,
+    "rotation_speed": _RULE_PM,
+    "rotation_speed_pitch": _RULE_PM,
+    "rotation_speed_yaw": _RULE_PM,
+    "rotation_speed_roll": _RULE_PM,
+
+    # —— 长度 / 标量类：不能为负，用区间 ——
+    # 半径按 ± 会有一半取到负值，只能在原点附近堆着（用户报的现象）。
+    "sphere_emitter_radius": _RULE_INTERVAL,
+    "box_emitter_x": _RULE_INTERVAL,
+    "box_emitter_y": _RULE_INTERVAL,
+    "box_emitter_z": _RULE_INTERVAL,
+    # life={ 0.1 1.0 } 按 ± 会得到 -0.9~1.1，负寿命无意义
+    "life": _RULE_INTERVAL,
+    "size": _RULE_INTERVAL,
+    "alpha": _RULE_INTERVAL,
+    "color_x": _RULE_INTERVAL,
+    "color_y": _RULE_INTERVAL,
+    "color_z": _RULE_INTERVAL,
+    # velocity 是**速度大小**（标量，见标定件）。库里存在负基准
+    # （arkship 系列 velocity=-8/-10/-30），负值表示反向，方差是正向增量。
+    # 尚未单独实机确认，暂按区间。
+    "velocity": _RULE_INTERVAL,
+}
+
+# 未登记的字段走这个规则。
+_VAR_RULE_DEFAULT = _RULE_INTERVAL
+
+
+def _rule_of(field_name):
+    """取某字段的取数规则；未登记的字段走默认。"""
+    return _VAR_RULES.get(field_name, _VAR_RULE_DEFAULT)
+
+
+def _pick(base, var, u, rule):
+    """按规则把「基准 方差」折成一个值。u ∈ [0,1)。"""
+    if rule == _RULE_PM:
+        return base + var * (2.0 * u - 1.0)
+    return base + var * u
 
 
 def _apply_anim(base, anim, u):
@@ -337,9 +409,8 @@ class SubsystemSim:
         self.sphere_r_var = sr[1] if sub.emitter_type == "sphere" else 0.0
         self.sphere_yaw = sub.sphere_yaw
         self.sphere_pitch = sub.sphere_pitch
-        # 注：sphere_yaw / sphere_pitch 是球发射器自身的偏航与俯仰。球旋转对称，
-        # 所以它们不影响出生点分布（出生点另算整球均匀），但会作为初速度方向的
-        # 基准使用（见 _spawn 里 p / y 的算法）。
+        # 注：sphere_yaw / sphere_pitch 划定球面**出生区域**（各按「基准 + 方差*U」
+        # 取一个球面角，定位到半径 r 的球面上），不参与初速度方向。
 
         # 颜色抖动：每颗粒子在基色上叠加 0~方差 的随机偏移（原版 R/G/B 各约 570~660 个
         # 子系统写了非零方差）。parser 层曾只取 [0] 把这部分整个丢掉。
@@ -358,6 +429,8 @@ class SubsystemSim:
         # 三轴自转：面片除屏幕内自转（rotation_speed）外，还可绕 pitch/yaw 两轴
         # 翻转。原版 182 个子系统写了这三个键（pitch 75 / yaw 70 / roll 37）。
         # 基角取 particle_pitch / particle_yaw（面片的初始朝向），速率取对应键。
+        # 注意：这三个速率是**子系统级**常量（快照里按年龄累积），没有走逐粒子
+        # 的 _pick 规则；表里登记了它们只为将来需要逐粒子速率时有个入口。
         self.pitch_var = sub.particle_pitch[1]
         self.yaw_var = sub.particle_yaw[1]
         self.pitch_speed = sub.rotation_speed_pitch[0] + sub.rotation_speed_pitch[1]
@@ -536,13 +609,9 @@ class SubsystemSim:
     def _spawn(self, t):
         """生成一颗粒子。
 
-        二元组语义（全库统一，实测口径）：所有 `{ 基准 方差 }` 字段都是
-        **最终值 = 基准 + 方差 · U**，U 在 [0,1) 均匀取值。不是「基准 ± 方差」。
-
-        这条规则对角度字段同样成立：`particle_pitch={ 90 90 }` 得到 90~180；
-        `{ 0 360 }` 得到 0~360，也就是整圈（原版确有 12 处这么写）。
-        旧实现用的是「基准 ± 方差」，在半径上会让一半取到负值、被钳到原点
-        （实测 DustParticlesOrange 有 48.5% 的粒子堆在原点）。
+        二元组 `{ 基准 方差 }` 的取数**逐字段有自己的规则**，见文件顶部的
+        _VAR_RULES 表：角度类用「基准 ± 方差」，长度/标量类用「基准 + 方差·U」。
+        不要在这里假设一个统一语义——历史上两次踩坑正是因为硬套同一个公式。
         """
         sub = self.sub
         i = self.spawn_count
@@ -567,11 +636,9 @@ class SubsystemSim:
         w_box1 = self._w(i, 14)                  # box 盒内位置 X
         w_box2 = self._w(i, 15)                  # box 盒内位置 Y
         w_box3 = self._w(i, 16)                  # box 盒内位置 Z
-        w_sph_y = self._w(i, 17)                 # 球面发射器朝向 yaw 的取角
-        w_sph_p = self._w(i, 18)                 # 球面发射器朝向 pitch 的取角
 
         w0 = w_life
-        life = self.life + self.life_var * w0
+        life = _pick(self.life, self.life_var, w0, _rule_of("life"))
         life = max(life, 0.05)
 
         # 发射点。判定条件必须把方差也算上：原版大量发射器写成「基准 0 + 方差」，
@@ -579,22 +646,29 @@ class SubsystemSim:
         # 基准与方差都为 0 的那些（球面 61 个），它们仍然走 else。
         if sub.emitter_type == "box" and (self.box_half_x or self.box_half_y or self.box_half_z
                                           or self.box_var_x or self.box_var_y or self.box_var_z):
-            # 半边长 = 基准 + 方差*U（见 _spawn 顶部的语义说明），再在盒内均匀取点
-            hx = self.box_half_x + self.box_var_x * w_pos1
-            hy = self.box_half_y + self.box_var_y * w_pos2
-            hz = self.box_half_z + self.box_var_z * w_pos3
+            # 半边长按本字段自己的规则取（box_emitter_* 是长度类，区间），
+            # 再在盒内均匀取点
+            hx = _pick(self.box_half_x, self.box_var_x, w_pos1, _rule_of("box_emitter_x"))
+            hy = _pick(self.box_half_y, self.box_var_y, w_pos2, _rule_of("box_emitter_y"))
+            hz = _pick(self.box_half_z, self.box_var_z, w_pos3, _rule_of("box_emitter_z"))
             px = hx * (2.0 * w_box1 - 1.0)
             py = hy * (2.0 * w_box2 - 1.0)
             pz = hz * (2.0 * w_box3 - 1.0)
         elif sub.emitter_type == "sphere" and (self.sphere_r > 0.0 or self.sphere_r_var > 0.0):
-            # 半径 = 基准 + 方差*U：原版大量写 `{ 0 18 }`，按「基准 ± 方差」算会有
+            # 半径是长度类（区间）：原版大量写 `{ 0 18 }`，按「基准 ± 方差」算会有
             # 一半半径为负、被钳到 0 堆在原点（实测 48.5% 的粒子落在原点）。
-            r = self.sphere_r + self.sphere_r_var * w_pos1
-            # 方向：整球均匀（sin(pitch) 均匀 + yaw 均匀）。
-            # sphere_emitter_yaw / _pitch 不影响出生点（球旋转对称），它们的作用
-            # 是给粒子提供默认移动方向，在下面算初速度方向时用。
-            sp = math.degrees(math.asin(_clamp(2.0 * w_pos3 - 1.0, -1.0, 1.0)))
-            sy = 360.0 * w_pos2
+            r = _pick(self.sphere_r, self.sphere_r_var, w_pos1, _rule_of("sphere_emitter_radius"))
+            # 球面上的**出生区域**由 sphere_emitter_yaw / _pitch 划定（用户用
+            # pdx_axis_probe 的 test_2 格实机确认）。这两个是角度类，按 ± 取：
+            # pitch={ 60 80 } → -20~140，sin(pitch) 能到负值，所以带子会伸到
+            # 下半球——这正是用户实机看到的「+Z 的延伸到下半球」。
+            # 用区间语义时 pitch ∈ 60~140、sin 恒为正，永远进不了下半球，故排除。
+            # 只给一个轴方差就得到环：pitch 全向 → ZY 竖直环，yaw 全向 → XZ
+            # 水平环，两个都有才铺成球面。两个基准与方差都为 0 时退化成球面上的
+            # 一个定点（等于该方向的点发射器）。
+            # 注意这两个字段**只定出生点**，不影响初速度方向（方向另见下方）。
+            sy = _pick(self.sphere_yaw[0], self.sphere_yaw[1], w_pos2, _rule_of("sphere_emitter_yaw"))
+            sp = _pick(self.sphere_pitch[0], self.sphere_pitch[1], w_pos3, _rule_of("sphere_emitter_pitch"))
             d = _emit_dir(sp, sy)
             px = d[0] * r
             py = d[1] * r
@@ -602,27 +676,21 @@ class SubsystemSim:
         else:
             px = py = pz = 0.0
 
-        # 初速度方向：**球面发射器的朝向角 + velocity 的方向角**（用户实测口径）。
-        # sphere_emitter_yaw / _pitch 是球发射器自身的偏航/俯仰，给粒子提供默认
-        # 移动方向；球旋转对称，所以它对「出生点分布」没有影响（出生点另算整球
-        # 均匀），但方向要用上。velocity_yaw / _pitch 是叠加在它上面的偏移。
-        # point / box 发射器没有这层基准，sphere 角为 0 时与旧行为一致。
-        # 用独立的 salt（17/18），不能复用发射点的 w_pos*：共用维度会让出生点与
-        # 方向联动，点集退化成低维曲面。
-        base_y = self.sphere_yaw[0] + self.sphere_yaw[1] * w_sph_y
-        base_p = self.sphere_pitch[0] + self.sphere_pitch[1] * w_sph_p
-        p = base_p + self.pitch[0] + self.pitch[1] * w_dir1
-        y = base_y + self.yaw[0] + self.yaw[1] * w_dir2
+        # 初速度方向：只由 velocity_yaw / velocity_pitch 决定（与 emitter_* 共用
+        # probe 实测的那套球面角）。sphere_emitter_yaw/_pitch 不参与——它们管的是
+        # 出生区域（见上）。
+        p = _pick(self.pitch[0], self.pitch[1], w_dir1, _rule_of("velocity_pitch"))
+        y = _pick(self.yaw[0], self.yaw[1], w_dir2, _rule_of("velocity_yaw"))
         d = _emit_dir(p, y)
-        v = self.vel + self.vel_var * w_speed
+        v = _pick(self.vel, self.vel_var, w_speed, _rule_of("velocity"))
 
         # 发射体朝向：旋转「形状偏移」与「出射方向」，position 不动（position 是
         # 设计者摆发射体的位置；point 发射器没有体积，写非零 emitter_yaw 仍有效果，
         # 只能由「方向被旋转」满足）。
         # 有方差时逐粒子取角，否则用构造期算好的固定矩阵。
         if self.emit_var:
-            ey = self.emit_yaw[0] + self.emit_yaw[1] * w_pos1
-            ep = self.emit_pitch[0] + self.emit_pitch[1] * w_pos2
+            ey = _pick(self.emit_yaw[0], self.emit_yaw[1], w_pos1, _rule_of("emitter_yaw"))
+            ep = _pick(self.emit_pitch[0], self.emit_pitch[1], w_pos2, _rule_of("emitter_pitch"))
             m = _emit_rot_matrix(ep, ey) if (ey or ep) else self.emit_rot
         else:
             m = self.emit_rot
@@ -635,8 +703,9 @@ class SubsystemSim:
         py += pos0[1]
         pz += pos0[2]
 
-        ang0 = sub.rotation[0] + sub.rotation[1] * w_rot0
-        angvel = (sub.rotation_speed[0] + sub.rotation_speed[1] * w_rotv
+        ang0 = _pick(sub.rotation[0], sub.rotation[1], w_rot0, _rule_of("rotation"))
+        angvel = (_pick(sub.rotation_speed[0], sub.rotation_speed[1], w_rotv,
+                        _rule_of("rotation_speed"))
                   + self.roll_speed)   # roll 轴自转 = 屏幕内自转，合并到同一条通道
 
         # 面片初始朝向：基角 + 逐粒子随机扰动，在发射时定死。
@@ -646,14 +715,14 @@ class SubsystemSim:
         # life/life_var、velocity_pitch/_var、particle_yaw/_var、roll/roll_var 同构。
         # 实测全库 5122 个子系统里 pitch_var 非零 1187（billboard=no 占 971）、
         # yaw_var 非零 830。billboard=yes 的这两个字段引擎本身忽略。
-        b_pitch = sub.particle_pitch[0] + self.pitch_var * w_pit
-        b_yaw = sub.particle_yaw[0] + self.yaw_var * w_yaw
+        b_pitch = sub.particle_pitch[0] + _pick(0.0, self.pitch_var, w_pit, _rule_of("particle_pitch"))
+        b_yaw = sub.particle_yaw[0] + _pick(0.0, self.yaw_var, w_yaw, _rule_of("particle_yaw"))
         # 颜色抖动：同样是发射时定死的逐粒子偏移（原版 R/G/B 各约 570~660 个
         # 子系统写了非零方差，如 y={ 150 20 }）。存偏移量而不是绝对值，这样
         # snapshot 里叠加颜色动画（anim_r/g/b）时不会错位。
-        c_r = self.color_var_r * w_cr
-        c_g = self.color_var_g * w_cg
-        c_b = self.color_var_b * w_cb
+        c_r = _pick(0.0, self.color_var_r, w_cr, _rule_of("color_x"))
+        c_g = _pick(0.0, self.color_var_g, w_cg, _rule_of("color_y"))
+        c_b = _pick(0.0, self.color_var_b, w_cb, _rule_of("color_z"))
 
         self.particles.append([t, life, px, py, pz, d[0] * v, d[1] * v, d[2] * v, angvel, ang0, w0,
                                b_pitch, b_yaw, c_r, c_g, c_b])    # ---- 物理 ----
@@ -863,10 +932,12 @@ class SubsystemSim:
             if age < 0.0 or age >= life:
                 continue
             u = age / life
-            size = _apply_anim(self.size_base + self.size_var * p[10], self.size_anim, u)
+            size = _apply_anim(_pick(self.size_base, self.size_var, p[10], _rule_of("size")),
+                               self.size_anim, u)
             if size <= 0.0:
                 continue
-            alpha = _apply_anim(self.alpha_base + self.alpha_var * p[10], self.alpha_anim, u)
+            alpha = _apply_anim(_pick(self.alpha_base, self.alpha_var, p[10], _rule_of("alpha")),
+                                self.alpha_anim, u)
             r = _clamp(_apply_anim(sub.color[0] + p[13], self.anim_r, u), 0.0, 1.0)
             g = _clamp(_apply_anim(sub.color[1] + p[14], self.anim_g, u), 0.0, 1.0)
             b = _clamp(_apply_anim(sub.color[2] + p[15], self.anim_b, u), 0.0, 1.0)
