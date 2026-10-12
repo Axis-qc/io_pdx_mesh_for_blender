@@ -165,14 +165,11 @@ def _norm3(v):
 
 # ---- 向量化力场（numpy 可选）----
 #
-# 用 numpy 不破坏确定性：numpy 的 sin/cos/sqrt 与 math 模块逐位相同
-# （20 万随机点 0 处差异，1200 子步累加后终点逐位相同）。
-#
-# 只对 point/turbulence/vortex/spin 走向量化（逐粒子三角函数与叉积乘加是热点）。
-# 实测：峰值 500+ 粒的纯 vortex 系统 1.6~1.8x，无力场时反而慢（建数组开销没人
-# 分摊），故由力场类型与粒子数共同把关。
+# numpy 的 sin/cos/sqrt 与 math 模块逐位相同（20 万随机点 0 处差异），所以走向量化
+# 不破坏确定性。只对 point/turbulence/vortex/spin 走：逐粒子三角函数与叉积乘加是
+# 热点，而无力场时建数组的开销没人分摊，反而更慢。
 _VEC_FORCE_TYPES = ("turbulence", "point", "vortex", "spin")
-# 向量化每子步要建数组，粒子太少得不偿失（1200 颗有 turbulence 时 3.65x）。
+# 粒子太少同样摊不平建数组的开销（1200 颗有 turbulence 时才 3.65x）。
 _VEC_MIN_PARTICLES = 64
 
 

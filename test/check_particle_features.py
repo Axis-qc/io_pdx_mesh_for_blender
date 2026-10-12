@@ -131,8 +131,8 @@ def spread_of_subsystem(sy, name, n=120):
 
 
 # 原版 857 个 box 里，绝大多数三轴都是 0（box_emitter_* 写成 0.0），
-# 真正 z 非零的只有 22 个。挑一个「只有 z 非零」的样本来验：修前 box_emitter_z
-# 被整个丢掉，出生点三轴全 0 → 所有粒子挤在一个点；修后应散成一条 z 向线段。
+# 真正 z 非零的只有 22 个。挑一个「只有 z 非零」的样本来验：box_emitter_z 若没被
+# 读进来，出生点三轴全 0、所有粒子挤在一个点；读对了应散成一条 z 向线段。
 box_sys = None
 for nm, sy in lib.systems.items():
     for sb in sy.subsystems:
@@ -167,7 +167,7 @@ if box_sys:
         check("box 样本生成了粒子", False)
     else:
         print("    发射点跨度 x={0:.3f} y={1:.3f} z={2:.3f}".format(*spans))
-        check("box 的 z 轴确实散开（修前恒为 0）", spans[2] > 1e-6,
+        check("box 的 z 轴确实散开（未读入时恒为 0）", spans[2] > 1e-6,
               "z 跨度 {0:.4f}".format(spans[2]))
         decl = (abs(st.box_half_x) * 2, abs(st.box_half_y) * 2, abs(st.box_half_z) * 2)
         bad = [n for n, sp_, d in zip("xyz", spans, decl) if d > 0 and sp_ <= 1e-6]
@@ -428,8 +428,8 @@ else:
 
 # 平铺环：billboard=no 且 pitch≈90 应躺在水平面（法线朝 +Z）
 # 必须限定 billboard=no：billboard=yes 的面片恒朝镜头，pitch 对它无效
-# （pdx_axis_probe 实机定案），拿它验平铺会把正确的实现判成错——修前正是
-# 因为 flat 分支抢在 billboard 判断之前，才有 129 个 billboard=yes 被平铺。
+# （pdx_axis_probe 实机定案），拿它验平铺会把正确的实现判成错——判断顺序若先看
+# pitch≈90，129 个同时写了 billboard=yes 的子系统会被摁平。
 flat_pick = None
 for nm, sy in lib.systems.items():
     for sb in sy.subsystems:
@@ -506,7 +506,7 @@ check("billboard=no 四格姿态与实机读数一致（箭头指向 + 水平判
       "{0} 处不符".format(_fix_bad))
 
 _r0, _u0 = BP._fixed_quad_basis(0.0, 0.0)
-check("默认姿态 right=+X、up=+Z（修前误为 -Y / +X）",
+check("默认姿态 right=+X、up=+Z（误成 -Y / +X 即为错）",
       all(abs(_r0[i] - (1.0, 0.0, 0.0)[i]) < 1e-9 for i in range(3))
       and all(abs(_u0[i] - (0.0, 0.0, 1.0)[i]) < 1e-9 for i in range(3)),
       "right={0} up={1}".format(_r0, _u0))
@@ -694,7 +694,7 @@ if colossus:
     check("colossus 三球沿径向朝中心汇聚", len(dev) == 3 and max(dev) < 5.0,
           "与朝心夹角 {0}".format(detail))
 
-    # position 轴序：出生点方位 120 度均布、半径 22~23.3（修前整体偏 90 度）
+    # position 轴序：出生点方位 120 度均布、半径 22~23.3（整体偏 90 度即为错）
     azs = []
     rads = []
     for want in ("ball_1", "ball_2", "ball_3"):
@@ -712,7 +712,7 @@ if colossus:
           "方位 {0} 半径 {1}".format([round(a, 1) for a in azs],
                                      [round(r, 1) for r in rads]))
 
-    # 轨迹真的落到原点附近（修前掠过，半径不降）
+    # 轨迹真的落到原点附近（只掠过不靠近即为错）
     rec = []
     sim2 = S.SystemSim(lib.systems[nmm], 0.0)
     for fr in range(0, 200):
@@ -805,8 +805,8 @@ print()
 print("=" * 78)
 print("5. 脉冲发射 emission_pulse_duration / emission_pulse_silence")
 print("=" * 78)
-print("   这两个键原先只在 unknown_keys 里被丢弃（107 个子系统受影响），")
-print("   特效表现为一直喷而不是脉冲。这里验「工作相发射、静默相停发」。")
+print("   这两个键必须解析进来（107 个子系统用到）；丢了就表现成一直喷而不是脉冲。")
+print("   这里验「工作相发射、静默相停发」。")
 
 pulsed = []
 for sy in lib.systems.values():
@@ -889,7 +889,7 @@ print()
 print("=" * 78)
 print("6. 三轴自转 rotation_speed_pitch / _yaw / _roll")
 print("=" * 78)
-print("   原先这三个键被静默丢弃（182 个子系统），面片只能绕视线轴自转。")
+print("   三个轴按世界轴平铺（pitch→X、yaw→Y、roll→Z），182 个子系统用到。")
 
 axis_subs = [(sy, sb) for sy in lib.systems.values() for sb in sy.subsystems
              if (sb.rotation_speed_pitch[0] or sb.rotation_speed_yaw[0]
@@ -985,7 +985,7 @@ check("无轴自转的子系统朝向增量恒为 0", still_ok == still_tot,
 # ---------------------------------------------------------------- 回归关键帧
 print()
 print("=" * 78)
-print("7. 时间轴回退（关键帧回退，替代原先的从 0 全量重放）")
+print("7. 时间轴回退（关键帧回退）")
 print("=" * 78)
 
 
@@ -1125,7 +1125,7 @@ print("=" * 78)
 print("9. vortex 力场语义（径向吸引，不是绕轴公转）")
 print("=" * 78)
 print("   pdx_axis_probe 四轮实机订正：vortex 只有指向 direction 轴线的径向吸引、")
-print("   无切向分量；到轴距离 0 时完全无力。修前它与 spin 共用叉积分支（当成公转）。")
+print("   无切向分量；到轴距离 0 时完全无力（与 spin 的绕轴公转不同）。")
 
 # 构造一个最小系统：vortex 轴 +Y、力心在原点，粒子放 +X 侧。
 _vo = P.PdxForce.__new__(P.PdxForce)

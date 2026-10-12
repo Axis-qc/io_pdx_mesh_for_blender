@@ -521,10 +521,8 @@ class SubsystemPreview:
 
         n = min(len(snap), cap)
 
-        # 组数组：numpy 向量化，无 numpy 时回退纯 Python。
-        # 实测（perf-tester，10011 粒子，f=3601）写网格占 refresh 的 77%，
-        # 而写网格里绝大部分时间花在「逐粒子拼 coords/colors/uvs 三个 list」上，
-        # 不是 foreach_set 本身。10007 粒子的系统向量化后模拟+组数组合计约 24×。
+        # 组数组：numpy 向量化，无 numpy 时回退纯 Python。拼数组是 refresh 的大头
+        # （实测占 77%，比 foreach_set 本身贵）。
         if _NP is not None and n > 0:
             coords, colors, uvs = _build_arrays_np(
                 snap, n, cap, right, up, sheet_x, sheet_y, do_sheet)
