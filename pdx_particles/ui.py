@@ -24,6 +24,7 @@ from bpy.types import Operator, Panel, PropertyGroup, UIList  # type: ignore
 from .. import IO_PDX_LOG, IO_PDX_SETTINGS
 from .parser import (
     ParticleLibrary,
+    _infer_root,
     build_catalog,
     detect_game_roots,
     looks_like_game_root,
@@ -104,19 +105,6 @@ def _texture_roots():
     if v and v not in out:
         out.append(v)
     return out
-
-
-def _mod_root(source_file):
-    """从源文件向上找含 gfx 的目录。"""
-    p = os.path.dirname(os.path.abspath(source_file))
-    for _ in range(4):
-        if os.path.isdir(os.path.join(p, "gfx")):
-            return p
-        parent = os.path.dirname(p)
-        if parent == p:
-            break
-        p = parent
-    return ""
 
 
 def _clear_previews():
@@ -282,7 +270,7 @@ class ParticlePreviewEntry(PropertyGroup):
 
 def _load_systems(path):
     """解析文件 → (loaded[(system, offset)], missing[])。"""
-    roots = [r for r in (_mod_root(path),) if r] + _texture_roots()
+    roots = [r for r in (_infer_root(path),) if r] + _texture_roots()
     seen = []
     for r in roots:
         if r not in seen:

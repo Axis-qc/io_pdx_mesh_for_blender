@@ -271,7 +271,7 @@ class PdxAnimation:
 
 
 class PdxForce:
-    __slots__ = ("type", "name", "position", "direction", "local_force", "yaw", "division", "amount", "unknown")
+    __slots__ = ("type", "name", "position", "direction", "local_force", "yaw", "division", "amount")
 
     def __init__(self, node):
         t = node.child("type")
@@ -284,8 +284,6 @@ class PdxForce:
         self.yaw = _pair(node.child("yaw"))[0]
         self.division = _pair(node.child("division"), 16.0)[0]
         self.amount = _pair(node.child("amount"))[0]
-        known = {"type", "name", "position", "direction", "local_force", "yaw", "division", "amount"}
-        self.unknown = {c.key for c in node.children if c.key not in known}
 
 
 class PdxSubsystem:
@@ -420,7 +418,7 @@ class PdxSubsystem:
 
 
 class PdxParticleSystem:
-    __slots__ = ("name", "subsystems", "animations", "forces", "source_file", "unknown_top")
+    __slots__ = ("name", "subsystems", "animations", "forces", "source_file")
 
     def __init__(self, node, source_file):
         nm = node.child("name")
@@ -435,8 +433,6 @@ class PdxParticleSystem:
         for c in node.child_values("force"):
             force = PdxForce(c)
             self.forces[force.name] = force
-        known = {"name", "subsystem", "animation", "force"}
-        self.unknown_top = {c.key for c in node.children if c.key not in known}
 
     def nested_subsystems(self):
         """所有被解析但**不参与模拟/渲染**的嵌套子子系统（childsystem）。
@@ -681,22 +677,21 @@ class ParticleCatalogEntry:
     重复出现时不去重，各留一条并带来源文件，便于区分。
     """
 
-    __slots__ = ("name", "type", "scale", "source_file", "system", "system_file")
+    __slots__ = ("name", "type", "scale", "source_file", "system")
 
-    def __init__(self, name, type_, scale, source_file, system, system_file):
+    def __init__(self, name, type_, scale, source_file, system):
         self.name = name
         self.type = type_
         self.scale = scale
         self.source_file = source_file
         self.system = system          # 解析到的本体（PdxParticleSystem），没有则 None
-        self.system_file = system_file
 
     @property
     def resolved(self):
         return self.system is not None
 
 
-def build_catalog(roots, library=None, roots_for_index=None):
+def build_catalog(roots, roots_for_index=None):
     """收集 roots 下所有 pdxparticle 注册项 → [ParticleCatalogEntry]。
 
     只扫 gfx/**/*.gfx（注册所在处），不碰 gfx/particles 下的 .asset 本体——
@@ -706,7 +701,7 @@ def build_catalog(roots, library=None, roots_for_index=None):
     项，但 mod 的粒子常引用原版贴图、继承原版本体，索引范围要更宽。
     """
     index_roots = roots_for_index if roots_for_index is not None else roots
-    lib = library if library is not None else ParticleLibrary(index_roots).scan()
+    lib = ParticleLibrary(index_roots).scan()
     out = []
     for root in lib.roots:
         if root not in roots:
@@ -722,8 +717,7 @@ def build_catalog(roots, library=None, roots_for_index=None):
                     continue
                 system = lib.systems.get(reg["type"])
                 out.append(ParticleCatalogEntry(
-                    reg["name"], reg["type"], reg["scale"], path,
-                    system, lib.file_of.get(reg["type"])))
+                    reg["name"], reg["type"], reg["scale"], path, system))
     out.sort(key=lambda e: (e.name.lower(), e.source_file))
     return out, lib
 
@@ -738,16 +732,12 @@ class ParticleLibrary:
     def __init__(self, roots):
         self.roots = [r for r in roots if r and os.path.isdir(r)]
         self.systems = {}
-        self.file_of = {}
         self.files_scanned = 0
 
-    def scan(self, extra_files=()):
+    def scan(self):
         for root in self.roots:
             for path in iter_files(root, "gfx/particles", {".asset"}):
                 self._scan_file(path)
-        for f in extra_files:
-            if os.path.isfile(f):
-                self._scan_file(f)
         return self
 
     def _scan_file(self, path):
@@ -758,7 +748,6 @@ class ParticleLibrary:
                     system = PdxParticleSystem(top, path)
                     if system.name:
                         self.systems[system.name] = system
-                        self.file_of[system.name] = path
         except Exception as err:  # noqa: BLE001
             DATA_LOG.error("parsing failed: %s (%s)", path, err)
 
@@ -789,11 +778,3 @@ def _infer_root(file_path):
             break
         p = parent
     return None
-
-
-def sph_to_dir(pitch_deg, yaw_deg):
-    """粒子空间球坐标（pitch 自 +Y 轴，yaw 绕 Y）→ 单位方向向量。pitch=90 → 水平盘。"""
-    p = math.radians(pitch_deg)
-    y = math.radians(yaw_deg)
-    sp = math.sin(p)
-    return (sp * math.cos(y), math.cos(p), sp * math.sin(y))

@@ -1131,11 +1131,11 @@ print("   无切向分量；到轴距离 0 时完全无力。修前它与 spin �
 _vo = P.PdxForce.__new__(P.PdxForce)
 _vo.type = "vortex"; _vo.name = "vo"; _vo.position = (0.0, 0.0, 0.0)
 _vo.direction = (0.0, 1.0, 0.0); _vo.local_force = True
-_vo.yaw = 0.0; _vo.division = 16.0; _vo.amount = 1.0; _vo.unknown = set()
+_vo.yaw = 0.0; _vo.division = 16.0; _vo.amount = 1.0
 _sp_f = P.PdxForce.__new__(P.PdxForce)
 _sp_f.type = "spin"; _sp_f.name = "sp"; _sp_f.position = (0.0, 0.0, 0.0)
 _sp_f.direction = (0.0, 1.0, 0.0); _sp_f.local_force = True
-_sp_f.yaw = 0.0; _sp_f.division = 16.0; _sp_f.amount = 1.0; _sp_f.unknown = set()
+_sp_f.yaw = 0.0; _sp_f.division = 16.0; _sp_f.amount = 1.0
 
 _ss = S.SubsystemSim.__new__(S.SubsystemSim)
 _ss.forces = [_vo]

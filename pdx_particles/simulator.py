@@ -20,7 +20,6 @@ try:                      # numpy 可选：缺失时全部回退纯 Python 路�
 except Exception:         # noqa: BLE001
     _NP = None
 
-GOLDEN = 0.6180339887498949
 SUBSTEP = 1.0 / 120.0     # 物理子步（秒）
 _EPS = 1e-9
 
@@ -44,10 +43,6 @@ MAX_PREVIEW_SECONDS = 60.0
 CHECKPOINT_STRIDE = 60
 
 
-def _frac(x):
-    return x - math.floor(x)
-
-
 def _emit_dir(pitch_deg, yaw_deg):
     """发射方向的单位向量：**仰角 pitch + 方位角 yaw**，方位基准为 **+Z**。
 
@@ -66,8 +61,6 @@ def _emit_dir(pitch_deg, yaw_deg):
     velocity_* / emitter_* / sphere_emitter_* 三个入口共用这一套（标定件里
     emitter_* 与 velocity_* 明确注为「同一套球面角」，sphere 的 {0 180} 全向
     也靠这套角度铺满整球）。
-
-    注意别照搬 sph_to_dir 的极角模型：它把 yaw 当绕 +Y 的极角，与实机不符。
     """
     p = math.radians(pitch_deg)
     y = math.radians(yaw_deg)
@@ -485,12 +478,10 @@ class SubsystemSim:
         用 Halton 低差异序列：每一维取一个互质基数，维度之间互相独立；子系统之间
         靠序列起点错开（seq_offset），不占用额外维度。
 
-        不能写成 frac((i+1)*GOLDEN + salt*C) 那种「同一序列加偏移」的形式——
-        那样各维之间只差一个常数，等于同一个随机数，点集退化成一条直线。
-        实测 16x16 网格只覆盖 12.5%（本该接近 100%），球面发射器的落点被压成
-        一条测地线，三轴符号比 x=86.6%/y=50%/z=36.6%（应各约 50%），
-        视觉上就是「球形发射场只出来一半」。换成 Halton 后球面覆盖
-        10.8% → 86.7%，三轴符号回到 49.5/49.9/50.0%。
+        不用「黄金比序列加偏移」那种写法：各维之间只差一个常数，等于同一个随机数，
+        点集退化成一条直线（实测 16x16 网格只覆盖 12.5%，球面发射器的落点被压成
+        一条测地线，三轴符号比 x=86.6%/y=50%/z=36.6%，视觉上球面场只出来一半）。
+        Halton 的球面覆盖 10.8% → 86.7%，三轴符号回到 49.5/49.9/50.0%。
         """
         base = _HALTON_BASES[salt % len(_HALTON_BASES)]
         return _radical_inverse(self.seq_offset + i + 1, base)
@@ -717,6 +708,8 @@ class SubsystemSim:
             if self.use_vec and len(self.particles) >= _VEC_MIN_PARTICLES:
                 self._step_vec(t_now, h, fric)
             else:
+                # 阻尼系数在本次调用内是常量，先算一次（与 _step_vec 一致）
+                damp = math.exp(-fric * h) if fric > 0.0 else 1.0
                 alive = self.particles
                 idx = 0
                 for p in alive:
@@ -728,7 +721,6 @@ class SubsystemSim:
                     p[6] += a[1] * h
                     p[7] += a[2] * h
                     if fric > 0.0:
-                        damp = math.exp(-fric * h)
                         p[5] *= damp
                         p[6] *= damp
                         p[7] *= damp

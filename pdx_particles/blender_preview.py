@@ -497,8 +497,6 @@ class SubsystemPreview:
         sub = sim.sub
         snap = sim.snapshot()
         cap = self.capacity
-        if cap <= 0:
-            return 0
 
         # 立牌基向量二选一：
         # - billboard=no：固定朝向，不跟随镜头，朝向由 particle_yaw / particle_pitch
@@ -521,9 +519,6 @@ class SubsystemPreview:
         # snapshot 给的 cell 为 -1，组数组里退回第 1 帧（实机读数即默认只取第 1 帧）。
         do_sheet = (sheet_x * sheet_y) > 1
 
-        coords = [0.0] * (cap * 12)
-        colors = [0.0] * (cap * 16)
-        uvs = [0.0] * (cap * 8)
         n = min(len(snap), cap)
 
         # 组数组：numpy 向量化，无 numpy 时回退纯 Python。
