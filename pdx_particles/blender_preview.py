@@ -197,6 +197,11 @@ def _fixed_quad_basis(yaw_deg, pitch_deg):
     注意 yaw 与 pitch 的旋转都作用于**两个基向量**，且 pitch 的转轴是 yaw 之后的当前
     长轴，才能同时满足 z2 与 z7。
 
+    闭式解（供 numpy 向量化的逐粒子版本用，_quad_basis_arrays 复用）：
+      right = ( cos y,           -sin y,        0    )
+      up    = ( sin y · sin p,   cos y · sin p, cos p )
+    与逐行调用本函数的结果逐位一致（见 _quad_basis_arrays 的注释与校验）。
+
     默认姿态下 right × up = -Y（Blender 正面视角方向），材质关了背面剔除，正反都可见。
     """
     right = (1.0, 0.0, 0.0)
@@ -212,15 +217,35 @@ def _fixed_quad_basis(yaw_deg, pitch_deg):
     return right, up
 
 
-def _build_arrays_py(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
+def _quad_basis_arrays(yaw_rad, pitch_rad):
+    """_fixed_quad_basis 的向量化版：逐粒子 (n,) 弧度 → (n,3) 的 right / up。
+
+    取的是上面写的闭式解，避免逐粒子调 _rot_about（那要 6 次罗德里格斯）。
+    """
+    np = _NP
+    cy, sy = np.cos(yaw_rad), np.sin(yaw_rad)
+    cp, sp = np.cos(pitch_rad), np.sin(pitch_rad)
+    right = np.stack([cy, -sy, np.zeros_like(cy)], axis=1)
+    up = np.stack([sy * sp, cy * sp, cp], axis=1)
+    return right, up
+
+
+def _build_arrays_py(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet,
+                     per_particle_basis=False):
     """纯 Python 组数组（numpy 不可用时的回退，逻辑与向量化版逐项对应）。"""
     coords = [0.0] * (cap * 12)
     colors = [0.0] * (cap * 16)
     uvs = [0.0] * (cap * 8)
     for i in range(n):
-        x, y, z, size, r, g, b, a, ang, cell, p_ang, y_ang = snap[i]
+        x, y, z, size, r, g, b, a, ang, cell, p_ang, y_ang, b_pitch, b_yaw = snap[i]
         c, s = math.cos(ang), math.sin(ang)
-        right_i, up_i = _orient_basis(right, up, p_ang, y_ang)
+        if per_particle_basis:
+            # 逐粒子基角（含随机扰动），与 _quad_basis_arrays 闭式解同源；
+            # 三轴自转的累积增量照常叠在其上（两件事先后独立，不是同一回事）。
+            right_i, up_i = _orient_basis(
+                *_fixed_quad_basis(b_yaw, b_pitch), p_ang, y_ang)
+        else:
+            right_i, up_i = _orient_basis(right, up, p_ang, y_ang)
         r2 = (right_i[0] * c - up_i[0] * s, right_i[1] * c - up_i[1] * s,
               right_i[2] * c - up_i[2] * s)
         u2 = (right_i[0] * s + up_i[0] * c, right_i[1] * s + up_i[1] * c,
@@ -263,13 +288,19 @@ def _build_arrays_py(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
     return coords, colors, uvs
 
 
-def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
-    """numpy 向量化组数组，与纯 Python 版逐位等价。"""
+def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet,
+                    per_particle_basis=False):
+    """numpy 向量化组数组，与纯 Python 版逐位等价。
+
+    per_particle_basis=True 时，arr[:, 12]/arr[:, 13] 是每颗粒子的面片基角
+    （弧度），right/up 由它们逐粒子重算；否则沿用外部传入的共享基向量。
+    """
     np = _NP
-    # snap 是 list[tuple]，转成 (n,12) 一次成型；多余容量留 0（与纯 Python 版
+    # snap 是 list[tuple]，转成 (n,14) 一次成型；多余容量留 0（与纯 Python 版
     # 初始化为 0 的语义一致——mesh 顶点数固定为 cap，未用到的槽位保持原值/0）。
-    # 宽度 12：末两列是面片朝向的 pitch/yaw（弧度），供三轴自转用。
-    arr = np.array(snap[:n], dtype=np.float64).reshape(n, 12)
+    # 宽度 14：第 11/12 列是三轴自转累积角（弧度），第 13/14 列是面片基角
+    # pitch/yaw（弧度，已含逐粒子随机扰动）。
+    arr = np.array(snap[:n], dtype=np.float64).reshape(n, 14)
     px, py, pz = arr[:, 0], arr[:, 1], arr[:, 2]
     size = arr[:, 3]
     r, g, b, a = arr[:, 4], arr[:, 5], arr[:, 6], arr[:, 7]
@@ -282,14 +313,21 @@ def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
 
     c = np.cos(ang)
     s = np.sin(ang)
-    R = np.asarray(right, dtype=np.float64)
-    U = np.asarray(up, dtype=np.float64)
+    # 逐粒子基角：billboard=no 且 pitch_var / yaw_var 非零时启用。
+    # 快照给的是度，这里弧度化一次；负号（引擎→Blender 的镜像）已含在
+    # _quad_basis_arrays 的闭式解里，这里不要再取负。
+    if per_particle_basis:
+        R, U = _quad_basis_arrays(
+            np.radians(arr[:, 13]), np.radians(arr[:, 12]))
+    else:
+        R = np.asarray(right, dtype=np.float64)
+        U = np.asarray(up, dtype=np.float64)
     # 三轴自转：逐粒子转基向量。全部为 0 时（绝大多数子系统）跳过，省掉两次
     # (n,3) 的三角运算。
     if np.any(p_ang) or np.any(y_ang):
         cp, sp = np.cos(p_ang)[:, None], np.sin(p_ang)[:, None]
         cy, sy = np.cos(y_ang)[:, None], np.sin(y_ang)[:, None]
-        # 把常量基向量广播成 (n,3)，再逐粒子旋转（绕 X 转 pitch，再绕 Y 转 yaw）
+        # 把基向量广播成 (n,3)，再逐粒子旋转（绕 X 转 pitch，再绕 Y 转 yaw）
         R = np.broadcast_to(R, (n, 3)).copy()
         U = np.broadcast_to(U, (n, 3)).copy()
         Rx0 = R[:, 0].copy()
@@ -303,6 +341,10 @@ def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet):
         U = np.stack([Ux0 * cy[:, 0] + Ux2 * sy[:, 0], Ux1,
                       -Ux0 * sy[:, 0] + Ux2 * cy[:, 0]], axis=1)
         r2 = R * c[:, None] - U * s[:, None]                    # (n,3)
+        u2 = R * s[:, None] + U * c[:, None]
+    elif per_particle_basis:
+        # R / U 已经是 (n,3)，不能再加 [None, :]
+        r2 = R * c[:, None] - U * s[:, None]
         u2 = R * s[:, None] + U * c[:, None]
     else:
         r2 = R[None, :] * c[:, None] - U[None, :] * s[:, None]  # (n,3)
@@ -503,7 +545,13 @@ class SubsystemPreview:
         #   （标定件：billboard=yes 的 base / yaw=90 / pitch=90 三组显示完全一致）。
         # 判断顺序必须先看 billboard：先判 pitch≈90 会把 129 个两者都写的子系统
         # 摁平在水平面上，而它们本该正常朝镜头。
+        #
+        # billboard=no 且两轴都有随机扰动时（pitch_var / yaw_var 非零），基角是
+        # 逐粒子取的（发射时定死），不能只算一组共享基向量——那正是本条修复前
+        # 「全是水平面」的原因。共享基向量仍作为无扰动时的快路径基准。
+        per_basis = False
         if not sub.billboard:
+            per_basis = bool(sub.particle_pitch[1] or sub.particle_yaw[1])
             right, up = _fixed_quad_basis(sub.particle_yaw[0], sub.particle_pitch[0])
         elif cam_basis is not None:
             right, up = cam_basis
@@ -523,10 +571,10 @@ class SubsystemPreview:
         # （实测占 77%，比 foreach_set 本身贵）。
         if _NP is not None and n > 0:
             coords, colors, uvs = _build_arrays_np(
-                snap, n, cap, right, up, sheet_x, sheet_y, do_sheet)
+                snap, n, cap, right, up, sheet_x, sheet_y, do_sheet, per_basis)
         else:
             coords, colors, uvs = _build_arrays_py(
-                snap, n, cap, right, up, sheet_x, sheet_y, do_sheet)
+                snap, n, cap, right, up, sheet_x, sheet_y, do_sheet, per_basis)
 
         mesh = self.mesh
         mesh.vertices.foreach_set("co", coords)

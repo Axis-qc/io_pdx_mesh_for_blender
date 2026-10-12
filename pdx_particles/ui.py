@@ -966,8 +966,14 @@ class IOPDX_PT_PDXparticles(Panel):
                     emit = "point"
                 pos = "({0:g},{1:g},{2:g})".format(*sub.position)
                 facing = "billboard" if sub.billboard else "fixed"
-                if abs(sub.particle_pitch[0] - 90.0) < 1.0 and sub.particle_pitch[1] < 1.0:
-                    facing = "flat(90)"
+                # 「平铺」只在没有随机扰动时成立：pitch_var 非零意味着每颗粒子
+                # 的基角不同（如 { 90 90 } 的 beam），只有部分粒子是平的，不能
+                # 整条标成 flat(90)。有扰动时把范围一起标出来。
+                if abs(sub.particle_pitch[0] - 90.0) < 1.0:
+                    facing = ("flat(90)" if sub.particle_pitch[1] < 1.0
+                              else "flat(90)+-{0:g}".format(sub.particle_pitch[1]))
+                if not sub.billboard and abs(sub.particle_pitch[1]) >= 1.0:
+                    facing += " jitter"
                 anims = [n for n in (s.size_anim, s.alpha_anim,
                                      s.anim_r, s.anim_g, s.anim_b) if n is not None]
                 anim_txt = ",".join(a.name for a in anims) if anims else "-"

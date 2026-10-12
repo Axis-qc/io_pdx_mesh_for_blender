@@ -328,8 +328,8 @@ class SubsystemSim:
         # 三轴自转：面片除屏幕内自转（rotation_speed）外，还可绕 pitch/yaw 两轴
         # 翻转。原版 182 个子系统写了这三个键（pitch 75 / yaw 70 / roll 37）。
         # 基角取 particle_pitch / particle_yaw（面片的初始朝向），速率取对应键。
-        self.pitch0 = sub.particle_pitch[0]
-        self.yaw0 = sub.particle_yaw[0]
+        self.pitch_var = sub.particle_pitch[1]
+        self.yaw_var = sub.particle_yaw[1]
         self.pitch_speed = sub.rotation_speed_pitch[0] + sub.rotation_speed_pitch[1]
         self.yaw_speed = sub.rotation_speed_yaw[0] + sub.rotation_speed_yaw[1]
         # roll 轴的自转等价于屏幕内自转，与 rotation_speed 同义：实测 47 个有轴
@@ -498,6 +498,8 @@ class SubsystemSim:
         w_speed = self._w(i, 6)                  # 初速度大小
         w_rot0 = self._w(i, 7)                   # 初始自转角
         w_rotv = self._w(i, 8)                   # 自转角速度
+        w_pit = self._w(i, 9)                    # 面片基角 pitch 的随机扰动
+        w_yaw = self._w(i, 10)                   # 面片基角 yaw 的随机扰动
 
         w0 = w_life
         life = self.life + self.life_var * (2.0 * w0 - 1.0)
@@ -551,7 +553,17 @@ class SubsystemSim:
         angvel = (sub.rotation_speed[0] + sub.rotation_speed[1] * (2.0 * w_rotv - 1.0)
                   + self.roll_speed)   # roll 轴自转 = 屏幕内自转，合并到同一条通道
 
-        self.particles.append([t, life, px, py, pz, d[0] * v, d[1] * v, d[2] * v, angvel, ang0, w0])    # ---- 物理 ----
+        # 面片初始朝向：基角 + 逐粒子随机扰动，在发射时定死。
+        # 第二个值是变化量，原版结构由 _decomp/editor_registry.cpp 实锤：
+        # pe_behavior_particle_pitch_var 用的就是 CreateComponentVariation，且把
+        # pe_behavior_particle_pitch 自身（lVar3+0x278）当父节点传入，与
+        # life/life_var、velocity_pitch/_var、particle_yaw/_var、roll/roll_var 同构。
+        # 实测全库 5122 个子系统里 pitch_var 非零 1187（billboard=no 占 971）、
+        # yaw_var 非零 830。billboard=yes 的这两个字段引擎本身忽略。
+        b_pitch = sub.particle_pitch[0] + self.pitch_var * (2.0 * w_pit - 1.0)
+        b_yaw = sub.particle_yaw[0] + self.yaw_var * (2.0 * w_yaw - 1.0)
+
+        self.particles.append([t, life, px, py, pz, d[0] * v, d[1] * v, d[2] * v, angvel, ang0, w0, b_pitch, b_yaw])    # ---- 物理 ----
 
     def _accel(self, p, v, t):
         ax = ay = az = 0.0
@@ -769,11 +781,11 @@ class SubsystemSim:
             if a <= 0.0:
                 continue
             ang = math.radians(p[9] + p[8] * age)
-            # 三轴自转只输出「随时间累积的增量」，不输出基角：基角（pitch0 / yaw0）
-            # 决定的是面片的初始朝向，已经体现在 blender_preview 挑选的 right/up
-            # 基向量里（平铺分支、固定朝向分支都用到了它）。这里若再把基角当旋转
-            # 量叠加一次，就等于转了两次——实测让 308 个 pitch≈90 的平铺子系统
-            # 从水平面被转开（法线与 +Z 对齐度 1.000 → 0.000）。
+            # 三轴自转只输出「随时间累积的增量」，不输出基角：基角（particle_pitch
+            # / particle_yaw 的取值）决定的是面片的初始朝向，由 blender_preview 那边
+            # 的 _fixed_quad_basis 消费（末两列给的是这两个**基角**，不是转角增量）。
+            # 这里若再把基角当旋转量叠加一次，就等于转了两次——实测让 308 个
+            # pitch≈90 的平铺子系统从水平面被转开（法线与 +Z 对齐度 1.000 → 0.000）。
             if has_axis:
                 p_ang = math.radians(rp_rate * age)
                 y_ang = math.radians(ry_rate * age)
@@ -783,7 +795,8 @@ class SubsystemSim:
             cell = -1
             if sub.sheet_anim and sheet_total > 1:
                 cell = int(age * sub.sheet_loop * sheet_total) % sheet_total
-            out.append((p[2], p[3], p[4], size, r, g, b, a, ang, cell, p_ang, y_ang))
+            out.append((p[2], p[3], p[4], size, r, g, b, a, ang, cell, p_ang, y_ang,
+                        p[11], p[12]))
         return out
 
 

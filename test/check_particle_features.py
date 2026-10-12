@@ -896,7 +896,7 @@ axis_subs = [(sy, sb) for sy in lib.systems.values() for sb in sy.subsystems
                  or sb.rotation_speed_roll[0])]
 check("存在带轴自转的子系统", len(axis_subs) > 0, "{0} 个".format(len(axis_subs)))
 
-# snapshot 元组宽度必须是 12
+# snapshot 元组宽度必须是 14（0.96.8 起末四列：三轴自转增量 + 面片基角）
 sim0 = S.SystemSim(sorted(lib.systems.values(), key=lambda s: s.name)[0])
 sim0.advance(2.0)
 width = 0
@@ -904,7 +904,7 @@ for _n, rows in sim0.snapshot():
     if rows:
         width = len(rows[0])
         break
-check("snapshot 元组宽度为 12", width == 12, "实测 {0}".format(width))
+check("snapshot 元组宽度为 14", width == 14, "实测 {0}".format(width))
 
 # 轴自转必须真的改变朝向：验契约「增量 == radians(速率 × 年龄)」。
 # 这里**手工把 size/alpha 动画关掉**，让 snapshot 的唯一过滤条件变成「年龄」，
@@ -1217,6 +1217,158 @@ for _sy in sample(list(lib.systems.values()), 80):
             _ok_mass = False
 check("非零 mass 的子系统仍正常发射", _ok_mass and _checked_mass > 0,
       "核对 {0} 个".format(_checked_mass))
+
+print()
+print("=" * 78)
+print("11. 面片基角随机扰动 particle_pitch_var / particle_yaw_var")
+print("=" * 78)
+print("   原版结构由 _decomp/editor_registry.cpp 实锤：_var 用 CreateComponentVariation，")
+print("   且把同名基值当父节点传入 = 基值 + 变化量。修复前只取 [0]，全系统共享一组基向量。")
+print("   扰动在**发射时定死**，逐粒子一次（与 rotation 的基角同样式），不是每帧变。")
+
+_jit = [(sy.name, sb.name) for sy in lib.systems.values() for sb in sy.subsystems
+        if not sb.billboard and (abs(sb.particle_pitch[1]) > 1e-6
+                                 or abs(sb.particle_yaw[1]) > 1e-6)]
+check("存在 billboard=no 且带基角扰动的子系统", len(_jit) > 0,
+      "{0} 个".format(len(_jit)))
+
+
+def _basis_set(subname_sy, subname, sim_t=2.0):
+    """跑一个子系统，返回 (去重后的基向量集合, 粒子数) 与最小 |法线·+Z|。"""
+    sim = S.SystemSim(lib.systems[subname_sy])
+    sim.advance(sim_t)
+    st = next((s for s in sim.subs if s.name == subname), None)
+    if st is None or not st.particles:
+        return set(), 0, None
+    snap = st.snapshot()
+    per = bool(st.sub.particle_pitch[1] or st.sub.particle_yaw[1])
+    bases = set()
+    aligns = []
+    for rec in snap:
+        if per:
+            r, u = BP._fixed_quad_basis(rec[13], rec[12])
+        else:
+            r, u = BP._fixed_quad_basis(st.sub.particle_yaw[0], st.sub.particle_pitch[0])
+        bases.add(tuple(round(v, 5) for v in r + u))
+        cr = (r[1] * u[2] - r[2] * u[1], r[2] * u[0] - r[0] * u[2], r[0] * u[1] - r[1] * u[0])
+        ln = math.sqrt(sum(c * c for c in cr)) or 1e-9
+        aligns.append(abs(cr[2] / ln))
+    return bases, len(snap), (min(aligns) if aligns else None)
+
+
+# 有扰动：多颗粒子的基向量应互不相同（修复前恒为 1 组）。
+_var_ok = 0
+_var_probed = 0
+for _sy_n, _sb_n in sample(_jit, 40):
+    _b, _n, _ = _basis_set(_sy_n, _sb_n)
+    if _n < 2:
+        continue
+    _var_probed += 1
+    if len(_b) > 1:
+        _var_ok += 1
+check("有 pitch/yaw 扰动的子系统逐粒子朝向不同", _var_probed > 0 and _var_ok == _var_probed,
+      "{0}/{1} 个".format(_var_ok, _var_probed))
+
+# 无扰动：必须仍然全系统一致（快路径没被破坏）。
+_njit = [(sy.name, sb.name) for sy in lib.systems.values() for sb in sy.subsystems
+         if not sb.billboard and abs(sb.particle_pitch[1]) < 1e-6
+         and abs(sb.particle_yaw[1]) < 1e-6]
+_nv_ok = 0
+_nv_probed = 0
+for _sy_n, _sb_n in sample(_njit, 40):
+    _b, _n, _ = _basis_set(_sy_n, _sb_n)
+    if _n < 2:
+        continue
+    _nv_probed += 1
+    if len(_b) == 1:
+        _nv_ok += 1
+check("无扰动的子系统仍全系统朝向一致", _nv_probed > 0 and _nv_ok == _nv_probed,
+      "{0}/{1} 个".format(_nv_ok, _nv_probed))
+
+# 平铺回归：pitch≈90 且无扰动的，法线仍须与 +Z 完全对齐（308 个子系统的老契约）。
+_flat_ok = 0
+_flat_probed = 0
+_flat = [(sy.name, sb.name) for sy in lib.systems.values() for sb in sy.subsystems
+         if not sb.billboard and abs(sb.particle_pitch[0] - 90.0) < 1.0
+         and abs(sb.particle_pitch[1]) < 1e-6 and abs(sb.particle_yaw[1]) < 1e-6]
+for _sy_n, _sb_n in sample(_flat, 40):
+    _b, _n, _al = _basis_set(_sy_n, _sb_n)
+    if _n < 1 or _al is None:
+        continue
+    _flat_probed += 1
+    if _al > 0.999:
+        _flat_ok += 1
+check("pitch≈90 无扰动的仍平铺（法线与 +Z 对齐）", _flat_probed > 0 and _flat_ok == _flat_probed,
+      "{0}/{1} 个".format(_flat_ok, _flat_probed))
+
+# 闭式解与逐行 _fixed_quad_basis 必须逐位一致（向量化分支的正确性前提）。
+_rng = random.Random(20241012)
+_ys = [_rng.uniform(-180.0, 180.0) for _ in range(300)]
+_ps = [_rng.uniform(-180.0, 180.0) for _ in range(300)]
+if BP._NP is not None:
+    _R, _U = BP._quad_basis_arrays(
+        BP._NP.radians(BP._NP.array(_ys)), BP._NP.radians(BP._NP.array(_ps)))
+    _worst = 0.0
+    for _i in range(300):
+        _r0, _u0 = BP._fixed_quad_basis(_ys[_i], _ps[_i])
+        _worst = max(_worst,
+                     max(abs(_a - _b) for _a, _b in zip(_r0, _R[_i])),
+                     max(abs(_a - _b) for _a, _b in zip(_u0, _U[_i])))
+    check("逐粒子闭式解 == 逐行 _fixed_quad_basis", _worst < 1e-9,
+          "最大差 {0:.2e}".format(_worst))
+
+# 真值样本：colossus beam 三条都是 pitch={90 90}，ring_pulse / ball 是 {90 0}。
+_col = lib.systems.get("fallen_empire_01_colossus_energy_effect")
+if _col is not None:
+    _beams = [s for s in _col.subsystems
+              if s.name.startswith("beam") and abs(s.particle_pitch[1]) > 1e-6]
+    check("colossus beam 带 pitch 扰动（真值样本）", len(_beams) == 3,
+          "{0} 条，pitch={1}".format(len(_beams), [list(b.particle_pitch) for b in _beams]))
+    _bv = 0
+    _bn = 0
+    for _b_sub in _beams:
+        _bs, _cnt, _ = _basis_set("fallen_empire_01_colossus_energy_effect", _b_sub.name)
+        if _cnt < 2:
+            continue
+        _bn += 1
+        if len(_bs) > 1:
+            _bv += 1
+    check("colossus beam 逐粒子朝向发散", _bn > 0 and _bv == _bn, "{0}/{1} 条".format(_bv, _bn))
+else:
+    print("  (跳过 colossus 真值样本：未找到该系统)")
+
+# 组数组必须真能跑：逐粒子基向量分支的形状广播只有打 _build_arrays 才会暴露
+# （单元断言只调 _fixed_quad_basis，绕过组数组就测不到）。这里只打少量样本：
+# 每个都要跑一次 SystemSim.advance，实测是整脚本里最贵的一段，取 8 个足够。
+_arr_ok = True
+_arr_detail = []
+_arr_n = 0
+for _sy_n, _sb_n in sample(_jit, 5) + sample(_flat, 3):
+    _sim = S.SystemSim(lib.systems[_sy_n])
+    _sim.advance(2.0)
+    _st = next((s for s in _sim.subs if s.name == _sb_n), None)
+    if _st is None:
+        continue
+    _snap = _st.snapshot()
+    if not _snap:
+        continue
+    _sb = _st.sub
+    _per = bool(_sb.particle_pitch[1] or _sb.particle_yaw[1])
+    _r0, _u0 = BP._fixed_quad_basis(_sb.particle_yaw[0], _sb.particle_pitch[0])
+    try:
+        if BP._NP is not None:
+            BP._build_arrays_np(_snap, len(_snap), max(len(_snap), 1), _r0, _u0,
+                                max(_sb.sheet_x, 1), max(_sb.sheet_y, 1),
+                                (max(_sb.sheet_x, 1) * max(_sb.sheet_y, 1)) > 1, _per)
+        BP._build_arrays_py(_snap, len(_snap), max(len(_snap), 1), _r0, _u0,
+                            max(_sb.sheet_x, 1), max(_sb.sheet_y, 1),
+                            (max(_sb.sheet_x, 1) * max(_sb.sheet_y, 1)) > 1, _per)
+    except Exception as _e:  # noqa: BLE001
+        _arr_ok = False
+        _arr_detail.append("{0}/{1}: {2}".format(_sy_n, _sb_n, _e))
+    _arr_n += 1
+check("组数组两种实现都能跑通（含逐粒子基角）",
+      _arr_n > 0 and _arr_ok, "跑 {0} 个，{1}".format(_arr_n, "; ".join(_arr_detail[:3])))
 
 print()
 print("=" * 78)
