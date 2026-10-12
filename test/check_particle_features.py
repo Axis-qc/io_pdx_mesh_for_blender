@@ -22,7 +22,7 @@
 模拟层（SystemSim + advance 跑物理）抽样，固定种子可复现——
 单次 advance 是数百毫秒，全量 4700+ 子系统要几十分钟，不值得。
 
-不修改任何文件；只在结尾打印报告并以退出码反映结果。
+不修改任何文件；只在结尾打印报告。
 """
 
 import os
@@ -843,7 +843,7 @@ check("脉冲子系统在静默相不发射", violations == 0,
 
 # 非脉冲子系统不能被误伤：排程应等于闭式解 int((t-start)*rate)。
 # 注意不能写成「10s 应是 5s 的两倍」——start≠0 时 (10-start)/(5-start) 不是 2
-# （例：start=1、rate=30 时是 9/4=2.25）。这一条我第一版就写错了。
+# （例：start=1、rate=30 时是 9/4=2.25）。
 plain_bad = 0
 plain_checked = 0
 plain_examples = []
@@ -909,8 +909,7 @@ check("snapshot 元组宽度为 12", width == 12, "实测 {0}".format(width))
 # 轴自转必须真的改变朝向：验契约「增量 == radians(速率 × 年龄)」。
 # 这里**手工把 size/alpha 动画关掉**，让 snapshot 的唯一过滤条件变成「年龄」，
 # 从而能与 st.particles 按序一一对齐。直接按位置匹配是不行的：
-# point 发射器会让同一时刻出生的多颗粒子位置完全相同，字典匹配会互相覆盖
-# （我第一版就这么错，误报 106 处不符）。
+# point 发射器会让同一时刻出生的多颗粒子位置完全相同，字典匹配会互相覆盖。
 turned = 0
 probe = 0
 axis_bad = 0
@@ -960,7 +959,7 @@ check("朝向增量 == radians(速率 × 年龄)", axis_bad == 0,
       "逐粒子核对，{0} 处不符".format(axis_bad))
 
 # 无轴自转的必须不受影响。注意速率是 [基值] + [方差]：只看 [0] 会漏掉
-# rotation_speed_pitch=(0.0, 2.0) 这类「只在方差里非零」的（我第一版漏了 10 个）。
+# rotation_speed_pitch=(0.0, 2.0) 这类「只在方差里非零」的。
 still_tot = 0
 still_ok = 0
 still_examples = []
@@ -1079,7 +1078,7 @@ else:
 
     # 关键：强制关闭向量化后结果必须逐位相同。
     # 只在抽样集合里找走向量化的样本——不要对全库每个系统都建 SystemSim
-    # 只为了挑 4 个（我第一版就这么写，白跑几千次构造）。
+    # 只为了挑 4 个（白跑几千次构造）。
     vsamples = []
     for sy in sample(list(lib.systems.values()), 200):
         if any(s.use_vec for s in S.SystemSim(sy).subs):
@@ -1167,8 +1166,7 @@ check("spin 有切向分量（与 vortex 不同）", abs(_a_sp[2]) > 0.9,
 if S._NP is not None:
     _bad = 0
     # 注意：比对前必须把 forces 切回 vortex——上面测 spin 时改成了 [_sp_f]，
-    # 若不切回来就是「spin 的标量值 vs vortex 的向量值」，必然不符（本检查第一版
-    # 正是漏了这一步，误报 3 处）。
+    # 若不切回来就是「spin 的标量值 vs vortex 的向量值」，必然不符。
     _ss.forces = [_vo]
     for _pt in ((3.0, 5.0, 0.0), (0.0, 7.0, 0.0), (-2.0, 1.0, 4.0), (0.5, -3.0, 2.5)):
         _sf = _ss._accel(_pt, (0.0, 0.0, 0.0), 0.0)

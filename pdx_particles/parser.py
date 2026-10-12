@@ -9,7 +9,7 @@ Paradox particle files (.gfx / .asset / entity .asset), text parser.
  - `值,动画名` 复合值、`值 方差` 二元组、`值,动画名 方差` 三元组
  - `key =` 换行后 `{`（lev_stellarite_move_trail.asset）
  - 一行多个赋值、`#` 注释
- - 顶层块名：particle / pdxparticle_system / entity / objectTypes
+ - 顶层块名：particle / pdxparticle_system / entity
 
  author : Axis-qc (fork of ross-g/io_pdx_mesh 0.91.2)
 """
@@ -318,7 +318,8 @@ class PdxSubsystem:
         self.emitter_type = str(et.value).strip('"') if et is not None and et.value is not None else "point"
         self.box_x = _pair(node.child("box_emitter_x"))
         self.box_y = _pair(node.child("box_emitter_y"))
-        # 三个轴都要读；只读 x/y 会让 box 发射器塌成一个平面矩形（原版 748 个用到 z）。
+        # 三个轴都要读；只读 x/y 会让 box 发射器塌成一个平面矩形。原版 748 个写了
+        # 这个键，但值非零的只有 36 个（其余写成 { 0 方差 }，方差当前不参与散开）。
         self.box_z = _pair(node.child("box_emitter_z"))
         self.sphere_radius = _pair(node.child("sphere_emitter_radius"))
         self.sphere_yaw = _pair(node.child("sphere_emitter_yaw"))

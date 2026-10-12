@@ -2,11 +2,11 @@
 PDX particle simulator: deterministic, frame-scrub able integration.
 
  设计要点（与预览目标对应）：
- - 确定性：不用随机数。每颗粒子按『出生序号 × 黄金比例分数』取权重槽 W，
+ - 确定性：不用随机数。每颗粒子按出生序号在各维 Halton 序列上取权重槽 W，
    同一时刻擦洗到同一帧永远得到同一画面。
- - 逐帧确定性驱动：simulate(t) 把状态推进到绝对秒 t；时间轴倒退时从头重算，
-   前进小步长则增量推进，两条路径结果一致。
- - 力场语义按实机校准记录实现：负 amount 吸引 / 正排斥，division=16，
+ - 逐帧确定性驱动：advance(t) 把状态推进到绝对秒 t；子步恒为 SUBSTEP、按绝对
+   子步号推进（不从本次 dt 等分），跳帧与逐帧结果才逐位一致。
+ - 力场语义按实机校准记录实现：负 amount 吸引 / 正排斥，
    force 必须被子系统 force=<名> 引用才生效。
  - 不复现父级/entity 缩放（挂载缩放），只保证粒子系统内部尺寸比例。
 
@@ -86,8 +86,7 @@ def _emit_rot_matrix(pitch_deg, yaw_deg):
 
     基准取 +Z，因为 d(0,0) 就是 +Z（标定件：emitter_yaw 与 velocity_yaw 同零点），
     于是 emitter_yaw=emitter_pitch=0 等价于单位阵——写 0 的子系统不会被动旋转。
-    原版 2376 个子系统显式写 0，其中 222 个是尾焰类（fire_flare、fire_backblast…），
-    整体扭转 90° 会让它们全部喷错方向。
+    原版 2376 个子系统显式写 0，其中大量是尾焰/引擎类，整体扭转 90° 会全部喷错。
 
     取绕轴 (base × d) 转 base 与 d 夹角这一支（最短路径）。
     """

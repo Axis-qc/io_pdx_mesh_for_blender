@@ -12,8 +12,7 @@ Build/refresh Blender preview objects for a simulated PDX particle system.
    同一套（交换 Y/Z）。粒子空间 -Z 是前方 → Blender -Y 是前方，与导入模型的
    船头方向（-Y）一致；粒子上方 +Y → Blender +Z。
  - 材质：ParticleAdditive → 发光叠加观感；ParticleAlphaBlend → 普通透明混合。
- - 显示缩放（默认 0.02）只影响整体呈现尺寸，等比，不改内部比例；
-   不复现父级/entity 挂载缩放。
+ - 不复现父级/entity 挂载缩放，只保证粒子系统内部尺寸比例。
 
  author : Axis-qc (fork of ross-g/io_pdx_mesh 0.91.2)
 """
@@ -145,8 +144,7 @@ def _orient_basis(right, up, p_ang, y_ang):
     与 _fixed_quad_basis 的基角（particle_yaw/pitch）是两回事，不会重复转。
 
     两者都为 0 时原样返回（绝大多数子系统走这条快路径，不做任何三角运算）。
-    转轴沿世界 +X / +Y：这是 rotation_speed_pitch / _yaw 的既有实现契约，
-    已由 check_particle_features 第 6 项逐位断言，本次不改动。
+    转轴沿世界 +X / +Y，与 rotation_speed_pitch / _yaw 的语义对应。
     """
     if p_ang == 0.0 and y_ang == 0.0:
         return right, up
