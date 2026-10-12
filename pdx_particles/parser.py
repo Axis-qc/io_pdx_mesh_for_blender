@@ -364,7 +364,22 @@ class PdxSubsystem:
             self.color = (1.0, 1.0, 1.0)
             a = None
         self.alpha = _triplet(a, 255.0)
-        self.position = _vec3(node.child("position"))
+        # 资产 position 的轴序与游戏世界不同，要转。实测（用户 2026-10-12 定案）：
+        #     (px, py, pz) -> 游戏 (pz, py, -px)
+        # 即 pz→+X、py→+Y、px→-Z。验证：x=-20 是游戏 +Z 方向 20，z=60 是 +X 方向 60。
+        # 插件内部坐标就是游戏坐标（渲染时再按 (x,z,y) 映射到 Blender：游戏 Z→Y、Y→Z），
+        # 所以这里转完即与 _emit_dir / _emit_rot_matrix 同处一个坐标系。
+        #
+        # 修前直接读原始值，等于把发射体绕游戏 +Y 少转 90°：colossus 三个球因此整体
+        # 偏离原位 31~33 单位、且方位角错 90°，粒子沿切线掠过原点永不靠近；连带
+        # emitter_yaw 也差 90°（所以才需要给发射方向加 +90 去凑——那是两个错误互相
+        # 掩盖，位置修好后发射方向不需要任何偏移，emitter_yaw=0 就是 +Z）。
+        # 对照：修正后三球与「指向原点」夹角 1.0°/0.0°/1.0°（残差来自作者取整）。
+        #
+        # 【注意】box_emitter_x/y/z 与 force.direction/position 各自另有一套映射，
+        # 目前仍按原样读取，未随本处一起转（见各自定义处注释）。
+        _pos_asset = _vec3(node.child("position"))
+        self.position = (_pos_asset[2], _pos_asset[1], -_pos_asset[0])
 
         self.start = _pair(node.child("start"))
         self.duration = _pair(node.child("duration"), -1.0)
