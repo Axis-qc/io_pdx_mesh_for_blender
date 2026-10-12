@@ -60,8 +60,8 @@ def _emit_dir(pitch_deg, yaw_deg):
         pitch=90 → +Y       pitch=-90 → -Y       pitch=45 → +Z/+Y 斜上
 
     velocity_* / emitter_* 两个入口共用这一套（标定件里明确注为「同一套球面角」）。
-    球面发射器的取点不使用本函数的角度散布：它在整球上均匀取方向（见 _spawn），
-    因为 sphere_emitter_yaw/_pitch 是发射器自身的偏航/俯仰，球旋转对称、无效果。
+    球面发射器的取点不走本函数：它在整球上均匀取方向（见 _spawn），
+    sphere_emitter_yaw/_pitch 是发射器自身的偏航/俯仰，球旋转对称、与取点无关。
     """
     p = math.radians(pitch_deg)
     y = math.radians(yaw_deg)
@@ -538,7 +538,7 @@ class SubsystemSim:
         **最终值 = 基准 + 方差 · U**，U 在 [0,1) 均匀取值。不是「基准 ± 方差」。
 
         这条规则对角度字段同样成立：`particle_pitch={ 90 90 }` 得到 90~180；
-        想全向就写 `{ 0 360 }`（原版确有 12 处这么写），而不是靠 ±180 凑。
+        `{ 0 360 }` 得到 0~360，也就是整圈（原版确有 12 处这么写）。
         旧实现用的是「基准 ± 方差」，在半径上会让一半取到负值、被钳到原点
         （实测 DustParticlesOrange 有 48.5% 的粒子堆在原点）。
         """
