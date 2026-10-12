@@ -25,6 +25,8 @@
 不修改任何文件；只在结尾打印报告。
 """
 
+import itertools
+import math
 import os
 import random
 import sys
@@ -551,7 +553,7 @@ else:
 
 print()
 print("=" * 78)
-print("B2. 发射器形态：sphere 各向同性（Halton 权重回归）")
+print("B2. 发射器形态：sphere 各向同性（哈希权重回归）")
 print("=" * 78)
 
 sph_pick = None
@@ -1369,6 +1371,78 @@ for _sy_n, _sb_n in sample(_jit, 5) + sample(_flat, 3):
     _arr_n += 1
 check("组数组两种实现都能跑通（含逐粒子基角）",
       _arr_n > 0 and _arr_ok, "跑 {0} 个，{1}".format(_arr_n, "; ".join(_arr_detail[:3])))
+
+print()
+print("=" * 78)
+print("12. 哈希权重：维度独立性与种子")
+print("=" * 78)
+print("   随机量来自整数哈希（_hash32），不再用 Halton 低差异序列。")
+print("   原因：低差异序列在索引小于 base 时退化成精确等差，小 max_amount 的")
+print("   子系统永远落在该区，导致 ① 相邻粒子恒定步长、② 各维同序（同进同退）。")
+
+_sim_w = S.SystemSim(sorted(lib.systems.values(), key=lambda s: s.name)[0])
+_st_w = _sim_w.subs[0]
+_D = 16
+_cols = {s: [_st_w._w(i, s) for i in range(_D)] for s in range(_D)}
+
+
+def _rank_of(v):
+    order = sorted(range(len(v)), key=lambda k: v[k])
+    r = [0.0] * len(v)
+    for pos, idx in enumerate(order):
+        r[idx] = pos
+    return r
+
+
+def _spearman(a, b):
+    n = len(a)
+    ra, rb = _rank_of(a), _rank_of(b)
+    ma, mb = sum(ra) / n, sum(rb) / n
+    cov = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    da = math.sqrt(sum((x - ma) ** 2 for x in ra))
+    db = math.sqrt(sum((y - mb) ** 2 for y in rb))
+    return cov / (da * db) if da and db else 0.0
+
+
+_worst_rho = max(abs(_spearman(_cols[a], _cols[b]))
+                 for a, b in itertools.combinations(range(_D), 2))
+# 零假设：同样本量下「真正独立」的随机源，max|Spearman| 本来就有 0.6~0.8。
+# 所以判据不能是「越小越好」，而得是「不超出独立随机的正常波动范围」。
+_rng0 = random.Random(20241012)
+_null = []
+for _ in range(60):
+    _c = {s: [_rng0.random() for _ in range(_D)] for s in range(_D)}
+    _null.append(max(abs(_spearman(_c[a], _c[b]))
+                     for a, b in itertools.combinations(range(_D), 2)))
+_null.sort()
+_p95 = _null[56]
+print("  16 维两两最大秩相关 = {0:.3f}（独立随机 p95 = {1:.3f}）".format(_worst_rho, _p95))
+check("哈希各维独立（不超出独立随机基准）", _worst_rho <= _p95,
+      "{0:.3f} vs p95 {1:.3f}".format(_worst_rho, _p95))
+
+# 相邻序号之间不能有恒定步长（等差梯子的直接判据）
+_ds = [(_cols[9][k + 1] - _cols[9][k]) * 180.0 for k in range(_D - 1)]
+check("相邻粒子的权重不再等差", (max(_ds) - min(_ds)) > 1.0,
+      "相邻差极差 {0:.1f} 度".format(max(_ds) - min(_ds)))
+
+# 种子：同种子逐位一致、不同种子确实不同、seed=0 走 seq_offset 路径
+_seed_sys = lib.systems.get("fallen_empire_01_colossus_energy_effect")
+if _seed_sys is not None:
+
+
+    def _seed_pattern(seed):
+        _s = S.SystemSim(_seed_sys, seed=seed)
+        _s.advance(1.5)
+        _t = next((x for x in _s.subs if x.name == "beam_1"), None)
+        return [round(p[11], 6) for p in _t.particles] if _t else []
+
+
+    _a1, _a2 = _seed_pattern(7), _seed_pattern(7)
+    _b, _c0 = _seed_pattern(8), _seed_pattern(0)
+    check("同种子逐位可复现", bool(_a1) and _a1 == _a2, "{0} 颗".format(len(_a1)))
+    check("不同种子产生不同图案", bool(_a1) and _a1 != _b and _b != _c0)
+else:
+    print("  (跳过种子检查：未找到 colossus 样本)")
 
 print()
 print("=" * 78)

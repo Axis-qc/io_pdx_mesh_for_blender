@@ -67,7 +67,9 @@ git clone https://github.com/Axis-qc/io_pdx_mesh_for_blender.git
 
 导入会自动挑一帧粒子最多的画面，不必手动找。时间轴往回拖只回退到最近的检查点，不会从头重算。回退关键帧间隔按实测调到 0.5 秒一档：1 秒级回退从几百毫秒降到几毫秒，代价是最重的几个系统同时载入时多占约 240MB 内存。`vortex` / `spin` 力场的子系统也走向量化积分，与 `point` / `turbulence` 同等待遇，逐位一致（astral_rift 等大粒子系统约 1.6~1.8 倍）。
 
-`test/` 里有粒子功能的自检与基准脚本：`check_particle_features.py` 是特征回归（当前 53 项通过），`bench_checkpoint_stride.py` 与 `bench_vortex_vec.py` 是此前两项调优的实测脚本，可复跑。
+面板上的 `Seed` 控制每颗粒子的随机量（寿命、速度、发射位置、朝向）。同一个种子每次结果完全一样，换个数字全部重排；改完按旁边的刷新按钮重新载入才生效。默认 0 是按子系统序号自动错开，同参数的两个子系统不会长得一模一样。粒子数很少的系统尤其值得试几个种子：随机量少的时候，不同种子之间的观感差别最大。
+
+`test/` 里有粒子功能的自检与基准脚本：`check_particle_features.py` 是特征回归（当前 65 项通过，整轮约 1 分钟），`bench_checkpoint_stride.py` 与 `bench_vortex_vec.py` 是此前两项调优的实测脚本，可复跑。
 
 已知限制：`childsystem` 嵌套子系统只解析并在日志里提示，不参与渲染（全库仅 15 处，其中 6 处是 `hide=yes`）；`local_space` 不影响预览，因为预览里没有带变换的父实体。
 

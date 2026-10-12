@@ -587,10 +587,10 @@ class SubsystemPreview:
 class PreviewScene:
     """一个粒子系统的完整预览（collection + 各子系统对象 + 参照球）。"""
 
-    def __init__(self, system, library, time_offset=0.0):
+    def __init__(self, system, library, time_offset=0.0, seed=0):
         self.system = system
         self.library = library
-        self.sim = SystemSim(system, time_offset)
+        self.sim = SystemSim(system, time_offset, seed)
         self.collection = None
         self.sub_previews = []
         self.ref_sphere = None

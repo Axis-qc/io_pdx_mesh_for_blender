@@ -65,7 +65,9 @@ Particles share the model's axes: positions are mapped with the same (x, z, y) c
 
 Import picks the busiest frame automatically, so you do not have to hunt for one. Scrubbing backwards only rewinds to the nearest checkpoint rather than replaying from the start. The checkpoint interval is tuned to half a second based on measurements: rewinding by a second now takes a few milliseconds instead of hundreds, at the cost of roughly 240 MB of extra memory when the heaviest systems are all loaded. Subsystems with `vortex` / `spin` force fields now also use the vectorised integrator, same as `point` / `turbulence`, bit-for-bit identical (around 1.6~1.8x on large systems like astral_rift).
 
-`test/` contains the self-check and benchmark scripts for the particle preview: `check_particle_features.py` is the feature regression (currently 53 checks passing); `bench_checkpoint_stride.py` and `bench_vortex_vec.py` are the measurement scripts behind two earlier tunings and can be re-run.
+The `Seed` field in the panel controls the per-particle randomness (lifetime, speed, spawn position, orientation). The same seed always reproduces the same result, and changing it reshuffles everything; press the refresh button next to it to reload. The default 0 staggers subsystems by index so two identical subsystems do not look the same. It is worth trying a few seeds on systems with few particles: the less randomness there is to spread, the more the choice of seed shows.
+
+`test/` contains the self-check and benchmark scripts for the particle preview: `check_particle_features.py` is the feature regression (currently 65 checks passing, roughly a minute for a full run); `bench_checkpoint_stride.py` and `bench_vortex_vec.py` are the measurement scripts behind two earlier tunings and can be re-run.
 
 Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered (only 15 occurrences in the whole game, 6 of them `hide=yes`); `local_space` has no effect on the preview, as the preview has no transformed parent entity.
 

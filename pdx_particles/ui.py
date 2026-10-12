@@ -331,9 +331,12 @@ def _import_loaded(context, loaded, missing, library):
     max_end = 0.0
     total_n = 0
     nested = []                      # 已解析但不渲染的嵌套子子系统，用于诊断提示
+    # 种子要在清空 entries **之前**读出来：import 算子每次都 clear + 重建，
+    # 放到之后就只能永远读到默认的 0 了。
+    seed = context.scene.io_pdx_particle_seed
     for system, offset in loaded:
         try:
-            preview = PreviewScene(system, library, time_offset=offset)
+            preview = PreviewScene(system, library, time_offset=offset, seed=seed)
         except Exception as err:  # noqa: BLE001
             IO_PDX_LOG.error("particle preview build failed: %s (%s)", system.name, err)
             missing.append(system.name)
@@ -914,6 +917,12 @@ class IOPDX_PT_PDXparticles(Panel):
         layout.operator("io_pdx_particles.import", icon="FILEBROWSER",
                         text="Load from file ...")
 
+        # 种子：只影响「载入/重载时」生成的随机量，改完要 Reload 才生效
+        # （重建预览代价不小，不做成自动触发）。
+        row = layout.row(align=True)
+        row.prop(scene, "io_pdx_particle_seed", text="Seed")
+        row.operator("io_pdx_particles.reload", text="", icon="FILE_REFRESH")
+
         if not _ACTIVE:
             # 模块级 _ACTIVE 不持久化：重开 .blend、或 Blender 重载脚本后，
             # 场景里可能还留着上次的预览对象，但已经没人驱动它们了。
@@ -1094,6 +1103,12 @@ def register():
                     "Leave empty or press Detect to find it automatically",
         subtype="DIR_PATH",
         default="",
+    )
+    bpy.types.Scene.io_pdx_particle_seed = IntProperty(  # type: ignore
+        name="Seed",
+        description="Random seed for per-particle variation. Same seed gives the "
+                    "same result every time; change it to reshuffle every system",
+        default=0,
     )
     # 帧处理器：先清掉同名残留（重载/重装会留下引用旧模块的旧对象），再挂当前的。
     # append 前用 _find_stale_handlers 去重是必要的：处理器现在是 @persistent 的，
