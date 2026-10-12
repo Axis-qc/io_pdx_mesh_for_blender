@@ -292,7 +292,7 @@ class PdxSubsystem:
         "sphere_radius", "sphere_yaw", "sphere_pitch",
         "emitter_yaw", "emitter_pitch", "has_emitter_rot",
         "texture_file", "texture_shader", "sheet_x", "sheet_y", "sheet_anim", "sheet_loop",
-        "color", "alpha", "position",
+        "color", "color_var", "alpha", "position",
         "start", "duration", "velocity_pitch", "velocity_yaw", "velocity",
         "life", "emission", "size", "particle_yaw", "particle_pitch",
         "rotation", "rotation_speed", "rotation_speed_pitch", "rotation_speed_yaw",
@@ -349,14 +349,17 @@ class PdxSubsystem:
 
         color = node.child("color")
         if color is not None:
-            self.color = (
-                _pair(color.child("x"), 255.0)[0] / 255.0,
-                _pair(color.child("y"), 255.0)[0] / 255.0,
-                _pair(color.child("z"), 255.0)[0] / 255.0,
-            )
+            # 三个通道各自也是「值 方差」：原版 572/663/562 个子系统写了非零方差
+            # （如 y={ 150 20 }、z={ 80 20 }），只取 [0] 会把每颗粒子的颜色抖动丢掉。
+            cr = _pair(color.child("x"), 255.0)
+            cg = _pair(color.child("y"), 255.0)
+            cb = _pair(color.child("z"), 255.0)
+            self.color = (cr[0] / 255.0, cg[0] / 255.0, cb[0] / 255.0)
+            self.color_var = (cr[1] / 255.0, cg[1] / 255.0, cb[1] / 255.0)
             a = color.child("alpha")
         else:
             self.color = (1.0, 1.0, 1.0)
+            self.color_var = (0.0, 0.0, 0.0)
             a = None
         self.alpha = _triplet(a, 255.0)
         # position 轴序与世界不同：放 +X 写 pz，放 +Z 写 -px。

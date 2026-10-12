@@ -271,7 +271,17 @@ class SubsystemSim:
         # 原版仅 1 处这么写，按「不发射」实现与画面等价，且不必在积分里特判。
         if sub.mass[0] <= 0.0:
             self.rate = 0.0
-        self.start = sub.start[0] + time_offset
+        # 发射窗口起点。start 的方差是**整个子系统摇一次**（用户实测口径），
+        # 不是每颗粒子各摇一个延迟——后者会让同一个子系统内部也错开发射，
+        # 而原版语义是「这个发射器什么时候开始工作」。
+        # 原版 76 个子系统写了非零方差（如 start={ 0 4 }）。
+        start_var = sub.start[1]
+        if start_var:
+            # 用子系统自身（index/seq_offset）摇一次，与粒子序号无关，保证确定
+            self.start = max(sub.start[0] + start_var * (2.0 * _hash01(
+                (max(index, 0) * 0x9E3779B1 + 0x1234567) & 0xFFFFFFFF) - 1.0), 0.0) + time_offset
+        else:
+            self.start = sub.start[0] + time_offset
         # 同一系统里多个子系统错开哈希输入（seq_offset），避免它们发出完全相同的
         # 落点图案（同参数的两个子系统本来会长得一模一样）。
         self.seq_offset = max(index, 0) * 97
@@ -310,18 +320,28 @@ class SubsystemSim:
         # 实机校准（kaiju_gobble_planet）：amount=-4 的 point 吸力 10s 拉升约 200 单位，
         # 反推 a ≈ amount 本身 → division 不折算（其语义未定，先当无操作，参数保留展示）。
 
-        # box / sphere 发射尺寸
-        bx = sub.box_x
-        by = sub.box_y
-        bz = sub.box_z
+        # box / sphere 发射尺寸。
+        # 三个轴都要取方差：原版大量写成 `{ 0 方差 }`（x 442 / y 462 / z 672 个），
+        # 只取基准值会让这些发射器塌成一个点——实测 736 个子系统三轴基准全 0、
+        # 只写方差，旧实现下它们 60 颗粒子的位置完全相同。
+        bx, by, bz = sub.box_x, sub.box_y, sub.box_z
         self.box_half_x = bx[0] if sub.emitter_type == "box" else 0.0
         self.box_half_y = by[0] if sub.emitter_type == "box" else 0.0
         self.box_half_z = bz[0] if sub.emitter_type == "box" else 0.0
+        self.box_var_x = bx[1] if sub.emitter_type == "box" else 0.0
+        self.box_var_y = by[1] if sub.emitter_type == "box" else 0.0
+        self.box_var_z = bz[1] if sub.emitter_type == "box" else 0.0
         sr = sub.sphere_radius
         self.sphere_r = sr[0] if sub.emitter_type == "sphere" else 0.0
         self.sphere_r_var = sr[1] if sub.emitter_type == "sphere" else 0.0
         self.sphere_yaw = sub.sphere_yaw
         self.sphere_pitch = sub.sphere_pitch
+
+        # 颜色抖动：每颗粒子在基色上 ± 方差的随机偏移（原版 R/G/B 各约 570~660 个
+        # 子系统写了非零方差）。parser 层曾只取 [0] 把这部分整个丢掉。
+        self.color_var_r = sub.color_var[0]
+        self.color_var_g = sub.color_var[1]
+        self.color_var_b = sub.color_var[2]
 
         # 是否走向量化积分：带 _VEC_FORCE_TYPES 列出的力场才划算（point/turbulence
         # 逐粒子大量三角函数，vortex/spin 逐粒子叉积）。实测有 turbulence 时 3.65x，
@@ -527,17 +547,23 @@ class SubsystemSim:
         w_rotv = self._w(i, 8)                   # 自转角速度
         w_pit = self._w(i, 9)                    # 面片基角 pitch 的随机扰动
         w_yaw = self._w(i, 10)                   # 面片基角 yaw 的随机扰动
+        w_cr = self._w(i, 11)                    # 颜色 R 通道抖动
+        w_cg = self._w(i, 12)                    # 颜色 G 通道抖动
+        w_cb = self._w(i, 13)                    # 颜色 B 通道抖动
 
         w0 = w_life
         life = self.life + self.life_var * (2.0 * w0 - 1.0)
         life = max(life, 0.05)
 
-        # 发射点
-        if sub.emitter_type == "box" and (self.box_half_x or self.box_half_y or self.box_half_z):
-            px = (2.0 * w_pos1 - 1.0) * self.box_half_x
-            py = (2.0 * w_pos2 - 1.0) * self.box_half_y
-            pz = (2.0 * w_pos3 - 1.0) * self.box_half_z
-        elif sub.emitter_type == "sphere" and self.sphere_r > 0.0:
+        # 发射点。判定条件必须把方差也算上：原版大量发射器写成「基准 0 + 方差」，
+        # 只看基准会把它们判成点发射（球面 148 个、box 736 个）。真正的点发射是
+        # 基准与方差都为 0 的那些（球面 61 个），它们仍然走 else。
+        if sub.emitter_type == "box" and (self.box_half_x or self.box_half_y or self.box_half_z
+                                          or self.box_var_x or self.box_var_y or self.box_var_z):
+            px = (self.box_half_x + self.box_var_x * (2.0 * w_pos1 - 1.0))
+            py = (self.box_half_y + self.box_var_y * (2.0 * w_pos2 - 1.0))
+            pz = (self.box_half_z + self.box_var_z * (2.0 * w_pos3 - 1.0))
+        elif sub.emitter_type == "sphere" and (self.sphere_r > 0.0 or self.sphere_r_var > 0.0):
             # 球面点：半径 ± 方差，yaw/pitch 在给定范围内取。
             # 角度与 velocity/emitter 同一套（probe 实测）：只给一个轴全向 →
             # 垂直于另一轴的环，两个都给才成球（标定件明确记载的行为）。
@@ -589,8 +615,15 @@ class SubsystemSim:
         # yaw_var 非零 830。billboard=yes 的这两个字段引擎本身忽略。
         b_pitch = sub.particle_pitch[0] + self.pitch_var * (2.0 * w_pit - 1.0)
         b_yaw = sub.particle_yaw[0] + self.yaw_var * (2.0 * w_yaw - 1.0)
+        # 颜色抖动：同样是发射时定死的逐粒子偏移（原版 R/G/B 各约 570~660 个
+        # 子系统写了非零方差，如 y={ 150 20 }）。存偏移量而不是绝对值，这样
+        # snapshot 里叠加颜色动画（anim_r/g/b）时不会错位。
+        c_r = self.color_var_r * (2.0 * w_cr - 1.0)
+        c_g = self.color_var_g * (2.0 * w_cg - 1.0)
+        c_b = self.color_var_b * (2.0 * w_cb - 1.0)
 
-        self.particles.append([t, life, px, py, pz, d[0] * v, d[1] * v, d[2] * v, angvel, ang0, w0, b_pitch, b_yaw])    # ---- 物理 ----
+        self.particles.append([t, life, px, py, pz, d[0] * v, d[1] * v, d[2] * v, angvel, ang0, w0,
+                               b_pitch, b_yaw, c_r, c_g, c_b])    # ---- 物理 ----
 
     def _accel(self, p, v, t):
         ax = ay = az = 0.0
@@ -801,9 +834,9 @@ class SubsystemSim:
             if size <= 0.0:
                 continue
             alpha = _apply_anim(self.alpha_base + self.alpha_var * (2.0 * p[10] - 1.0), self.alpha_anim, u)
-            r = _apply_anim(sub.color[0], self.anim_r, u)
-            g = _apply_anim(sub.color[1], self.anim_g, u)
-            b = _apply_anim(sub.color[2], self.anim_b, u)
+            r = _clamp(_apply_anim(sub.color[0] + p[13], self.anim_r, u), 0.0, 1.0)
+            g = _clamp(_apply_anim(sub.color[1] + p[14], self.anim_g, u), 0.0, 1.0)
+            b = _clamp(_apply_anim(sub.color[2] + p[15], self.anim_b, u), 0.0, 1.0)
             a = _clamp(alpha, 0.0, 1.0)
             if a <= 0.0:
                 continue

@@ -1202,6 +1202,10 @@ if _mz:
 # 且**不是脉冲发射**——脉冲子系统在 t=2.0 可能正落在静默相，本来就没有粒子
 # （实测 glow_glitch 的 pulse_period=2.5、lightning_burst=6.6，两者在 2 秒时
 # 都处于停发段），不排除它们会把正确实现误判成失败。
+# 同理排除**带 start 方差**的：start={ 0 2 } 这类会摇出最多 2 秒的启动延迟，
+# 实测 extra_dimensional_anchor_station_lightning_effect/lightning 摇到 1.746 秒、
+# 速率 1.0，2 秒时按闭式解还不足一颗粒子——那是平方差语义的正确表现，
+# 不是「发不出来」。这条断言要验的是 mass 通道，不该被启动延迟干扰。
 _ok_mass = True
 _checked_mass = 0
 for _sy in sample(list(lib.systems.values()), 80):
@@ -1212,6 +1216,8 @@ for _sy in sample(list(lib.systems.values()), 80):
         if _sb.emission[0] < 1.0 or _sb.duration[0] >= 0.0 or _sb.start[0] > 0.0:
             continue
         if _sb.max_amount < 1 or _s.pulse_period > 0.0:
+            continue
+        if _sb.start[1] > 0.0:
             continue
         _checked_mass += 1
         _s.advance(2.0)
@@ -1443,6 +1449,128 @@ if _seed_sys is not None:
     check("不同种子产生不同图案", bool(_a1) and _a1 != _b and _b != _c0)
 else:
     print("  (跳过种子检查：未找到 colossus 样本)")
+
+print()
+print("=" * 78)
+print("13. 「基准 + 方差」字段的第二值是否真的被用上")
+print("=" * 78)
+print("   同类漏用在本仓库出现过多次，都是「解析层读到了、模拟层没用第二个值」。")
+print("   这里逐字段验：方差非零的样本，逐粒子取值必须散开。")
+
+
+def _spread_of(sysname, subname, team=60):
+    """返回 (粒子数, 去重位置数, 去重颜色偏移数)。"""
+    _sim = S.SystemSim(lib.systems[sysname])
+    _st = next((x for x in _sim.subs if x.name == subname), None)
+    if _st is None:
+        return (0, 0, 0)
+    for _i in range(team):
+        _st.spawn_count = _i
+        _st._spawn(0.0)
+    _pos = set((round(p[2], 3), round(p[3], 3), round(p[4], 3)) for p in _st.particles)
+    _col = set((round(p[13], 4), round(p[14], 4), round(p[15], 4)) for p in _st.particles)
+    return (len(_st.particles), len(_pos), len(_col))
+
+
+# 13a 球面半径写成「基准 0 + 方差」：必须散开（曾经全从原点发射）
+_sph_var = None
+for _n, _sy in lib.systems.items():
+    for _sb in _sy.subsystems:
+        if (not _sb.hide and _sb.emitter_type == "sphere"
+                and _sb.sphere_radius[0] <= 0.0 and _sb.sphere_radius[1] > 0.0):
+            _sph_var = (_n, _sb.name)
+            break
+    if _sph_var:
+        break
+if _sph_var:
+    _nn, _pp, _ = _spread_of(*_sph_var)
+    check("球面半径 {0 方差} 会散开（不再全在原地）", _pp > 1,
+          "{0}/{1}: {2} 颗 {3} 个位置".format(_sph_var[0][:24], _sph_var[1], _nn, _pp))
+else:
+    check("找到球面半径只写方差的样本", False)
+
+# 13b 真值样本：用户报的 DustParticlesOrange
+_dust = ("infernal_system_crisis_star_file", "DustParticlesOrange")
+if _dust[0] in lib.systems:
+    _nn, _pp, _ = _spread_of(*_dust, team=80)
+    check("DustParticlesOrange 从原点改为球壳发射", _pp > 1,
+          "{0} 颗 {1} 个位置".format(_nn, _pp))
+else:
+    print("  (跳过 DustParticlesOrange：未找到该系统)")
+
+# 13c box 三轴只写方差：必须散开（曾经塌成单点）
+_box_var = None
+for _n, _sy in lib.systems.items():
+    for _sb in _sy.subsystems:
+        if (not _sb.hide and _sb.emitter_type == "box"
+                and _sb.box_x[0] <= 0 and _sb.box_y[0] <= 0 and _sb.box_z[0] <= 0
+                and (_sb.box_x[1] > 0 or _sb.box_y[1] > 0 or _sb.box_z[1] > 0)):
+            _box_var = (_n, _sb.name)
+            break
+    if _box_var:
+        break
+if _box_var:
+    _nn, _pp, _ = _spread_of(*_box_var)
+    check("box 三轴 {0 方差} 会散开（不再塌成单点）", _pp > 1,
+          "{0}/{1}: {2} 颗 {3} 个位置".format(_box_var[0][:24], _box_var[1], _nn, _pp))
+else:
+    check("找到 box 只写方差的样本", False)
+
+# 13d 颜色三通道方差：逐粒子抖动必须不同（曾经在解析层就被丢弃）
+_col_var = None
+for _n, _sy in lib.systems.items():
+    for _sb in _sy.subsystems:
+        if not _sb.hide and max(_sb.color_var) > 1e-9:
+            _col_var = (_n, _sb.name)
+            break
+    if _col_var:
+        break
+if _col_var:
+    _nn, _, _cc = _spread_of(*_col_var)
+    check("颜色方差产生逐粒子抖动", _cc > 1,
+          "{0}/{1}: {2} 颗 {3} 种偏移".format(_col_var[0][:24], _col_var[1], _nn, _cc))
+else:
+    check("找到带颜色方差的样本", False)
+
+# 13e 相反方向：没有方差的字段不能凭空抖动（防止把 0 方差也算进去）
+_zero = None
+for _n, _sy in lib.systems.items():
+    for _sb in _sy.subsystems:
+        if (not _sb.hide and not any(_sb.color_var)
+                and _sb.emitter_type == "point"):
+            _zero = (_n, _sb.name)
+            break
+    if _zero:
+        break
+if _zero:
+    _nn, _, _cc = _spread_of(*_zero)
+    check("无颜色方差时不做抖动", _cc <= 1, "{0} 种偏移".format(_cc))
+
+# 13f start 方差：整个子系统摇一次（同一子系统内所有粒子同一起点）
+_start_var = None
+for _n, _sy in lib.systems.items():
+    for _sb in _sy.subsystems:
+        if not _sb.hide and _sb.start[1] > 0.0:
+            _start_var = (_n, _sb.name, _sb)
+            break
+    if _start_var:
+        break
+if _start_var:
+    _n0, _s0, _sb0 = _start_var
+    _a = S.SystemSim(lib.systems[_n0])
+    _aa = next((x for x in _a.subs if x.name == _s0), None)
+    _b = S.SystemSim(lib.systems[_n0])
+    _bb = next((x for x in _b.subs if x.name == _s0), None)
+    _base0 = _sb0.start[0]
+    check("start 方差整子系统摇一次（同参数两次构建一致）",
+          _aa is not None and abs(_aa.start - _bb.start) < 1e-12,
+          "start={0} vs {1}".format(round(_aa.start, 3) if _aa else None,
+                                    round(_bb.start, 3) if _bb else None))
+    check("start 方差确实可能推迟启动（≥基准值）",
+          _aa is not None and _aa.start >= _base0 - 1e-9,
+          "基准 {0} 实测 {1}".format(_base0, round(_aa.start, 3) if _aa else None))
+else:
+    check("找到带 start 方差的样本", False)
 
 print()
 print("=" * 78)
