@@ -53,7 +53,9 @@ First set the game folder (there is a `Detect` button) and your own mod folders 
 
 The index covers the whole `gfx/` tree and groups entries by the folder they live in; each category shows its entry count and can be hidden by clicking its eye icon, and `Mod only` keeps just your own mod's content. Press `Rescan` after installing a new mod. Building the index takes about 3 seconds for the vanilla game. Picking a file by hand is still there under `Load from file ...` at the bottom of the panel.
 
-Particle timing is in seconds at a fixed 60 frames per second, independent of the scene frame rate.
+Particle timing is in seconds and uses the scene's `render.fps`, which you can change. Importing a skeletal animation retimes it to the same frame rate, so both the animation and the particles keep the duration they have in game.
+
+Selecting a model or entity lists the skeletal animations that go with it (entities list theirs by `state`, models list the animations that reference them); pick one and press `Load animation`. Switching entries clears what the previous load created and leaves your own scene objects alone.
 
 Supported: billboards and fixed orientation, point/sphere/box emitters, emitter rotation, per-particle variance, pulsed emission, three-axis spin, size/alpha/colour animation curves, textures and sprite sheets, and the `point` / `planar` / `vortex` / `spin` / `turbulence` / `friction` force fields.
 
@@ -63,13 +65,13 @@ Particles share the model's axes, so a preview lines up with an imported ship fo
 
 Import picks the busiest frame automatically. The `Seed` field controls per-particle randomness (lifetime, speed, spawn position, orientation, colour); the same seed always reproduces the same result, and the refresh button next to it reloads after a change. The default 0 staggers subsystems by index.
 
-Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered; `local_space` has no effect on the preview. The `Entity` tab places particles on the mount point named by the entity's `node` field; mount points come from the model where it has them, and `locator` blocks written in the entity itself are created as needed. When there is no `node`, or the name does not match, particles stay at the origin and a note goes to the log.
+Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered; `local_space` has no effect on the preview; an entity's `attach` chain is not expanded, so only the selected entity loads; the state machine (`state_time` / `looping` / `next_state`) is not simulated and events only start after their `time`. The `Entity` tab places particles on the mount point named by the entity's `node` field; mount points come from the model where it has them, and `locator` blocks written in the entity itself are created as needed. When there is no `node`, or the name does not match, particles stay at the origin and a note goes to the log.
 
-`version` is 0.98.1, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
+`version` is 0.99.0, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
 
 ### Usage notes
 
-Uniform scale on export, bone naming, import order, writing translation, coordinate mapping, particle field variance, and the order to debug an animation that misbehaves in game are covered in [使用注意事项.md](使用注意事项.md) (Chinese).
+Uniform scale on export, bone naming, import order, writing translation, coordinate mapping, particle field variance, animation frame rate and duration, and the order to debug an animation that misbehaves in game are covered in [使用注意事项.md](使用注意事项.md) (Chinese).
 
 ### License and credits
 

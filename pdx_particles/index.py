@@ -126,6 +126,14 @@ class PDXIndex(object):
         # （plasma_cannon_medium_hit_effect → plasma_cannon_hit_effect），
         # 按本体名直接查会漏掉。
         self.reg_to_body = {}
+        # ---- 骨骼动画链（三层，缺一层都到不了文件）----
+        # pdxmesh 名 → {动画 id: 动画注册名}
+        # .gfx 里写 animation = { id = "survey" type = "survey_base_effect_animation" }，
+        # entity 的 state.animation 用的正是这个 id，不是动画名。
+        self.pdxmesh_anims = {}
+        # 动画注册名 → .anim 绝对路径（.asset 里 animation = { name, file }，
+        # file 相对该 .asset 所在目录）
+        self.anim_defs = {}
 
     # ---------------------------------------------------------------- build
 
@@ -180,6 +188,14 @@ class PDXIndex(object):
                 if name and rel:
                     abs_mesh = os.path.normpath(os.path.join(root, rel.replace("\\", os.sep)))
                     pdxmesh_defs.setdefault(name, (abs_mesh, root, is_vanilla))
+                # animation = { id = "...", type = "..." }：id 是 entity state 里
+                # 用的状态别名，type 才指向 .asset 的动画注册名。同一个 pdxmesh 可
+                # 有多条（实测 3087 条分布在 1150 个 pdxmesh 上）。
+                for anim in blk.child_values("animation"):
+                    aid = _text_of(anim, "id")
+                    atype = _text_of(anim, "type")
+                    if name and aid and atype:
+                        self.pdxmesh_anims.setdefault(name, {}).setdefault(aid, atype)
             for reg in top.child_values("pdxparticle"):
                 name = _text_of(reg, "name")
                 if not name:
@@ -201,6 +217,20 @@ class PDXIndex(object):
         except Exception:  # noqa: BLE001
             return
         for top in tops:
+            # animation 这个键含义重载，只能按字段判：
+            #   .asset 的 animation = { name, file }    → 骨骼动画注册（2469 处）
+            #   .gfx   的 animation = { id, type }      → pdxmesh 上的 id 映射（3087 处）
+            #   state = { animation = "survey" }        → 叶子标量（6346 处）
+            #   particle .asset 的 animation = { name, start, duration, curve, ... }
+            #                                           → 粒子通道动画，与骨骼无关
+            # 前三者互斥（重叠 0）；第四类带 name 但**没有 file**，所以要求
+            # (name, file) 同时存在即可把它排除，不会误收成骨骼动画注册。
+            if top.key == "animation":
+                nm = _text_of(top, "name")
+                rel = _text_of(top, "file")
+                if nm and rel:
+                    self.anim_defs.setdefault(nm, os.path.normpath(
+                        os.path.join(os.path.dirname(path), rel.replace("\\", os.sep))))
             if top.key in SYSTEM_KEYS:
                 try:
                     system = PdxParticleSystem(top, path)
@@ -228,7 +258,23 @@ class PDXIndex(object):
                                 when = 0.0
                             particles.append({"particle": p, "node": _text_of(ev, "node"),
                                               "time": when})
-                # entity 自带的挂点（实测 8429 个 entity 里 2160 个有，占 25.6%）：
+                # 各 state 的骨骼动画。值是 pdxmesh 上的动画 id（不是动画名），
+                # 要经 pdxmesh_anims 换注册名再换文件；实体的动画与粒子可以同时
+                # 存在（实测 1300 个 entity 两者都有），也可能只有动画（1526 个）。
+                anims = []
+                for state in top.child_values("state"):
+                    aid = _text_of(state, "animation")
+                    if not aid:
+                        continue
+                    spd = state.child("animation_speed")
+                    try:
+                        speed = (float(spd.value)
+                                 if spd is not None and spd.value is not None else 1.0)
+                    except (TypeError, ValueError):
+                        speed = 1.0
+                    anims.append({"state": _text_of(state, "name"), "id": aid,
+                                  "speed": speed})
+                # 实体自带的挂点（实测 8429 个 entity 里 2160 个有，占 25.6%）：
                 # 这些点不在 .mesh 里，只导入模型不会建出它们，必须自己解析。
                 locators = []
                 for loc in top.child_values("locator"):
@@ -244,7 +290,7 @@ class PDXIndex(object):
                     locators.append({"name": lname, "position": xyz})
                 simple = [p["particle"] for p in particles]
                 entities.append((name, _text_of(top, "pdxmesh"), particles, simple,
-                                 locators, path, root, is_vanilla))
+                                 locators, anims, path, root, is_vanilla))
 
     # ------------------------------------------------------------- entries
 
@@ -263,9 +309,38 @@ class PDXIndex(object):
             stem = os.path.splitext(os.path.basename(path))[0]
             pdxnames = sorted(by_mesh.get(key, []))
             keys = [stem.lower()] + [n.lower() for n in pdxnames]
+            # 这个模型能被哪些动画驱动：把每个 pdxmesh 名上的 id 映射摊平。
             self.entries.append(IndexEntry(
                 KIND_MODEL, stem, keys, path, _category_of(root, path),
-                root, is_vanilla, {"pdxmesh": pdxnames}))
+                root, is_vanilla, {"pdxmesh": pdxnames,
+                                   "animations": self._anims_of(pdxnames)}))
+
+    def _anims_of(self, pdxmesh_names):
+        """pdxmesh 名列表 → [{id, type, file}]（同一动画去重）。
+
+        实测 2968 个 .mesh 里 974 个带动画映射；id 是 state 用的别名，
+        type 才指向 .asset 注册名，file 是最终 .anim（解析不出就留空）。
+        """
+        out = []
+        seen = set()
+        for name in pdxmesh_names:
+            for aid, atype in (self.pdxmesh_anims.get(name) or {}).items():
+                key = (aid, atype)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({"id": aid, "type": atype,
+                            "file": self.anim_file(atype)})
+        return out
+
+    def anim_file(self, anim_type):
+        """动画注册名 → .anim 绝对路径；未注册或文件不存在返回 ""。
+
+        文件不存在也当解析失败：注册指向的 .anim 实测 2457/2457 都在，
+        真缺了说明是坏数据，让界面显示空比给个点不开的路径好。
+        """
+        p = self.anim_defs.get(anim_type) or ""
+        return p if p and os.path.isfile(p) else ""
 
     def _build_particles(self, regs):
         # 注册项的 type 指向本体；本体分类优先（更贴近用户找的位置）
@@ -284,22 +359,36 @@ class PDXIndex(object):
                 {"type": typ, "scale": scale, "resolved": has_body}))
 
     def _build_entities(self, entities, pdxmesh_defs):
-        for name, pdxmesh, particles, simple, locators, src, root, is_vanilla in entities:
+        for (name, pdxmesh, particles, simple, locators, state_anims,
+             src, root, is_vanilla) in entities:
             mesh = ""
             if pdxmesh:
                 hit = pdxmesh_defs.get(pdxmesh)
                 if hit:
                     mesh = hit[0]
+            # state.animation 存的是 pdxmesh 上的动画 id，经该 pdxmesh 的映射换
+            # 成动画注册名，再经注册表换成文件。entity 与它的 pdxmesh 一一对应，
+            # 所以只用自己那个 pdxmesh 的映射（实测 6346 条 state 动画全部命中，
+            # 不会误取到别的模型的同名 id）。
+            table = self.pdxmesh_anims.get(pdxmesh) or {}
+            anims = []
+            for sa in state_anims:
+                atype = table.get(sa["id"], "")
+                anims.append({"state": sa["state"], "id": sa["id"],
+                              "speed": sa["speed"], "type": atype,
+                              "file": self.anim_file(atype) if atype else ""})
             keys = [name.lower()]
             if pdxmesh:
                 keys.append(pdxmesh.lower())
             keys.extend(p.lower() for p in simple)
+            keys.extend(a["id"].lower() for a in anims)
             self.entries.append(IndexEntry(
                 KIND_ENTITY, name, keys, src, _category_of(root, src),
                 root, is_vanilla,
                 {"pdxmesh": pdxmesh, "mesh": mesh, "particles": simple,
                  "events": particles, "locators": locators,
-                 "has_particle": bool(simple)}))
+                 "animations": anims,
+                 "has_particle": bool(simple), "has_anim": bool(anims)}))
 
     # -------------------------------------------------------------- query
 
@@ -325,8 +414,14 @@ class PDXIndex(object):
             return self.library.systems.get(body)
         return None
 
-    def query(self, kind, text="", disabled=(), mod_only=False, require_particle=False):
-        """按分类禁用、来源与关键字过滤。disabled 为分类名集合。"""
+    def query(self, kind, text="", disabled=(), mod_only=False, require_particle=False,
+              require_content=False):
+        """按分类禁用、来源与关键字过滤。disabled 为分类名集合。
+
+        require_content：只要「有粒子或有动画」的条目（Entity 页用）。与
+        require_particle 分开是因为 entity 里 1526 个只有骨骼动画、没有粒子，
+        只按粒子筛会把它们整片挡在列表外。
+        """
         out = []
         for e in self.entries:
             if e.kind != kind:
@@ -337,6 +432,10 @@ class PDXIndex(object):
                 continue
             if require_particle and not e.detail.get("has_particle", True):
                 continue
+            if require_content:
+                d = e.detail
+                if not (d.get("has_particle") or d.get("has_anim")):
+                    continue
             if not e.matches(text):
                 continue
             out.append(e)

@@ -37,11 +37,16 @@ from .index import (
     KIND_PARTICLE,
     PDXIndex,
 )
-from .simulator import PARTICLE_FPS
+from .simulator import scene_fps
 from .blender_preview import PreviewScene, view_rotation_key
 
 # 活动预览列表（模块级；跨 .blend 不持久化，重开文件后重新导入即可）
 _ACTIVE = []
+
+# 加载动画后当前 action 对应的 .anim 路径（模块级，仅用于界面回显）
+_ACTIVE_ANIM = ""
+# 上次重定时所用的 fps，draw 里只读比对用（写 ID 属性会截断面板绘制）
+_ANIM_RETIMED_FPS = None
 
 # 视口跟随：billboard 面片要朝向「界面里的实际镜头」，而 Blender 没有「视口旋转」
 # 事件，也没有 screen.areas.active（5.2 实测不存在），只能靠定时器轮询镜头角度。
@@ -329,10 +334,10 @@ def _import_file(context, path):
 def _import_loaded(context, loaded, missing, library):
     """已解析好的 (system, offset) 列表 → 建预览、选帧、出画面。"""
     scene = context.scene
-    # 帧与秒的换算用固定基准 PARTICLE_FPS（60）：粒子数据里的时间量都是秒，
-    # 场景 render.fps 只是显示属性，不能拿它换算（否则同一份粒子在不同 fps
-    # 的场景里速度不同，低发射速率的粒子还会因为时间轴过短而永远不出现）。
-    fps = PARTICLE_FPS
+    # 帧与秒的换算用场景 render.fps：粒子数据里的时间量都是秒，按场景 fps 换算
+    # 才能让时长与实机一致（写死 60 时，24fps 场景里 2 秒效果会播成 5 秒）。
+    # 骨骼动画由 import_animfile(retime_to=...) 重定时到同一个 fps，两者对齐。
+    fps = scene_fps(scene)
 
     max_end = 0.0
     total_n = 0
@@ -374,7 +379,7 @@ def _import_loaded(context, loaded, missing, library):
     # 不必再让 refresh() 从 0 重放一遍——那正是导入耗时里最大的一笔
     # （par_01 实测 pick_frame 28.96s + refresh 重放 30.39s，合计约 60s）。
     scene.frame_set(best_frame)
-    t_target = (scene.frame_current - scene.frame_start) / PARTICLE_FPS
+    t_target = (scene.frame_current - scene.frame_start) / fps
     for preview in list(_ACTIVE):
         try:
             sim = preview.sim
@@ -463,17 +468,19 @@ class IOPDX_OT_particle_reload(Operator):
 
 
 class IOPDX_OT_particle_clear(Operator):
-    """Remove all particle preview objects and collections"""
+    """Remove everything this addon loaded (previews and models)"""
     bl_idname = "io_pdx_particles.clear"
-    bl_label = "Clear previews"
-    bl_description = "Delete all particle preview objects/collections"
+    bl_label = "Clear loaded"
+    bl_description = "Delete every object this addon loaded (previews and models)"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         n = len(_ACTIVE)
         _clear_previews()
+        removed = _clear_loaded(context)
         context.scene.io_pdx_particle_entries.clear()
-        self.report({"INFO"}, "Removed {0} preview(s)".format(n))
+        context.scene.io_pdx_anim_items.clear()
+        self.report({"INFO"}, "Removed {0} preview(s), {1} object(s)".format(n, removed))
         return {"FINISHED"}
 
 
@@ -513,6 +520,7 @@ MAX_LIST_ROWS = 20000   # 近万条填充实测 <10ms，留个上限只为防病
 _INDEX = None
 _INDEX_KEY = None
 _SHOWN = []             # 与列表行一一对应，供加载时取回原始条目
+_ANIM_SHOWN = []        # 动画列表行对应的动画字典（选中的模型/实体决定它）
 _REBUILDING = False     # 重建分类列表期间抑制 enabled 回调（见 _category_enabled_update）
 # 列表当前对应的索引标识。draw() 是只读上下文（写 ID 属性会抛
 # "Writing to ID classes in this context is not allowed"，且异常会截断整个面板），
@@ -655,14 +663,15 @@ def _rebuild_asset_list(context):
     scene = context.scene
     kind = scene.io_pdx_asset_tab
     index = _ensure_index()
-    # 实体页只列带粒子的：本页的用途就是「模型 + 粒子一起看」
-    require_particle = kind == KIND_ENTITY
+    # 实体页列「有粒子或有动画」的：entity 里有 1526 个只有骨骼动画没粒子，
+    # 只按粒子筛会把它们整片挡住，而它们正是动画列表的主要来源。
+    require_content = kind == KIND_ENTITY
     entries = index.query(
         kind,
         text=scene.io_pdx_asset_filter or "",
         disabled=_disabled_for(scene, kind),
         mod_only=scene.io_pdx_index_mod_only,
-        require_particle=require_particle,
+        require_content=require_content,
     )
     _SHOWN = entries[:MAX_LIST_ROWS]
     scene.io_pdx_asset_items.clear()
@@ -676,11 +685,52 @@ def _rebuild_asset_list(context):
     scene.io_pdx_asset_index = 0
     scene.io_pdx_index_status = "{0} shown / {1} matched  ·  index {2} files in {3}s".format(
         len(_SHOWN), total, index.stats.get("files", 0), index.stats.get("seconds", 0))
+    # 列表换了一批，选中的条目也跟着变，动画列表必须同步重建
+    _rebuild_anim_list(context)
     return len(_SHOWN)
+
+
+def _anim_rows(entry):
+    """条目对应的骨骼动画行。模型页与实体页共用同一套行结构。"""
+    if entry is None:
+        return []
+    return list(entry.detail.get("animations") or [])
+
+
+def _rebuild_anim_list(context):
+    """按当前选中的条目填充动画列表。
+
+    模型页看「这个 .mesh 能被哪些动画驱动」，实体页看「这个 entity 的各个
+    state 用什么动画」。两者在索引里都摊平成 {id,type,file}，取不到文件的行
+    也列出来但标 no file，便于发现坏数据而不是静默少一行。
+    """
+    global _ANIM_SHOWN
+    scene = context.scene
+    entry = _selected_entry(scene)
+    _ANIM_SHOWN = _anim_rows(entry)
+    scene.io_pdx_anim_items.clear()
+    for a in _ANIM_SHOWN:
+        item = scene.io_pdx_anim_items.add()
+        item.name = a.get("id") or ""
+        item.state = a.get("state") or ""
+        item.type_name = a.get("type") or ""
+        item.detail = (os.path.basename(a.get("file") or "")
+                       if a.get("file") else "no file")
+    scene.io_pdx_anim_index = 0
+    return len(_ANIM_SHOWN)
 
 
 def _asset_filter_update(self, context):
     _rebuild_asset_list(context)
+
+
+def _asset_index_update(self, context):
+    """列表选中行变化 → 重建动画列表。
+
+    template_list 本身没有选中回调，挂在 active 索引属性上；这里是正常的
+    ID 属性写入上下文（不是 draw），所以可以安全重建。
+    """
+    _rebuild_anim_list(context)
 
 
 def _list_token():
@@ -882,6 +932,34 @@ class AssetListItem(PropertyGroup):
     vanilla: BoolProperty()     # noqa: F821
 
 
+class AnimListItem(PropertyGroup):
+    """动画列表里的一行（骨架动画：模型页/实体页共用）。"""
+    name: StringProperty()       # noqa: F821  动画 id（state 里写的那个）
+    state: StringProperty()      # noqa: F821  所属 state 名（模型页为空）
+    type_name: StringProperty()  # noqa: F821  动画注册名
+    detail: StringProperty()     # noqa: F821  .anim 文件名或 no file
+
+
+class LoadedObject(PropertyGroup):
+    """本插件加载出来的对象名，供下次加载前精确清理。
+
+    只记名字不记引用：对象可能已被用户删掉或随文件释放，名字查不到就跳过。
+    """
+    name: StringProperty()  # noqa: F821
+
+
+class IOPDX_UL_animations(UIList):
+    """骨架动画列表：id + state + 文件。"""
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_prop,
+                  index, flt_flag):
+        row = layout.row(align=True)
+        row.label(text=item.name, icon="RENDER_ANIMATION")
+        if item.state:
+            row.label(text=item.state)
+        row.label(text=item.detail)
+
+
 class IOPDX_UL_asset_items(UIList):
     """条目列表：名字 + 右侧说明，来源是原版时标一个标记。"""
 
@@ -1071,13 +1149,80 @@ def _selected_entry(scene):
     return _SHOWN[idx]
 
 
-def _load_mesh_path(path):
+def _snapshot_objects():
+    """当前场景里的对象名集合，用来算「这次加载新增了什么」。"""
+    return {o.name for o in bpy.data.objects}
+
+
+def _mark_loaded(context, before):
+    """把本次加载新增的对象记进场景属性，供下次加载前清理。
+
+    记在场景属性而不是模块级变量：模块状态跨 .blend 不保留，重开文件后清理
+    清单就丢了，旧对象会一直留在场景里（正是要修的问题）。场景属性跟着文件走。
+    """
+    if before is None:
+        return
+    scene = context.scene
+    known = {e.name for e in scene.io_pdx_loaded_objects}
+    for name in _snapshot_objects() - before:
+        if name in known:
+            continue
+        scene.io_pdx_loaded_objects.add().name = name
+
+
+def _clear_loaded(context):
+    """删掉上一次由本插件加载出来的对象（只删这些）。
+
+    用户自己的对象、相机、灯光一律不动：清单里只有加载前后差集。
+    顺带清掉这些骨架上的 action 与无人引用的数据块，否则切换几十次之后
+    action / mesh / material 会一路堆积。
+    """
+    global _ACTIVE_ANIM
+    scene = context.scene
+    names = [e.name for e in scene.io_pdx_loaded_objects]
+    scene.io_pdx_loaded_objects.clear()
+    if not names:
+        return 0
+
+    actions = set()
+    removed = 0
+    for name in names:
+        obj = bpy.data.objects.get(name)
+        if obj is None:
+            continue          # 用户已自己删掉，不算错
+        try:
+            if obj.type == "ARMATURE" and obj.animation_data is not None:
+                act = obj.animation_data.action
+                if act is not None:
+                    actions.add(act)
+            data = obj.data
+            bpy.data.objects.remove(obj, do_unlink=True)
+            removed += 1
+            # 对象的数据块（mesh/armature）在只有它引用时一并释放
+            if data is not None and getattr(data, "users", 0) == 0:
+                if isinstance(data, bpy.types.Mesh):
+                    bpy.data.meshes.remove(data)
+                elif isinstance(data, bpy.types.Armature):
+                    bpy.data.armatures.remove(data)
+        except Exception as err:  # noqa: BLE001
+            IO_PDX_LOG.error("failed to remove %s: %s", name, err)
+
+    for act in actions:
+        if act.users == 0:
+            bpy.data.actions.remove(act)
+    _ACTIVE_ANIM = ""
+    return removed
+
+
+def _load_mesh_path(path, reuse_skeleton=False):
     """导入 .mesh（复用模型导入流程）。
 
     延迟 import：pdx_blender 包在导入期会回头 import 本模块，模块级互相引用会成环。
+    reuse_skeleton=False：场景里可能留着上一个模型的同名骨架，复用它会让新网格
+    静默蒙皮到旧骨架上（不报错、动起来不对），浏览器加载必须新建。
     """
     from ..pdx_blender.blender_import_export import import_meshfile
-    import_meshfile(path)
+    import_meshfile(path, reuse_skeleton=reuse_skeleton)
 
 
 def _resolve_system(index, name):
@@ -1132,9 +1277,13 @@ def _load_entity(context, entry, index):
     detail = entry.detail
     mesh = detail.get("mesh") or ""
     loaded_any = False
+    # 清掉上一次加载的残留（只清本插件建的），再记下这次的新增
+    _clear_previews()
+    _clear_loaded(context)
+    before = _snapshot_objects()
     if mesh and os.path.isfile(mesh):
         try:
-            _load_mesh_path(mesh)
+            _load_mesh_path(mesh, reuse_skeleton=False)
             loaded_any = True
         except Exception as err:  # noqa: BLE001
             IO_PDX_LOG.error("entity mesh import failed: %s (%s)", mesh, err)
@@ -1194,7 +1343,171 @@ def _load_entity(context, entry, index):
     if unmatched:
         IO_PDX_LOG.warning("entity particle/mount not found: %s",
                            ", ".join(sorted(set(unmatched))))
+    # 记录这次新建的对象（模型、locator EMPTY、粒子对象），下次加载前清掉
+    _mark_loaded(context, before)
     return loaded_any
+
+
+def _find_rig():
+    """场景里唯一的骨架；没有或多于一个都返回 None。"""
+    rigs = [o for o in bpy.data.objects if o.type == "ARMATURE"]
+    return rigs[0] if len(rigs) == 1 else None
+
+
+def _any_rig():
+    return next((o for o in bpy.data.objects if o.type == "ARMATURE"), None)
+
+
+def _rig_for_anim(path):
+    """给这个 .anim 挑骨名匹配的骨架。
+
+    不能要求「场景里只有一个骨架」：一个 .mesh 里可以合法地挂多个带 skeleton
+    的 shape（move_indicator.mesh 实测 3 个），导入后会建出多个骨架。导入器
+    import_animfile 自己也是按骨名找匹配的骨架并要求唯一，这里必须用同一套
+    判据，否则多骨架模型点 Load 会直接报「没有骨架」。
+
+    拿不到骨名或匹配不唯一时返回 None，交由导入器抛它自己的错误。
+    """
+    from ..pdx_blender.blender_import_export import (
+        clean_imported_name,
+        get_rig_from_bone_name,
+        read_animation_bone_names,
+    )
+
+    try:
+        bone_names = read_animation_bone_names(path)
+    except Exception:  # noqa: BLE001
+        return None
+    if not bone_names:
+        return None
+
+    matched = []
+    for name in bone_names:
+        rig = get_rig_from_bone_name(clean_imported_name(name))
+        if rig is not None and rig not in matched:
+            matched.append(rig)
+    return matched[0] if len(matched) == 1 else None
+
+
+def _particle_end_frame():
+    """当前粒子预览需要的时间轴末帧；没有预览时返回 0。
+
+    取预览自身的时长而不是 scene.frame_end：后者在新场景里是默认的 250，
+    拿它做并集会给时间轴垫上一段与内容无关的空帧。
+    """
+    if not _ACTIVE:
+        return 0
+    fps = scene_fps(bpy.context.scene)
+    end = 0.0
+    for preview in list(_ACTIVE):
+        try:
+            end = max(end, preview.sim.total_duration())
+        except ReferenceError:
+            _ACTIVE.remove(preview)
+    return int(math.ceil(end * fps)) + 1 if end > 0.0 else 0
+
+
+def _union_frame_end(anim_end, particle_end):
+    """动画末关键帧与粒子末帧的并集末帧。
+
+    向上取整而不是四舍五入：末关键帧带小数时（实测 198.408），round 会得到
+    198 < 198.408，最后那点采样落在时间轴之外看不到。粒子侧已经是整帧，取 max。
+    """
+    anim = int(math.ceil(float(anim_end))) if anim_end else 0
+    return max(anim, int(particle_end or 0))
+
+
+def _import_anim(path, retime_to=None):
+    """导入一个 .anim 到场景里的骨架。
+
+    retime_to 给定时把动画重定时到该 fps（时长不变），并保持场景 fps 不被
+    动画文件改写——场景 fps 是用户设定的统一时间基准，粒子也按它换算。
+    导入器不新建 action，是往骨架当前挂着的 action 里写，所以这里显式解绑再
+    新建一个，保证切换动画时上一个不被覆盖（这也是列表能来回切的前提）。
+    """
+    from ..pdx_blender.blender_import_export import import_animfile
+
+    rig = _rig_for_anim(path) or _find_rig()
+    if rig is None:
+        raise RuntimeError("no armature matching this animation in the scene")
+
+    if rig.animation_data is None:
+        rig.animation_data_create()
+    # 先解绑：直接建 action 再赋值时，数据可能落到上一个 action 上（实测会把
+    # 时间轴叠加、range 被撑长）。
+    rig.animation_data.action = None
+    act = bpy.data.actions.new(os.path.splitext(os.path.basename(path))[0])
+    slot = act.slots.new(id_type="OBJECT", name=rig.name)
+    rig.animation_data.action = act
+    rig.animation_data.action_slot = slot
+
+    kwargs = {"retime_to": retime_to} if retime_to else {}
+    import_animfile(path, frame_start=1, **kwargs)
+    act.use_fake_user = True
+
+    # 时间轴取「动画与粒子的并集」：粒子预览把 frame_end 设到 max_end×fps，
+    # 动画导入器又会按动画帧数写一遍，两边互相截短。这里取两者较长的一边，
+    # 动画与粒子才能一起看完。
+    if retime_to:
+        from ..pdx_blender.blender_import_export import action_frame_range
+
+        scene = bpy.context.scene
+        span = action_frame_range(act)
+        if span:
+            scene.frame_start = 1
+            scene.frame_end = _union_frame_end(span[1], _particle_end_frame())
+    return rig, act
+
+
+class IOPDX_OT_asset_anim_load(Operator):
+    """Load the animation selected in the animation list"""
+    bl_idname = "io_pdx_particles.load_anim"
+    bl_label = "Load animation"
+    bl_description = ("Load the selected skeletal animation onto the scene armature "
+                      "(retimed to the scene fps so its duration is unchanged)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        global _ACTIVE_ANIM, _ANIM_RETIMED_FPS
+        scene = context.scene
+        idx = scene.io_pdx_anim_index
+        if not (0 <= idx < len(_ANIM_SHOWN)):
+            self.report({"WARNING"}, "Select an animation in the list first")
+            return {"CANCELLED"}
+        anim = _ANIM_SHOWN[idx]
+        path = anim.get("file") or ""
+        if not path or not os.path.isfile(path):
+            self.report({"ERROR"}, "Animation file not found: {0}".format(
+                anim.get("type") or anim.get("id") or "?"))
+            return {"CANCELLED"}
+
+        # 场景里没有骨架时先按当前条目把模型导进来，否则点 Load 必然报错
+        if _any_rig() is None:
+            entry = _selected_entry(scene)
+            mesh = (entry.detail.get("mesh") if entry is not None else "") or ""
+            if mesh and os.path.isfile(mesh):
+                before = _snapshot_objects()
+                try:
+                    _load_mesh_path(mesh, reuse_skeleton=False)
+                except Exception as err:  # noqa: BLE001
+                    self.report({"ERROR"}, "Mesh import failed: {0}".format(err))
+                    return {"CANCELLED"}
+                _mark_loaded(context, before)
+            else:
+                self.report({"ERROR"}, "No armature in the scene — load a model first")
+                return {"CANCELLED"}
+
+        before = _snapshot_objects()
+        try:
+            _import_anim(path, retime_to=scene_fps(scene))
+        except Exception as err:  # noqa: BLE001
+            self.report({"ERROR"}, "Animation import failed: {0}".format(err))
+            return {"CANCELLED"}
+        _mark_loaded(context, before)
+        _ACTIVE_ANIM = path
+        _ANIM_RETIMED_FPS = scene_fps(scene)
+        self.report({"INFO"}, "Loaded animation {0}".format(os.path.basename(path)))
+        return {"FINISHED"}
 
 
 class IOPDX_OT_asset_load(Operator):
@@ -1211,13 +1524,18 @@ class IOPDX_OT_asset_load(Operator):
             self.report({"WARNING"}, "Select an entry in the list first")
             return {"CANCELLED"}
         index = _ensure_index()
+        # 每次加载前先清掉上一次由本插件加载的对象，避免切换时上一个的残留
+        _clear_previews()
 
         if entry.kind == KIND_MODEL:
+            _clear_loaded(context)
+            before = _snapshot_objects()
             try:
-                _load_mesh_path(entry.path)
+                _load_mesh_path(entry.path, reuse_skeleton=False)
             except Exception as err:  # noqa: BLE001
                 self.report({"ERROR"}, "Mesh import failed: {0}".format(err))
                 return {"CANCELLED"}
+            _mark_loaded(context, before)
             self.report({"INFO"}, "Loaded model {0}".format(entry.name))
             return {"FINISHED"}
 
@@ -1225,9 +1543,12 @@ class IOPDX_OT_asset_load(Operator):
             typ = entry.detail.get("type") or ""
             scene.io_pdx_particle_entries.clear()
             _clear_previews()
+            _clear_loaded(context)
+            before = _snapshot_objects()
             if not _load_particle_system(context, typ, index):
                 self.report({"ERROR"}, "No body found for type '{0}'".format(typ))
                 return {"CANCELLED"}
+            _mark_loaded(context, before)
             self.report({"INFO"}, "Previewing {0}".format(entry.name))
             return {"FINISHED"}
 
@@ -1313,6 +1634,27 @@ class IOPDX_PT_PDXparticles(Panel):
                      text="Load selected")
         layout.operator("io_pdx_particles.import", icon="FILEBROWSER",
                         text="Load from file ...")
+
+        # ---- 骨骼动画（选中条目带的；模型页与实体页都有）----
+        # 选中行就加载动画，和粒子的「选中即预览」不同：动画会覆盖骨架当前动作，
+        # 误点等于白导一次。所以做成选中后点 Load。
+        box = layout.box()
+        box.label(text="Animations ({0}):".format(len(_ANIM_SHOWN)),
+                  icon="RENDER_ANIMATION")
+        if _ANIM_SHOWN:
+            box.template_list("IOPDX_UL_animations", "", scene,
+                              "io_pdx_anim_items", scene, "io_pdx_anim_index", rows=5)
+            box.operator("io_pdx_particles.load_anim", icon="IMPORT",
+                         text="Load animation")
+        else:
+            box.label(text="This entry has no skeletal animation", icon="INFO")
+        if _ACTIVE_ANIM:
+            box.label(text="Loaded: {0}".format(os.path.basename(_ACTIVE_ANIM)),
+                      icon="CHECKMARK")
+            if _ANIM_RETIMED_FPS and abs(_ANIM_RETIMED_FPS - scene_fps(scene)) > 1e-4:
+                # fps 改了但动画还没重新定时 → 时长会不对，提示重载
+                box.label(text="Scene fps changed — Load again to retime",
+                          icon="ERROR")
 
         # 种子改完要 Reload 才生效（不做成自动触发，重建预览代价不小）
         row = layout.row(align=True)
@@ -1411,9 +1753,12 @@ classes = (
     IndexCategory,
     DisabledCategory,
     AssetListItem,
+    AnimListItem,
+    LoadedObject,
     IOPDX_UL_particle_roots,
     IOPDX_UL_index_categories,
     IOPDX_UL_asset_items,
+    IOPDX_UL_animations,
     IOPDX_OT_import_particle,
     IOPDX_OT_particle_reload,
     IOPDX_OT_particle_clear,
@@ -1427,6 +1772,7 @@ classes = (
     IOPDX_OT_index_all_categories,
     IOPDX_OT_asset_filter_update,
     IOPDX_OT_asset_load,
+    IOPDX_OT_asset_anim_load,
     IOPDX_PT_PDXparticles,
 )
 
@@ -1520,7 +1866,11 @@ def register():
         update=_asset_tab_update,
     )
     bpy.types.Scene.io_pdx_asset_items = CollectionProperty(type=AssetListItem)
-    bpy.types.Scene.io_pdx_asset_index = IntProperty(default=0)
+    bpy.types.Scene.io_pdx_asset_index = IntProperty(
+        default=0, update=_asset_index_update)
+    bpy.types.Scene.io_pdx_anim_items = CollectionProperty(type=AnimListItem)
+    bpy.types.Scene.io_pdx_anim_index = IntProperty(default=0)
+    bpy.types.Scene.io_pdx_loaded_objects = CollectionProperty(type=LoadedObject)
     bpy.types.Scene.io_pdx_asset_filter = StringProperty(  # type: ignore
         name="Search",
         description="Show only entries whose name, pdxmesh name or particle name contains this",
@@ -1571,7 +1921,9 @@ def unregister():
     for name in ("io_pdx_asset_tab", "io_pdx_asset_items", "io_pdx_asset_index",
                  "io_pdx_asset_filter", "io_pdx_index_categories",
                  "io_pdx_index_category_index", "io_pdx_index_disabled",
-                 "io_pdx_index_mod_only", "io_pdx_index_status"):
+                 "io_pdx_index_mod_only", "io_pdx_index_status",
+                 "io_pdx_anim_items", "io_pdx_anim_index",
+                 "io_pdx_loaded_objects"):
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)
     for cls in reversed(classes):

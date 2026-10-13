@@ -24,12 +24,30 @@ except Exception:         # noqa: BLE001
 SUBSTEP = 1.0 / 120.0     # 物理子步（秒）
 _EPS = 1e-9
 
-# 粒子时间基准：1 秒 = 60 帧，与场景 render.fps 无关。
-# 粒子数据里的 start / duration / life / emission 全部以秒为单位
-# （emission = 每秒发射数），所以帧号与秒的换算必须用这个固定基准，
-# 不能用场景 fps：场景 fps 是可变的显示属性，拿它换算会让同一份粒子
-# 数据在不同 fps 的场景里算出不同的时间，回放速度与实际不符。
+# 粒子时间基准的兜底值：拿不到场景 fps 时才用它（纯 Python 测试、无 bpy 环境）。
+# 实际使用时统一取场景 render.fps —— 粒子数据里的 start / duration / life /
+# emission 全部以秒为单位（emission = 每秒发射数），所以「帧号 ÷ fps = 秒」。
+# 用场景 fps 才能让粒子时长与实机一致：写死 60 时，24 fps 的场景里 2 秒的效果
+# 会摊成 120 帧、播 5 秒（慢 2.5 倍）。骨骼动画同样按场景 fps 重定时，两者统一。
 PARTICLE_FPS = 60
+
+
+def scene_fps(scene=None):
+    """当前场景的帧率（帧/秒）；取不到时回退 PARTICLE_FPS。
+
+    render.fps_base 必须一起算：它是 fps 的分母，非整数帧率（23.976）靠它表达。
+    """
+    try:
+        if scene is None:
+            import bpy  # noqa: PLC0415
+
+            scene = bpy.context.scene
+        base = float(getattr(scene.render, "fps_base", 1.0) or 1.0)
+        fps = float(scene.render.fps) / base
+        return fps if fps > 0.0 else float(PARTICLE_FPS)
+    except Exception:  # noqa: BLE001
+        return float(PARTICLE_FPS)
+
 
 # 预览时长上限（秒）：防病态参数（极低 emission）拉出几万帧的时间轴。
 MAX_PREVIEW_SECONDS = 60.0

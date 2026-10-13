@@ -1010,14 +1010,16 @@ def create_locator(PDX_locator, PDX_bone_dict):
     return new_loc
 
 
-def create_skeleton(PDX_bone_list, convert_bonespace=False):
+def create_skeleton(PDX_bone_list, convert_bonespace=False, reuse=True):
     # keep track of bones as we create them (may not be created in indexed order)
     bone_list = [None for _ in range(0, len(PDX_bone_list))]
 
     # check this skeleton is not already built in the scene
+    # reuse=False 用于资源浏览器连续加载：场景里留着上一个模型的同名骨架时，
+    # 复用会让新网格静默蒙皮到旧骨架上（不报错，只是动起来不对）。
     matching_rigs = [get_rig_from_bone_name(clean_imported_name(bone.name)) for bone in PDX_bone_list]
     matching_rigs = list(set(rig for rig in matching_rigs if rig))
-    if len(matching_rigs) == 1:
+    if reuse and len(matching_rigs) == 1:
         IO_PDX_LOG.debug("matching armature already found in scene")
         return matching_rigs[0]
 
@@ -1399,6 +1401,59 @@ def bones_allow_fast_keys(rig):
     return True
 
 
+def iter_action_curves(action):
+    """Action 里的全部 f-curve。Blender 5.x 的 Action 没有 .fcurves 了。"""
+    if action is None:
+        return
+    for layer in action.layers:
+        for strip in layer.strips:
+            for channelbag in strip.channelbags:
+                for curve in channelbag.fcurves:
+                    yield curve
+
+
+def action_frame_range(action):
+    """所有关键帧的时间范围 (min, max)；没有关键帧返回 None。"""
+    lo = hi = None
+    for curve in iter_action_curves(action):
+        for kp in curve.keyframe_points:
+            x = kp.co.x
+            if lo is None or x < lo:
+                lo = x
+            if hi is None or x > hi:
+                hi = x
+    return None if lo is None else (lo, hi)
+
+
+def retime_action(action, factor):
+    """把动作整体缩放到新帧率，**动画时长（秒）不变**。
+
+    游戏内动画按文件内嵌 fps 插值到引擎帧率，时长是固定量；导入到 Blender
+    之后场景 fps 是用户可调的，不重定时就会出现「设 24 帧时动画快 1.6 倍」。
+    缩放绕第一个关键帧进行，起点保持在原处——直接对 x 乘 factor 会把整条
+    曲线平移（实测起点 1.0 会漂到 1.59），时间轴起点跟着错位。
+
+    返回处理的关键帧数。
+    """
+    rng = action_frame_range(action)
+    if rng is None or factor <= 0.0:
+        return 0
+    origin = rng[0]
+    n = 0
+    touched = []
+    for curve in iter_action_curves(action):
+        for kp in curve.keyframe_points:
+            kp.co.x = origin + (kp.co.x - origin) * factor
+            kp.handle_left.x = origin + (kp.handle_left.x - origin) * factor
+            kp.handle_right.x = origin + (kp.handle_right.x - origin) * factor
+            n += 1
+        touched.append(curve)
+    # 曲线改完必须 update，否则 Blender 仍按缓存的旧坐标求值
+    for curve in touched:
+        curve.update()
+    return n
+
+
 def build_action_curve_map(rig):
     """收集骨架动画数据里的所有 f-curve，键为 (data_path, array_index)。
 
@@ -1408,12 +1463,8 @@ def build_action_curve_map(rig):
     anim_data = rig.animation_data
     if anim_data is None or anim_data.action is None:
         return curve_map
-
-    for layer in anim_data.action.layers:
-        for strip in layer.strips:
-            for channelbag in strip.channelbags:
-                for curve in channelbag.fcurves:
-                    curve_map[(curve.data_path, curve.array_index)] = curve
+    for curve in iter_action_curves(anim_data.action):
+        curve_map[(curve.data_path, curve.array_index)] = curve
     return curve_map
 
 
@@ -1515,6 +1566,9 @@ def import_meshfile(meshpath, imp_mesh=True, imp_skel=True, imp_locs=True, join_
     # kwargs wrangling
     # correct bone orientation on import
     bonespace = kwargs.get("bonespace", False)
+    # 场景里已有同名骨架时是否复用它。默认 True，保持命令行与面板「Import」的
+    # 既有行为；资源浏览器传 False，避免新网格蒙皮到上一个模型留下的骨架上。
+    reuse_skeleton = kwargs.get("reuse_skeleton", True)
 
     start = time.time()
     IO_PDX_LOG.info("importing - {0}".format(meshpath))
@@ -1554,7 +1608,8 @@ def import_meshfile(meshpath, imp_mesh=True, imp_skel=True, imp_locs=True, join_
 
             if imp_skel:
                 IO_PDX_LOG.info("creating skeleton -")
-                rig = create_skeleton(pdx_bone_list, convert_bonespace=bonespace)
+                rig = create_skeleton(pdx_bone_list, convert_bonespace=bonespace,
+                                      reuse=reuse_skeleton)
 
         # then create all the meshes
         meshes = node.findall("mesh")
@@ -1808,6 +1863,19 @@ def export_meshfile(meshpath, exp_mesh=True, exp_skel=True, exp_locs=True, exp_s
     IO_PDX_LOG.info("export finished! ({0:.4f} sec)".format(time.time() - start))
 
 
+def read_animation_bone_names(animpath):
+    """动画文件里被驱动的骨骼名列表（原始 PDX 名，未清理）。
+
+    给「场景里有多个骨架时挑哪个」用：一个 .mesh 里可以合法地挂多个带
+    skeleton 的 shape，导入后会建出多个骨架，这时不能要求骨架唯一。
+    """
+    asset_elem = pdx_data.read_meshfile(animpath)
+    info = asset_elem.find("info")
+    if info is None:
+        return []
+    return [bone.tag for bone in info]
+
+
 @allow_debug_logging
 def import_animfile(animpath, frame_start=1, **kwargs):
     start = time.time()
@@ -1830,17 +1898,29 @@ def import_animfile(animpath, frame_start=1, **kwargs):
             "file playback speed is not a whole number ({0}) - scene fps has been set to {1}, the exact value will be "
             "restored on export.".format(file_fps, fps)
         )
-    IO_PDX_LOG.info("setting playback speed - {0}".format(fps))
-    try:
-        bpy.context.scene.render.fps = fps
-    except Exception as err:
-        IO_PDX_LOG.error(err)
-        raise RuntimeError("Unsupported animation speed. {0}".format(fps))  # noqa: B904
-    bpy.context.scene.render.fps_base = 1.0
+    # retime_to：把动画重定时到调用方指定的帧率并保持时长不变（浏览器用，见
+    # retime_action）。给了它就不动场景 fps——场景 fps 是用户设定的统一时间基准，
+    # 粒子也按它换算，不能被单个动画文件覆盖。
+    retime_to = kwargs.get("retime_to", None)
+    if retime_to:
+        IO_PDX_LOG.info("retiming to scene fps - {0} (file fps {1})".format(retime_to, file_fps))
+    else:
+        IO_PDX_LOG.info("setting playback speed - {0}".format(fps))
+        try:
+            bpy.context.scene.render.fps = fps
+        except Exception as err:
+            IO_PDX_LOG.error(err)
+            raise RuntimeError("Unsupported animation speed. {0}".format(fps))  # noqa: B904
+        bpy.context.scene.render.fps_base = 1.0
 
     IO_PDX_LOG.info("setting playback range - ({0},{1})".format(frame_start, (frame_start + framecount - 1)))
-    bpy.context.scene.frame_start = frame_start
-    bpy.context.scene.frame_end = frame_start + framecount - 1
+    if retime_to:
+        # 重定时模式下不写时间轴：动画与粒子共用一条时间轴，范围要取两者的
+        # 并集，由调用方在重定时完成后统一决定（见 ui._import_anim）。
+        pass
+    else:
+        bpy.context.scene.frame_start = frame_start
+        bpy.context.scene.frame_end = frame_start + framecount - 1
     bpy.context.scene.frame_set(frame_start)
 
     # find armature and bones being animated in the scene
@@ -1975,6 +2055,21 @@ def import_animfile(animpath, frame_start=1, **kwargs):
 
     bpy.context.scene.frame_set(frame_start)
     bpy.context.view_layer.update()
+
+    # 重定时：帧号按 目标fps/文件fps 缩放，动画时长（秒）严格不变。放在写完全部
+    # 关键帧之后，这样初始姿态那批与后续采样一起被缩放到同一时间基上。
+    # 时间轴范围不在这里改：浏览器要的是「动画与粒子的并集」，由调用方决定
+    # （见 ui._import_anim），这里擅自写会把已装载粒子的时间轴截短。
+    if retime_to:
+        factor = float(retime_to) / file_fps
+        n_keys = retime_action(rig.animation_data.action, factor)
+        span = action_frame_range(rig.animation_data.action)
+        # 记录目标 fps（不是文件内嵌值）：导出侧会读它写回 fps，若仍留着文件原值，
+        # 导出的帧号会被当成原 fps 的帧号，时长缩掉 factor 倍。
+        rig[PDX_ANIM_FPS_PROP] = float(retime_to)
+        IO_PDX_LOG.info(
+            "retimed {0} keys by {1:.6f} to {2} fps (range {3})".format(
+                n_keys, factor, retime_to, span))
 
     bpy.ops.object.select_all(action="DESELECT")
     IO_PDX_LOG.info("import finished! ({0:.4f} sec)".format(time.time() - start))

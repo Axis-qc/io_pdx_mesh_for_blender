@@ -30,7 +30,7 @@ try:
 except Exception:  # noqa: BLE001
     _NP = None
 
-from .simulator import PARTICLE_FPS, SystemSim
+from .simulator import SystemSim, scene_fps
 
 IO_LOG = logging.getLogger("io_pdx.particles")
 
@@ -651,15 +651,15 @@ class PreviewScene:
     def refresh(self):
         """按当前场景帧驱动模拟并刷新所有网格。
 
-        帧 → 秒 用固定的 PARTICLE_FPS（60），不用场景 render.fps：粒子数据里
-        的时间量全部以秒为单位，拿可变的场景 fps 换算会让同一份数据在不同
-        fps 的场景里跑出不同速度。
+        帧 → 秒 用场景 render.fps（scene_fps 兜底 60）。粒子数据里的时间量全部
+        以秒为单位，按场景 fps 换算才能让时长与实机一致；骨骼动画也重定时到
+        同一个 fps，两者的「秒」才对得上。
 
         面片朝向由 _view_basis 现取（视口 → 摄像机 → 兜底），所以帧驱动的刷新
         天然会用上最新视角。
         """
         scene = bpy.context.scene
-        t = (scene.frame_current - scene.frame_start) / PARTICLE_FPS
+        t = (scene.frame_current - scene.frame_start) / scene_fps(scene)
         self.sim.advance(max(t, 0.0))
         total = 0
         basis = self._view_basis()
@@ -694,7 +694,7 @@ class PreviewScene:
         # 空状态，用户看到的是「这个子系统整段消失」。这里显式推进一次。
         if enabled:
             scene = bpy.context.scene
-            t = (scene.frame_current - scene.frame_start) / PARTICLE_FPS
+            t = (scene.frame_current - scene.frame_start) / scene_fps(scene)
             for sp in self.sub_previews:
                 if sp.sub_sim.name == name:
                     sp.sub_sim.advance(max(t, 0.0))
