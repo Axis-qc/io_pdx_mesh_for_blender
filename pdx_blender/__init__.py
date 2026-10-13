@@ -19,6 +19,7 @@ from bpy.props import (  # type: ignore
 from bpy.types import PropertyGroup  # type: ignore
 
 from .. import ENGINE_SETTINGS, IO_PDX_LOG, IO_PDX_SETTINGS
+from .. import pdx_i18n
 from . import blender_import_export, blender_ui
 from .. import pdx_particles
 
@@ -108,6 +109,7 @@ classes.sort(key=lambda cls: cls.panel_order if hasattr(cls, "panel_order") else
 
 def register():
     IO_PDX_LOG.info("Loading Blender UI.")
+    pdx_i18n.register()
     for cls in classes:
         bpy.utils.register_class(cls)
 
@@ -125,6 +127,7 @@ def unregister():
     pdx_particles.unregister()
     for cls in classes:
         bpy.utils.unregister_class(cls)
+    pdx_i18n.unregister()
 
     # remove tool properties from scene
     del bpy.types.Scene.io_pdx_settings

@@ -67,7 +67,9 @@ git clone https://github.com/Axis-qc/io_pdx_mesh_for_blender.git
 
 已知限制：`childsystem` 嵌套子系统只解析并在日志里提示，不参与渲染；`local_space` 不影响预览；entity 的 `attach` 挂载链不展开，只加载选中的那一个；状态机（`state_time` / `looping` / `next_state`）不模拟，只按事件的 `time` 延迟起播。`Entity` 那一栏会把粒子挂到 entity 的 `node` 指定的挂点上，挂点优先用模型自带的，entity 自己写的 `locator` 会自动补建；没写 `node` 或名字对不上时粒子留在原点并在日志里提示。
 
-`version` 为 0.99.0，`current_git_tag` 保持 0.91 不动，让插件内置更新器仍以官方 0.91 为参照。
+界面文字做了本地化。所有界面文本以英文原文为键集中放在 `pdx_i18n.py`，跟着 Blender 的界面语言切换：界面是中文时显示中文，英文时回落英文原文。目前提供简体中文，加别的语言只需在同一个表里加一个语种键。
+
+`version` 为 0.99.1，`current_git_tag` 保持 0.91 不动，让插件内置更新器仍以官方 0.91 为参照。
 
 ### 使用注意事项
 

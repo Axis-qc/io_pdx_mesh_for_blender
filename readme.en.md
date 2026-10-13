@@ -67,7 +67,9 @@ Import picks the busiest frame automatically. The `Seed` field controls per-part
 
 Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered; `local_space` has no effect on the preview; an entity's `attach` chain is not expanded, so only the selected entity loads; the state machine (`state_time` / `looping` / `next_state`) is not simulated and events only start after their `time`. The `Entity` tab places particles on the mount point named by the entity's `node` field; mount points come from the model where it has them, and `locator` blocks written in the entity itself are created as needed. When there is no `node`, or the name does not match, particles stay at the origin and a note goes to the log.
 
-`version` is 0.99.0, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
+The interface is localised. All UI text is keyed by its English source string in `pdx_i18n.py` and follows Blender's interface language: Chinese when Blender is in Chinese, the English original otherwise. Simplified Chinese ships today; another language is one more key in the same table.
+
+`version` is 0.99.1, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
 
 ### Usage notes
 

@@ -23,6 +23,7 @@ from bpy.props import (  # type: ignore
 from bpy.types import Operator, Panel, PropertyGroup, UIList  # type: ignore
 
 from .. import IO_PDX_INFO, IO_PDX_LOG, IO_PDX_SETTINGS
+from .. import pdx_i18n
 from .parser import (
     ParticleLibrary,
     _infer_root,
@@ -430,7 +431,7 @@ class IOPDX_OT_import_particle(Operator):
     def execute(self, context):
         path = bpy.path.abspath(self.filepath)
         if not os.path.isfile(path):
-            self.report({"ERROR"}, "File not found: {0}".format(path))
+            self.report({"ERROR"}, pdx_i18n.rpt("File not found: {0}").format(path))
             return {"CANCELLED"}
 
         scene = context.scene
@@ -438,9 +439,9 @@ class IOPDX_OT_import_particle(Operator):
         _clear_previews()
         ok = _import_file(context, path)
         if not ok:
-            self.report({"ERROR"}, "No particle systems found in {0}".format(os.path.basename(path)))
+            self.report({"ERROR"}, pdx_i18n.rpt("No particle systems found in {0}").format(os.path.basename(path)))
             return {"CANCELLED"}
-        self.report({"INFO"}, "Loaded {0} particle system(s)".format(len(_ACTIVE)))
+        self.report({"INFO"}, pdx_i18n.rpt("Loaded {0} particle system(s)").format(len(_ACTIVE)))
         return {"FINISHED"}
 
 
@@ -448,7 +449,7 @@ class IOPDX_OT_particle_reload(Operator):
     """Reload and rebuild all loaded particle previews from their source files"""
     bl_idname = "io_pdx_particles.reload"
     bl_label = "Reload from source"
-    bl_description = "Re-parse the source files and rebuild previews (调参后刷新)"
+    bl_description = "Re-parse the source files and rebuild previews"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -463,7 +464,7 @@ class IOPDX_OT_particle_reload(Operator):
             res = _import_file(context, f)
             if res:
                 ok += 1
-        self.report({"INFO"}, "Reloaded {0}/{1} file(s)".format(ok, len(files)))
+        self.report({"INFO"}, pdx_i18n.rpt("Reloaded {0}/{1} file(s)").format(ok, len(files)))
         return {"FINISHED"}
 
 
@@ -480,7 +481,7 @@ class IOPDX_OT_particle_clear(Operator):
         removed = _clear_loaded(context)
         context.scene.io_pdx_particle_entries.clear()
         context.scene.io_pdx_anim_items.clear()
-        self.report({"INFO"}, "Removed {0} preview(s), {1} object(s)".format(n, removed))
+        self.report({"INFO"}, pdx_i18n.rpt("Removed {0} preview(s), {1} object(s)").format(n, removed))
         return {"FINISHED"}
 
 
@@ -894,7 +895,8 @@ def _pick_frame(previews, fps, max_end):
 
 
 class ParticleRoot(PropertyGroup):
-    path: StringProperty(name="Root", subtype="DIR_PATH")  # noqa: F821
+    path: StringProperty(name="Root", subtype="DIR_PATH",
+                         translation_context=pdx_i18n.CTX)  # noqa: F821
 
 
 def _category_enabled_update(self, context):
@@ -1014,7 +1016,7 @@ class IOPDX_OT_particle_add_root(Operator):
     def execute(self, context):
         p = bpy.path.abspath(self.filepath)
         if not os.path.isdir(p):
-            self.report({"ERROR"}, "Not a folder: {0}".format(p))
+            self.report({"ERROR"}, pdx_i18n.rpt("Not a folder: {0}").format(p))
             return {"CANCELLED"}
         for e in context.scene.io_pdx_particle_roots:
             if bpy.path.abspath(e.path) == p:
@@ -1062,11 +1064,11 @@ class IOPDX_OT_particle_detect_game(Operator):
         pick = roots[0]
         _set_vanilla_root(pick)
         if looks_like_game_root(pick):
-            self.report({"INFO"}, "Found: {0}".format(pick))
+            self.report({"INFO"}, pdx_i18n.rpt("Found: {0}").format(pick))
         else:
             self.report({"WARNING"},
-                        "Found {0} but it has no gfx/particles or gfx/models — "
-                        "pick the right folder manually".format(pick))
+                        pdx_i18n.rpt("Found {0} but it has no gfx/particles or gfx/models — "
+                        "pick the right folder manually").format(pick))
         return {"FINISHED"}
 
 
@@ -1106,7 +1108,7 @@ class IOPDX_OT_index_rescan(Operator):
         if not index.stats.get("files"):
             self.report({"ERROR"}, "Nothing found — set the game folder or add a mod folder")
             return {"CANCELLED"}
-        self.report({"INFO"}, "Indexed {0} files in {1}s".format(
+        self.report({"INFO"}, pdx_i18n.rpt("Indexed {0} files in {1}s").format(
             index.stats.get("files"), index.stats.get("seconds")))
         return {"FINISHED"}
 
@@ -1477,7 +1479,7 @@ class IOPDX_OT_asset_anim_load(Operator):
         anim = _ANIM_SHOWN[idx]
         path = anim.get("file") or ""
         if not path or not os.path.isfile(path):
-            self.report({"ERROR"}, "Animation file not found: {0}".format(
+            self.report({"ERROR"}, pdx_i18n.rpt("Animation file not found: {0}").format(
                 anim.get("type") or anim.get("id") or "?"))
             return {"CANCELLED"}
 
@@ -1490,7 +1492,7 @@ class IOPDX_OT_asset_anim_load(Operator):
                 try:
                     _load_mesh_path(mesh, reuse_skeleton=False)
                 except Exception as err:  # noqa: BLE001
-                    self.report({"ERROR"}, "Mesh import failed: {0}".format(err))
+                    self.report({"ERROR"}, pdx_i18n.rpt("Mesh import failed: {0}").format(err))
                     return {"CANCELLED"}
                 _mark_loaded(context, before)
             else:
@@ -1501,12 +1503,12 @@ class IOPDX_OT_asset_anim_load(Operator):
         try:
             _import_anim(path, retime_to=scene_fps(scene))
         except Exception as err:  # noqa: BLE001
-            self.report({"ERROR"}, "Animation import failed: {0}".format(err))
+            self.report({"ERROR"}, pdx_i18n.rpt("Animation import failed: {0}").format(err))
             return {"CANCELLED"}
         _mark_loaded(context, before)
         _ACTIVE_ANIM = path
         _ANIM_RETIMED_FPS = scene_fps(scene)
-        self.report({"INFO"}, "Loaded animation {0}".format(os.path.basename(path)))
+        self.report({"INFO"}, pdx_i18n.rpt("Loaded animation {0}").format(os.path.basename(path)))
         return {"FINISHED"}
 
 
@@ -1533,10 +1535,10 @@ class IOPDX_OT_asset_load(Operator):
             try:
                 _load_mesh_path(entry.path, reuse_skeleton=False)
             except Exception as err:  # noqa: BLE001
-                self.report({"ERROR"}, "Mesh import failed: {0}".format(err))
+                self.report({"ERROR"}, pdx_i18n.rpt("Mesh import failed: {0}").format(err))
                 return {"CANCELLED"}
             _mark_loaded(context, before)
-            self.report({"INFO"}, "Loaded model {0}".format(entry.name))
+            self.report({"INFO"}, pdx_i18n.rpt("Loaded model {0}").format(entry.name))
             return {"FINISHED"}
 
         if entry.kind == KIND_PARTICLE:
@@ -1546,18 +1548,18 @@ class IOPDX_OT_asset_load(Operator):
             _clear_loaded(context)
             before = _snapshot_objects()
             if not _load_particle_system(context, typ, index):
-                self.report({"ERROR"}, "No body found for type '{0}'".format(typ))
+                self.report({"ERROR"}, pdx_i18n.rpt("No body found for type '{0}'").format(typ))
                 return {"CANCELLED"}
             _mark_loaded(context, before)
-            self.report({"INFO"}, "Previewing {0}".format(entry.name))
+            self.report({"INFO"}, pdx_i18n.rpt("Previewing {0}").format(entry.name))
             return {"FINISHED"}
 
         ok = _load_entity(context, entry, index)
         if not ok:
-            self.report({"ERROR"}, "Entity '{0}' has no loadable mesh or particle".format(entry.name))
+            self.report({"ERROR"}, pdx_i18n.rpt("Entity '{0}' has no loadable mesh or particle").format(entry.name))
             return {"CANCELLED"}
         n = len(entry.detail.get("particles") or [])
-        self.report({"INFO"}, "Loaded entity {0} ({1} particle(s))".format(entry.name, n))
+        self.report({"INFO"}, pdx_i18n.rpt("Loaded entity {0} ({1} particle(s))").format(entry.name, n))
         return {"FINISHED"}
 
 
@@ -1574,6 +1576,7 @@ def _import_one(context, system, library):
 
 class IOPDX_PT_PDXparticles(Panel):
     bl_label = "Particles"
+    bl_translation_context = pdx_i18n.CTX
     bl_category = "PDX Blender Tools"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -1616,7 +1619,7 @@ class IOPDX_PT_PDXparticles(Panel):
         box = layout.box()
         head = box.row(align=True)
         n_dis = len(_disabled_for(scene, scene.io_pdx_asset_tab))
-        head.label(text="Categories ({0} off):".format(n_dis), icon="FILE_FOLDER")
+        head.label(text=pdx_i18n.iface("Categories ({0} off):").format(n_dis), icon="FILE_FOLDER")
         head.operator("io_pdx_particles.all_categories", text="All", icon="HIDE_OFF")
         rows = box.row(align=True)
         rows.template_list("IOPDX_UL_index_categories", "", scene,
@@ -1639,7 +1642,7 @@ class IOPDX_PT_PDXparticles(Panel):
         # 选中行就加载动画，和粒子的「选中即预览」不同：动画会覆盖骨架当前动作，
         # 误点等于白导一次。所以做成选中后点 Load。
         box = layout.box()
-        box.label(text="Animations ({0}):".format(len(_ANIM_SHOWN)),
+        box.label(text=pdx_i18n.iface("Animations ({0}):").format(len(_ANIM_SHOWN)),
                   icon="RENDER_ANIMATION")
         if _ANIM_SHOWN:
             box.template_list("IOPDX_UL_animations", "", scene,
@@ -1649,7 +1652,7 @@ class IOPDX_PT_PDXparticles(Panel):
         else:
             box.label(text="This entry has no skeletal animation", icon="INFO")
         if _ACTIVE_ANIM:
-            box.label(text="Loaded: {0}".format(os.path.basename(_ACTIVE_ANIM)),
+            box.label(text=pdx_i18n.iface("Loaded: {0}").format(os.path.basename(_ACTIVE_ANIM)),
                       icon="CHECKMARK")
             if _ANIM_RETIMED_FPS and abs(_ANIM_RETIMED_FPS - scene_fps(scene)) > 1e-4:
                 # fps 改了但动画还没重新定时 → 时长会不对，提示重载
@@ -1676,7 +1679,7 @@ class IOPDX_PT_PDXparticles(Panel):
             row.prop(entry, "visible", text="", icon=icon, toggle=True) if entry else None
             try:
                 n_sub = len(preview.sim.subs)
-                row.label(text="{0}  ({1} emitters)".format(preview.system.name, n_sub),
+                row.label(text=pdx_i18n.iface("{0}  ({1} emitters)").format(preview.system.name, n_sub),
                           icon="PARTICLE_POINT")
             except ReferenceError:
                 row.label(text="(deleted)", icon="ERROR")
@@ -1684,7 +1687,7 @@ class IOPDX_PT_PDXparticles(Panel):
         # 当前帧可见粒子数：为 0 时提示拖时间轴，而不是让用户对着一个点发呆
         shown = sum(getattr(p, "last_count", 0) for p in _ACTIVE)
         if shown:
-            layout.label(text="{0} particles at frame {1}".format(shown, scene.frame_current),
+            layout.label(text=pdx_i18n.iface("{0} particles at frame {1}").format(shown, scene.frame_current),
                          icon="PARTICLE_POINT")
         else:
             layout.label(text="No particles at this frame — scrub the timeline",
@@ -1725,11 +1728,11 @@ class IOPDX_PT_PDXparticles(Panel):
                                      s.anim_r, s.anim_g, s.anim_b) if n is not None]
                 anim_txt = ",".join(a.name for a in anims) if anims else "-"
                 row = diag.row(align=True)
-                row.label(text="{0}: {1}  pos{2}  {3}".format(
+                row.label(text=pdx_i18n.iface("{0}: {1}  pos{2}  {3}").format(
                     sub.name[:16], emit, pos, facing))
-                row.label(text="anim:{0}".format(anim_txt[:22]))
+                row.label(text=pdx_i18n.iface("anim:{0}").format(anim_txt[:22]))
                 if sub.unknown_keys:
-                    diag.label(text="   unused keys: {0}".format(
+                    diag.label(text=pdx_i18n.iface("   unused keys: {0}").format(
                         ", ".join(sorted(sub.unknown_keys))[:40]), icon="ERROR")
 
         col = layout.column(align=True)
@@ -1861,6 +1864,9 @@ def register():
     bpy.types.Scene.io_pdx_asset_tab = EnumProperty(  # type: ignore
         name="Tab",
         description="What to browse and load",
+        # 本插件的标签页术语（「标签页」）与 Blender 内置的「选项卡」不同，
+        # 挂自有上下文才不会显示成后者的措辞。
+        translation_context=pdx_i18n.CTX,
         items=_tab_items(),
         default=KIND_MODEL,
         update=_asset_tab_update,

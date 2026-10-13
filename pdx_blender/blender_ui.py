@@ -19,6 +19,7 @@ from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList  
 from bpy_extras.io_utils import ExportHelper, ImportHelper  # type: ignore
 
 from .. import ENGINE_SETTINGS, IO_PDX_INFO, IO_PDX_LOG, IO_PDX_SETTINGS
+from .. import pdx_i18n
 from ..pdx_data import PDXData
 from ..updater import github
 
@@ -403,7 +404,7 @@ class IOPDX_OT_import_mesh(Operator, ImportHelper):
                 join_materials=self.chk_joinmats,
                 bonespace=self.chk_bonespace,
             )
-            self.report({"INFO"}, "[io_pdx_mesh] Finished importing {}".format(self.filepath))
+            self.report({"INFO"}, pdx_i18n.rpt("[io_pdx_mesh] Finished importing {}").format(self.filepath))
             IO_PDX_SETTINGS.last_import_mesh = self.filepath
 
         except Exception as err:
@@ -465,7 +466,7 @@ class IOPDX_OT_import_anim(Operator, ImportHelper):
                 frame_start=self.int_start,
                 keyframe_mode="legacy" if self.chk_legacy_keys else "fast",
             )
-            self.report({"INFO"}, "[io_pdx_mesh] Finsihed importing {}".format(self.filepath))
+            self.report({"INFO"}, pdx_i18n.rpt("[io_pdx_mesh] Finsihed importing {}").format(self.filepath))
             IO_PDX_SETTINGS.last_import_anim = self.filepath
 
         except Exception as err:
@@ -589,7 +590,7 @@ class IOPDX_OT_export_mesh(Operator, ExportHelper):
                 sort_verts=self.ddl_sort_vtx,
                 plain_txt=self.chk_plain_txt,
             )
-            self.report({"INFO"}, "[io_pdx_mesh] Finsihed exporting {}".format(self.filepath))
+            self.report({"INFO"}, pdx_i18n.rpt("[io_pdx_mesh] Finsihed exporting {}").format(self.filepath))
             IO_PDX_SETTINGS.last_export_mesh = self.filepath
 
         except Exception as err:
@@ -691,7 +692,7 @@ class IOPDX_OT_export_anim(Operator, ExportHelper):
                 plain_txt=self.chk_plain_txt,
             )
 
-            self.report({"INFO"}, "[io_pdx_mesh] Finsihed exporting {}".format(self.filepath))
+            self.report({"INFO"}, pdx_i18n.rpt("[io_pdx_mesh] Finsihed exporting {}").format(self.filepath))
             IO_PDX_SETTINGS.last_export_anim = self.filepath
 
         except Exception as err:
@@ -768,7 +769,7 @@ class IOPDX_PT_PDXblender_info(PDXUI, Panel):
     panel_order = 0
 
     def draw(self, context):
-        self.layout.label(text="PDX Blender Tools - v{}".format(github.CURRENT_VERSION), icon="TOOL_SETTINGS")
+        self.layout.label(text=pdx_i18n.iface("PDX Blender Tools - v{}").format(github.CURRENT_VERSION), icon="TOOL_SETTINGS")
 
         row = self.layout.row(align=True)
         split = row.split(factor=0.85, align=True)
@@ -784,7 +785,8 @@ class IOPDX_PT_PDXblender_info(PDXUI, Panel):
             else:
                 update_url = github.LATEST_RELEASE
             col2.operator("wm.url_open", icon="OUTLINER_OB_LIGHT", text=btn_txt).url = str(update_url)
-        col1.operator("wm.url_open", icon="FUND", text="Donate").url = str(IO_PDX_INFO["sponsor_url"])
+        col1.operator("wm.url_open", icon="FUND", text="Donate",
+                      text_ctxt=pdx_i18n.CTX).url = str(IO_PDX_INFO["sponsor_url"])
         popup = col3.operator("io_pdx_mesh.popup_message", icon="INFO", text="")
         popup.msg_text = github.LATEST_NOTES
         popup.msg_icon = "INFO"
@@ -1011,7 +1013,7 @@ class IOPDX_OT_detect_game_root(Operator):
         try:
             roots = detect_game_roots()
         except Exception as err:  # noqa: BLE001
-            self.report({"WARNING"}, "Game folder detection failed: {0}".format(err))
+            self.report({"WARNING"}, pdx_i18n.rpt("Game folder detection failed: {0}").format(err))
             return {"CANCELLED"}
 
         if not roots:
@@ -1023,11 +1025,11 @@ class IOPDX_OT_detect_game_root(Operator):
         pick = roots[0]
         prefs.vanilla_root = pick
         if looks_like_game_root(pick):
-            self.report({"INFO"}, "Game folder: {0}".format(pick))
+            self.report({"INFO"}, pdx_i18n.rpt("Game folder: {0}").format(pick))
         else:
             self.report({"WARNING"},
-                        "Found {0} but it has no gfx/particles or gfx/models - "
-                        "set the folder manually".format(pick))
+                        pdx_i18n.rpt("Found {0} but it has no gfx/particles or gfx/models - "
+                        "set the folder manually").format(pick))
         return {"FINISHED"}
 
 
