@@ -514,6 +514,12 @@ _INDEX = None
 _INDEX_KEY = None
 _SHOWN = []             # 与列表行一一对应，供加载时取回原始条目
 _REBUILDING = False     # 重建分类列表期间抑制 enabled 回调（见 _category_enabled_update）
+# 列表当前对应的索引标识。draw() 是只读上下文（写 ID 属性会抛
+# "Writing to ID classes in this context is not allowed"，且异常会截断整个面板），
+# 所以重建不能在 draw 里做：draw 只比对，发现不一致就注册一个一次性定时器，
+# 真正的重建在 draw 之外执行。
+_LIST_KEY = None
+_REBUILD_SCHEDULED = False
 
 # 选帧时的模拟采样次数上限：整条时间轴按步长抽样，避免秒数很长时逐帧推进。
 SAMPLE_BUDGET = 2400
@@ -677,10 +683,57 @@ def _asset_filter_update(self, context):
     _rebuild_asset_list(context)
 
 
+def _list_token():
+    """列表内容当前的标识；索引键变了它就变。"""
+    return repr(_INDEX_KEY)
+
+
+def _schedule_rebuild():
+    """请求在 draw 之外重建列表。
+
+    draw() 不能写 ID 属性，所以发现列表过期时只能注册一个一次性定时器，
+    让它在本帧绘制结束后执行重建。已经在排队就不重复注册。
+    """
+    global _REBUILD_SCHEDULED
+    if _REBUILD_SCHEDULED:
+        return
+    _REBUILD_SCHEDULED = True
+
+    def _run():
+        global _REBUILD_SCHEDULED
+        _REBUILD_SCHEDULED = False
+        try:
+            ctx = bpy.context
+            _rebuild_categories(ctx)
+            _rebuild_asset_list(ctx)
+            _mark_list_current()
+            # 重画面板，让用户立刻看到结果
+            for win in ctx.window_manager.windows:
+                for area in win.screen.areas:
+                    if area.type == "VIEW_3D":
+                        area.tag_redraw()
+        except Exception as err:  # noqa: BLE001
+            IO_PDX_LOG.error("deferred asset list rebuild failed: %s", err)
+        return None      # 一次性
+
+    try:
+        bpy.app.timers.register(_run, first_interval=0.0)
+    except Exception as err:  # noqa: BLE001
+        _REBUILD_SCHEDULED = False
+        IO_PDX_LOG.error("could not schedule asset list rebuild: %s", err)
+
+
+def _mark_list_current():
+    """把「列表已对应当前索引」记到模块级变量（不能写场景属性，见 _LIST_KEY）。"""
+    global _LIST_KEY
+    _LIST_KEY = _list_token()
+
+
 def _asset_tab_update(self, context):
     context.scene.io_pdx_asset_filter = ""
     _rebuild_categories(context)
     _rebuild_asset_list(context)
+    _mark_list_current()
 
 
 
@@ -971,6 +1024,7 @@ class IOPDX_OT_index_rescan(Operator):
         index = _ensure_index(force=True)
         _rebuild_categories(context)
         _rebuild_asset_list(context)
+        _mark_list_current()
         if not index.stats.get("files"):
             self.report({"ERROR"}, "Nothing found — set the game folder or add a mod folder")
             return {"CANCELLED"}
@@ -994,6 +1048,7 @@ class IOPDX_OT_index_all_categories(Operator):
                 scene.io_pdx_index_disabled.remove(i)
         _rebuild_categories(context)
         _rebuild_asset_list(context)
+        _mark_list_current()
         return {"FINISHED"}
 
 
@@ -1213,14 +1268,13 @@ class IOPDX_PT_PDXparticles(Panel):
 
         # ---- 索引状态与重建 ----
         index = _ensure_index()
-        # 两个都要判：分类列表为空（首次打开 / 重开 .blend 后模块级索引丢了），
-        # 或索引本身换了内容（用户在偏好里改了游戏目录或增删了 mod 目录）——
-        # 后者若只看「列表是否为空」会漏掉，表现为面板还列着旧目录的内容。
-        token = repr(_INDEX_KEY)
-        if not scene.io_pdx_index_categories or scene.io_pdx_index_token != token:
-            scene.io_pdx_index_token = token
-            _rebuild_categories(context)
-            _rebuild_asset_list(context)
+        # draw() 是只读上下文：写 Scene 属性会抛
+        # "Writing to ID classes in this context is not allowed"，异常还会截断
+        # 整个面板（表现为标签页之后一片空白）。所以这里只比对，不写；发现过期
+        # 就登记一个一次性定时器，真正的重建在 draw 之外跑。
+        stale = (not scene.io_pdx_index_categories) or (_LIST_KEY != _list_token())
+        if stale:
+            _schedule_rebuild()
         row = layout.row(align=True)
         row.label(text="Game folder:", icon="FILE_FOLDER")
         row.operator("io_pdx_particles.rescan", icon="FILE_REFRESH", text="Rescan")
@@ -1229,6 +1283,9 @@ class IOPDX_PT_PDXparticles(Panel):
             box.label(text="No folder configured yet.", icon="INFO")
             box.label(text="Set it in Preferences > Add-ons > IO PDX Mesh,")
             box.label(text="or add a mod folder there, then Rescan.")
+            return
+        if stale:
+            layout.label(text="Building list ...", icon="TIME")
             return
 
         # ---- 搜索 ----
@@ -1480,8 +1537,6 @@ def register():
         update=_asset_filter_update,
     )
     bpy.types.Scene.io_pdx_index_status = StringProperty(default="")  # type: ignore
-    # 列表对应的索引标识；与当前索引不一致时 draw() 会重建列表
-    bpy.types.Scene.io_pdx_index_token = StringProperty(default="")  # type: ignore
     # 帧处理器：先清掉同名残留（重载/重装会留下引用旧模块的旧对象），再挂当前的。
     # append 前用 _find_stale_handlers 去重是必要的：处理器现在是 @persistent 的，
     # 会跨文件存活，不去重就会越积越多。
@@ -1516,8 +1571,7 @@ def unregister():
     for name in ("io_pdx_asset_tab", "io_pdx_asset_items", "io_pdx_asset_index",
                  "io_pdx_asset_filter", "io_pdx_index_categories",
                  "io_pdx_index_category_index", "io_pdx_index_disabled",
-                 "io_pdx_index_mod_only", "io_pdx_index_status",
-                 "io_pdx_index_token"):
+                 "io_pdx_index_mod_only", "io_pdx_index_status"):
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)
     for cls in reversed(classes):

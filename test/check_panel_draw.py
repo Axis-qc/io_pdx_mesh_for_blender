@@ -1,0 +1,180 @@
+"""
+面板 draw() 冒烟：真正调用 draw()，在只读上下文中检出「写 ID 属性」这类错误。
+
+跑法：
+    & 'G:\\SteamLibrary\\steamapps\\common\\Blender\\blender.exe' -b --factory-startup \
+      --python test/check_panel_draw.py
+
+这个检查是补课：此前的索引/UI 测试都直接调 _rebuild_*()，**从没真正执行过
+draw()**，于是「draw 里写 Scene 属性」这种必现错误全套测试都放过了，实际表现
+是面板从标签页往后整段空白（异常截断了绘制）。
+
+用假的 layout 调真实 draw()，layout 的方法全部可调用且返回自身，因此能走完整条
+代码路径；真出异常就会被捕获并报 FAIL。
+"""
+
+import os
+import sys
+import traceback
+
+sys.dont_write_bytecode = True
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(ROOT))
+
+import bpy  # noqa: E402
+
+PASS, FAIL = [], []
+
+
+def check(name, cond, detail=""):
+    (PASS if cond else FAIL).append(name)
+    print("  {0} {1}{2}".format("PASS" if cond else "FAIL", name,
+                                "  — " + detail if detail else ""))
+
+
+def enable_addon():
+    try:
+        return bpy.ops.preferences.addon_enable(module="io_pdx_mesh") == {"FINISHED"}
+    except Exception:  # noqa: BLE001
+        try:
+            import io_pdx_mesh
+            io_pdx_mesh.pdx_blender.register()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+
+class FakeLayout(object):
+    """把 layout 的所有调用都吞掉并返回自身，其余属性当标量。"""
+
+    def __init__(self):
+        self.text = ""
+        self.icon = ""
+
+    def __getattr__(self, name):
+        def f(*a, **kw):
+            return FakeLayout()
+        return f
+
+
+def make_panel_self():
+    import types
+    return types.SimpleNamespace(layout=FakeLayout())
+
+
+def main():
+    print("panel draw smoke check")
+    if not enable_addon():
+        print("SKIP: could not enable addon")
+        return 2
+
+    ui = None
+    for name, mod in list(sys.modules.items()):
+        if name.endswith(".pdx_particles.ui"):
+            ui = mod
+            break
+    check("ui module loaded", ui is not None)
+    if ui is None:
+        return 1
+
+    scene = bpy.context.scene
+
+    # 干净状态：清掉场景里的列表与禁用记录，模拟首次打开
+    scene.io_pdx_index_categories.clear()
+    scene.io_pdx_index_disabled.clear()
+    scene.io_pdx_asset_items.clear()
+    ui._LIST_KEY = None
+    ui._REBUILD_SCHEDULED = False
+
+    # ---- 1. 首次打开：draw 必须不抛异常 ----
+    try:
+        ui.IOPDX_PT_PDXparticles.draw(make_panel_self(), bpy.context)
+        check("draw() runs without raising (first open)", True)
+    except Exception:
+        check("draw() runs without raising (first open)", False,
+              traceback.format_exc().strip().splitlines()[-1])
+
+    # ---- 2. draw 不能写 ID 属性 ----
+    # 直接验证：draw 期间对 scene 的写入会被 Blender 拒绝（报错文本见 UI 日志）。
+    # 这里用静态检查抓「draw 函数体里对 scene 赋值」。
+    import inspect
+    src = inspect.getsource(ui.IOPDX_PT_PDXparticles.draw)
+    bad = []
+    for line in src.splitlines():
+        s = line.strip()
+        if s.startswith("#") or "==" in s or "!=" in s:
+            continue
+        if s.startswith(("scene.", "context.scene.")) and "=" in s:
+            bad.append(s)
+    check("draw() contains no Scene writes", not bad, "; ".join(bad))
+
+    # ---- 3. 列表过期时只登记定时器，不在 draw 里重建 ----
+    scene.io_pdx_index_categories.clear()
+    ui._LIST_KEY = "a-key-that-cannot-match"
+    ui._REBUILD_SCHEDULED = False
+    try:
+        ui.IOPDX_PT_PDXparticles.draw(make_panel_self(), bpy.context)
+        check("draw() survives a stale list", True)
+    except Exception:
+        check("draw() survives a stale list", False,
+              traceback.format_exc().strip().splitlines()[-1])
+    check("stale list schedules a deferred rebuild", ui._REBUILD_SCHEDULED is True)
+
+    # ---- 4. 定时器回调真的把列表建起来 ----
+    # 直接跑那个闭包：从计时器注册表拿不到函数，改为同步调用等价路径
+    ui._rebuild_categories(bpy.context)
+    ui._rebuild_asset_list(bpy.context)
+    ui._mark_list_current()
+    check("categories filled", len(scene.io_pdx_index_categories) > 0,
+          "n={0}".format(len(scene.io_pdx_index_categories)))
+    check("asset items filled", len(scene.io_pdx_asset_items) > 0,
+          "n={0}".format(len(scene.io_pdx_asset_items)))
+    check("list key marked current", ui._LIST_KEY == ui._list_token(),
+          "key={0}".format(ui._LIST_KEY))
+
+    # ---- 5. 列表就不再算过期，draw 走正常分支 ----
+    before = ui._REBUILD_SCHEDULED
+    ui._REBUILD_SCHEDULED = False
+    ui.IOPDX_PT_PDXparticles.draw(make_panel_self(), bpy.context)
+    check("fresh list does not reschedule", ui._REBUILD_SCHEDULED is False)
+
+    # ---- 6. 三个标签页都画得出来 ----
+    for tab in ("model", "particle", "entity"):
+        scene.io_pdx_asset_tab = tab
+        try:
+            ui.IOPDX_PT_PDXparticles.draw(make_panel_self(), bpy.context)
+            check("draw() runs for tab {0}".format(tab), True)
+        except Exception:
+            check("draw() runs for tab {0}".format(tab), False,
+                  traceback.format_exc().strip().splitlines()[-1])
+
+    # ---- 7. 无配置时也不能抛（走「没设目录」的早退分支）----
+    old_vanilla = scene.io_pdx_particle_vanilla_root
+    old_prefs = None
+    try:
+        scene.io_pdx_particle_vanilla_root = ""
+        ui._INDEX = None
+        ui._INDEX_KEY = None
+        ui._addon_prefs_override = None
+    except Exception:
+        pass
+    try:
+        ui.IOPDX_PT_PDXparticles.draw(make_panel_self(), bpy.context)
+        check("draw() survives an unconfigured state", True)
+    except Exception:
+        check("draw() survives an unconfigured state", False,
+              traceback.format_exc().strip().splitlines()[-1])
+    finally:
+        scene.io_pdx_particle_vanilla_root = old_vanilla
+        ui._INDEX = None
+        ui._INDEX_KEY = None
+
+    print("\n{0} passed / {1} failed".format(len(PASS), len(FAIL)))
+    if FAIL:
+        print("failed:", ", ".join(FAIL))
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

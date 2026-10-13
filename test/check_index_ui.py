@@ -260,19 +260,18 @@ def main():
         check("prefs expose the contract attributes",
               hasattr(prefs_obj, "vanilla_root") and hasattr(prefs_obj, "extra_roots"))
 
-    # ---- 8.6 索引换了内容后，面板必须重建列表 ----
+    # ---- 8.6 索引换了内容后，列表必须被判定过期 ----
     # 场景：用户在偏好里改掉游戏目录 → _ensure_index 换索引 → 列表不能还列旧内容。
-    scene.io_pdx_index_token = "stale-token-not-matching"
+    # 判据是模块级 _LIST_KEY（draw 里不能写 Scene 属性，见 check_panel_draw.py）。
     UI._INDEX = None
     UI._INDEX_KEY = None
     UI._ensure_index(force=True)
-    token_now = repr(UI._INDEX_KEY)
-    check("token changes when the index key changes",
-          token_now != "stale-token-not-matching", token_now)
-    # draw() 里用这个判据决定重建；这里直接验判据成立
-    needs_rebuild = (not scene.io_pdx_index_categories
-                     or scene.io_pdx_index_token != token_now)
-    check("draw() would rebuild after the index key changed", needs_rebuild)
+    UI._LIST_KEY = "a-key-that-cannot-match"
+    check("list is judged stale after the index key changes",
+          UI._LIST_KEY != UI._list_token(), UI._list_token())
+    UI._mark_list_current()
+    check("marking the list current clears staleness",
+          UI._LIST_KEY == UI._list_token(), UI._LIST_KEY)
 
     # ---- 9. 实际加载：模型进场景（走 load_selected 操作符）----
     scene.io_pdx_asset_tab = "model"
