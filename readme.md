@@ -65,7 +65,7 @@ git clone https://github.com/Axis-qc/io_pdx_mesh_for_blender.git
 
 已知限制：`childsystem` 嵌套子系统只解析并在日志里提示，不参与渲染；`local_space` 不影响预览。`Entity` 那一栏会把粒子挂到 entity 的 `node` 指定的挂点上，挂点优先用模型自带的，entity 自己写的 `locator` 会自动补建；没写 `node` 或名字对不上时粒子留在原点并在日志里提示。
 
-`version` 为 0.98.0，`current_git_tag` 保持 0.91 不动，让插件内置更新器仍以官方 0.91 为参照。
+`version` 为 0.98.1，`current_git_tag` 保持 0.91 不动，让插件内置更新器仍以官方 0.91 为参照。
 
 ### 使用注意事项
 

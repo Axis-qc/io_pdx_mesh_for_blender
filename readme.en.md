@@ -65,7 +65,7 @@ Import picks the busiest frame automatically. The `Seed` field controls per-part
 
 Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered; `local_space` has no effect on the preview. The `Entity` tab places particles on the mount point named by the entity's `node` field; mount points come from the model where it has them, and `locator` blocks written in the entity itself are created as needed. When there is no `node`, or the name does not match, particles stay at the origin and a note goes to the log.
 
-`version` is 0.98.0, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
+`version` is 0.98.1, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
 
 ### Usage notes
 
