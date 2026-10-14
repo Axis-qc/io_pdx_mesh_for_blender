@@ -319,8 +319,14 @@ def get_mesh_info(blender_obj, mat_id, split_criteria=None, split_all=False, sor
 
     # cache some mesh data
     uv_setnames = [uv_set.name for uv_set in mesh.uv_layers if len(uv_set.data)][:PDX_MAXUVSETS]
+    tangents_ok = False
     if uv_setnames:
-        mesh.calc_tangents(uvmap=uv_setnames[0])
+        try:
+            mesh.calc_tangents(uvmap=uv_setnames[0])
+            tangents_ok = True
+        except RuntimeError:
+            # 有 n-gon 时切线算不出来（只支持三角/四边），切线不是必需数据，跳过即可。
+            IO_PDX_LOG.warning("could not calculate tangents (mesh has n-gons), continuing without them")
 
     # build a blank dictionary of mesh information for the exporter
     mesh_dict = {x: [] for x in ["p", "n", "ta", "u0", "u1", "u2", "u3", "tri", "min", "max"]}
@@ -370,8 +376,10 @@ def get_mesh_info(blender_obj, mat_id, split_criteria=None, split_all=False, sor
                 uv = tuple(swap_coord_space(tuple(uv)))
                 _uv_coords += (uv,)
 
-            # tangent (omitted if there were no UVs)
-            if uv_setnames:
+            # tangent (omitted if there were no UVs, or if tangent space could not be
+            # computed for this mesh - a failed calc_tangents leaves loop.tangent at
+            # zero, which would be worse than writing nothing at all)
+            if uv_setnames and tangents_ok:
                 _bitangent_sign = loop.bitangent_sign
                 _tangent = loop.tangent
                 _tangent = tuple(swap_coord_space(_tangent))
@@ -414,6 +422,7 @@ def get_mesh_info(blender_obj, mat_id, split_criteria=None, split_all=False, sor
 
     if not export_verts:
         # no mesh data collected?
+        bpy.data.meshes.remove(mesh)  # delete duplicate mesh datablock
         return {}, []
 
     # calculate mesh bounds
@@ -614,6 +623,8 @@ def get_locators_info(blender_empties):
 
 
 def get_skeleton_hierarchy(rig):
+    if rig is None or not len(rig.data.bones):
+        return []
     root_bone = rig.data.bones[0]
 
     def get_recursive_children(bone, hierarchy):
@@ -799,7 +810,7 @@ def resolve_texture_file(texture_dir, texture_name, meshpath, texture_index=None
     return local
 
 
-def create_node_texture(node_tree, tex_filepath, as_data=False):
+def create_node_texture(node_tree, tex_filepath, as_data=False, keep=False):
     teximage_node = node_tree.nodes.new("ShaderNodeTexImage")
 
     if tex_filepath is not None:
@@ -823,7 +834,10 @@ def create_node_texture(node_tree, tex_filepath, as_data=False):
         if not os.path.isfile(tex_filepath):
             IO_PDX_LOG.warning("unable to find texture filepath - {0}".format(tex_filepath))
 
-        new_image.use_fake_user = True
+        # 只有手动建的模板材质需要 fake user 保命；导入路径的贴图被材质引用，
+        # 设了 fake user 反而让它永远回收不掉（切换模型时一路堆积）。
+        if keep:
+            new_image.use_fake_user = True
         new_image.alpha_mode = "CHANNEL_PACKED"
         new_image.colorspace_settings.is_data = as_data
 
@@ -839,7 +853,9 @@ def create_shader(PDX_material, shader_name, texture_dir, template_only=False, m
     """
     new_shader = bpy.data.materials.new(shader_name)
     new_shader[PDX_SHADER] = PDX_material.shader[0]
-    new_shader.use_fake_user = True
+    # 只有手动建的模板材质需要 fake user 保命；导入的材质被网格引用着，
+    # 设了 fake user 会让它永远回收不掉。
+    new_shader.use_fake_user = template_only
     new_shader.use_nodes = True
 
     new_shader.use_backface_culling = True
@@ -865,7 +881,7 @@ def create_shader(PDX_material, shader_name, texture_dir, template_only=False, m
     if getattr(PDX_material, "diff", None) or template_only:
         texture_path = None if template_only else resolve_texture_file(texture_dir, PDX_material.diff[0], meshpath, texture_index)
 
-        albedo_texture = create_node_texture(node_tree, texture_path)
+        albedo_texture = create_node_texture(node_tree, texture_path, keep=template_only)
         set_node_pos(albedo_texture, -5, 0)
 
         links.new(albedo_texture.outputs["Color"], shader_root.inputs["Base Color"])
@@ -875,7 +891,7 @@ def create_shader(PDX_material, shader_name, texture_dir, template_only=False, m
     if getattr(PDX_material, "spec", None) or template_only:
         texture_path = None if template_only else resolve_texture_file(texture_dir, PDX_material.spec[0], meshpath, texture_index)
 
-        material_texture = create_node_texture(node_tree, texture_path, as_data=True)
+        material_texture = create_node_texture(node_tree, texture_path, as_data=True, keep=template_only)
         set_node_pos(material_texture, -5, 1)
 
         separate_color = node_tree.nodes.new(type="ShaderNodeSeparateColor")
@@ -896,7 +912,7 @@ def create_shader(PDX_material, shader_name, texture_dir, template_only=False, m
     if getattr(PDX_material, "n", None) or template_only:
         texture_path = None if template_only else resolve_texture_file(texture_dir, PDX_material.n[0], meshpath, texture_index)
 
-        normal_texture = create_node_texture(node_tree, texture_path, as_data=True)
+        normal_texture = create_node_texture(node_tree, texture_path, as_data=True, keep=template_only)
         set_node_pos(normal_texture, -5, 2)
 
         separate_color = node_tree.nodes.new(type="ShaderNodeSeparateColor")
@@ -1017,8 +1033,25 @@ def create_skeleton(PDX_bone_list, convert_bonespace=False, reuse=True):
     # check this skeleton is not already built in the scene
     # reuse=False 用于资源浏览器连续加载：场景里留着上一个模型的同名骨架时，
     # 复用会让新网格静默蒙皮到旧骨架上（不报错，只是动起来不对）。
-    matching_rigs = [get_rig_from_bone_name(clean_imported_name(bone.name)) for bone in PDX_bone_list]
-    matching_rigs = list(set(rig for rig in matching_rigs if rig))
+    #
+    # 只按「任意一根骨名命中」判断太松：root / main_body 这类名字在原版模型里高度
+    # 重叠，随便一个开着别的工程的文件就会撞上，然后新模型静默蒙皮到旧骨架上。
+    # 这里要求候选骨架把所有同名骨都包含进去且骨数一致，才认为它就是这个骨架。
+    wanted = [clean_imported_name(bone.name) for bone in PDX_bone_list]
+    wanted_counts = defaultdict(int)
+    for name in wanted:
+        wanted_counts[name] += 1
+
+    matching_rigs = []
+    for rig in [obj for obj in bpy.data.objects if isinstance(obj.data, bpy.types.Armature)]:
+        if len(rig.data.bones) != len(PDX_bone_list):
+            continue
+        have = defaultdict(int)
+        for bone in rig.data.bones:
+            have[BLENDER_UNIQUE_SUFFIX.sub("", bone.name)] += 1
+        if all(have[name] >= count for name, count in wanted_counts.items()):
+            matching_rigs.append(rig)
+
     if reuse and len(matching_rigs) == 1:
         IO_PDX_LOG.debug("matching armature already found in scene")
         return matching_rigs[0]
@@ -1604,7 +1637,8 @@ def import_meshfile(meshpath, imp_mesh=True, imp_skel=True, imp_locs=True, join_
             for b in skeleton:
                 pdx_bone = pdx_data.PDXData(b)
                 pdx_bone_list.append(pdx_bone)
-                scene_bone_dict[pdx_bone.name] = pdx_bone.tx
+                # 重名骨只保留第一次出现，与挂点按名绑定取首根的口径一致，避免位置与父骨错位。
+                scene_bone_dict.setdefault(pdx_bone.name, pdx_bone.tx)
 
             if imp_skel:
                 IO_PDX_LOG.info("creating skeleton -")
@@ -1678,7 +1712,9 @@ def import_meshfile(meshpath, imp_mesh=True, imp_skel=True, imp_locs=True, join_
             pdx_locator = pdx_data.PDXData(loc)
             obj = create_locator(pdx_locator, scene_bone_dict)
 
-    bpy.ops.object.select_all(action="DESELECT")
+    # 收尾的 operator 在 EDIT 等模式下会 poll 失败，不能让它把已完成的导入报成失败。
+    if bpy.ops.object.select_all.poll():
+        bpy.ops.object.select_all(action="DESELECT")
     IO_PDX_LOG.info("import finished! ({0:.4f} sec)".format(time.time() - start))
 
 
@@ -1807,6 +1843,10 @@ def export_meshfile(meshpath, exp_mesh=True, exp_skel=True, exp_locs=True, exp_s
         if exp_selected:
             blender_rigs = [obj for obj in blender_rigs if obj.select_get()]
 
+        # 「只导骨架」还勾了「仅选中」时，选中的可能一个骨架都没有，此时索引 [0] 会崩
+        if not blender_rigs:
+            raise RuntimeError("Skeleton only export is selected, but no armature was found.")
+
         if len(blender_rigs) > 1:
             raise RuntimeError("Unable to resolve a single armature for export. {0}".format(blender_rigs))
 
@@ -1859,7 +1899,9 @@ def export_meshfile(meshpath, exp_mesh=True, exp_skel=True, exp_locs=True, exp_s
 
     if bpy.ops.object.mode_set.poll():
         bpy.ops.object.mode_set(mode="OBJECT")
-    bpy.ops.object.select_all(action="DESELECT")
+    # 文件已写完，收尾的 operator 在 EDIT 等模式下会 poll 失败，不能让它把成功的导出报成失败。
+    if bpy.ops.object.select_all.poll():
+        bpy.ops.object.select_all(action="DESELECT")
     IO_PDX_LOG.info("export finished! ({0:.4f} sec)".format(time.time() - start))
 
 
@@ -2123,13 +2165,21 @@ def export_animfile(animpath, frame_start=1, frame_end=10, **kwargs):
     export_bones = get_skeleton_hierarchy(rig)
     info_xml.set("j", [len(export_bones)])
 
-    # write the playback speed, restoring the exact (possibly fractional) fps of the file this rig was imported from
-    # whenever the scene fps still matches what that import set it to
+    # write the playback speed. The action's frame numbers were sampled against the fps the
+    # rig was imported at (or retimed to), and changing the scene fps later does not re-sample
+    # them, so that stored value is what the frames must be interpreted with - using the new
+    # scene fps instead would silently change the exported duration.
     scene_fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
     fps = scene_fps
     stored_fps = rig.get(PDX_ANIM_FPS_PROP)
-    if stored_fps is not None and abs(scene_fps - round(float(stored_fps))) < 1e-4:
+    if stored_fps is not None:
         fps = float(stored_fps)
+        if abs(scene_fps - fps) > 1e-4:
+            IO_PDX_LOG.warning(
+                "scene fps ({0}) no longer matches the fps this animation was imported at ({1}) - exporting at the "
+                "imported value to preserve the duration; re-import to retime the keys to the new scene fps.".format(
+                    scene_fps, fps)
+            )
     if abs(fps - round(fps)) > 1e-4:
         IO_PDX_LOG.info("writing fractional playback speed - {0}".format(fps))
     info_xml.set("fps", [float(fps)])
@@ -2227,5 +2277,8 @@ def export_animfile(animpath, frame_start=1, frame_end=10, **kwargs):
 
     bpy.context.scene.frame_set(curr_frame)
 
-    bpy.ops.object.select_all(action="DESELECT")
+    # 文件已经写完，这里只是收尾；在 EDIT 等模式下这个 operator 会 poll 失败，
+    # 若让它抛出，会把一次成功的导出报成失败。
+    if bpy.ops.object.select_all.poll():
+        bpy.ops.object.select_all(action="DESELECT")
     IO_PDX_LOG.info("export finished! ({0:.4f} sec)".format(time.time() - start))

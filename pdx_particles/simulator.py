@@ -14,12 +14,15 @@ PDX particle simulator: deterministic, frame-scrub able integration.
  author : Axis-qc (fork of ross-g/io_pdx_mesh 0.91.2)
 """
 
+import logging
 import math
 
 try:                      # numpy 可选：缺失时全部回退纯 Python 路径
     import numpy as _NP
 except Exception:         # noqa: BLE001
     _NP = None
+
+SIM_LOG = logging.getLogger("io_pdx.particles.simulator")
 
 SUBSTEP = 1.0 / 120.0     # 物理子步（秒）
 _EPS = 1e-9
@@ -190,6 +193,13 @@ _VAR_RULES = {
 
 _VAR_RULE_DEFAULT = _RULE_INTERVAL
 
+# 逐用途的哈希盐：0~16 已被位置/方向/颜色占满，新增用途从 17 起编以免撞维
+_SALT_LIFE = 0          # 寿命（粒子记录 p[10] 存的就是它）
+_SALT_SIZE = 17         # 尺寸
+_SALT_ALPHA = 18        # 不透明度
+_SALT_EMIT_YAW = 19     # 逐粒子发射体方位角
+_SALT_EMIT_PITCH = 20   # 逐粒子发射体仰角
+
 
 def _rule_of(field_name):
     """取某字段的取数规则；未登记的字段走默认。"""
@@ -204,12 +214,68 @@ def _pick(base, var, u, rule):
 
 
 def _apply_anim(base, anim, u):
-    """按 op 把动画值作用到基础值上。MUL 乘、ADD 加，clamp 到 >=0。"""
+    """按 op 把动画值作用到基础值上。MUL 乘、ADD 加、ABS 是加法结果取绝对值。
+
+    ABS 必须走加法：三处 ABS 都是尺寸基准为 0 的闪光，按乘法算恒为 0，
+    粒子会被尺寸过滤整批剔掉，画面上什么都没有。
+    """
     if anim is None:
         return base
     v = anim.evaluate(u)
-    out = base * v if anim.op == "MUL" else base + v
+    if anim.op == "ADD":
+        out = base + v
+    elif anim.op == "ABS":
+        out = abs(base + v)
+    else:
+        if anim.op != "MUL":
+            # 未登记的 op 不再静默当乘法，按同一出口报出来并明确回落到 MUL
+            if not anim.op_warned:
+                anim.op_warned = True
+                SIM_LOG.warning(
+                    "particle animation %s: unknown op '%s', treated as MUL",
+                    anim.name, anim.op)
+        out = base * v
     return out if out > 0.0 else 0.0
+
+
+def _anim_u(anim, age, life):
+    """动画曲线的归一化时间 u ∈ [0,1)：按 axis 选计时基准，start/duration 参与归一化。
+
+    time=life 的 start/duration 是寿命的倍数（同一条 fade 动画被 life=0.14 与
+    life=15 的子系统共用，按秒算短寿命粒子永远淡不出去）；time=life_abs 的是秒
+    （duration=10 配 life=60 的 repeat=yes 样本只有秒读法才循环）；spawn / system
+    的基准无法确定，不猜，见 _anim_axis_note。repeat=yes 走完区间回绕。
+    """
+    if anim is None:
+        return 0.0
+    if anim.axis == "life_abs":
+        span = anim.duration if anim.duration > 0.0 else 1.0
+        phase = age - anim.start
+    elif anim.axis == "life":
+        span = life * (anim.duration if anim.duration > 0.0 else 1.0)
+        phase = age - life * anim.start
+    else:
+        _anim_axis_note(anim)
+        return (age / life) if life > 0.0 else 0.0
+    if span <= 0.0 or phase <= 0.0:
+        return 0.0
+    if anim.repeat:
+        phase = math.fmod(phase, span)
+    return phase / span if phase < span else 1.0
+
+
+_ANIM_AXIS_NOTED = set()
+
+
+def _anim_axis_note(anim):
+    """spawn / system 两个 time 轴的计时基准无法确定，只报一次「未按该轴生效」。"""
+    key = (anim.axis, anim.name)
+    if key in _ANIM_AXIS_NOTED:
+        return
+    _ANIM_AXIS_NOTED.add(key)
+    SIM_LOG.warning(
+        "particle animation %s: time=%s axis not applied, using age/life",
+        anim.name, anim.axis)
 
 
 def _turbulence(p, t):
@@ -499,7 +565,8 @@ class SubsystemSim:
         self.t = 0.0
         self.n_sub = 0          # 已执行的绝对子步数（唯一的时间状态，保证可重放）
         self.spawn_count = 0
-        # 粒子记录：[出生时间, 寿命, x,y,z, vx,vy,vz, 角速度, 初始角, 权重]
+        self._cap_warned = False
+        # 粒子记录：[出生时间, 寿命, x,y,z, vx,vy,vz, 角速度, 初始角, 寿命权重]
         self.particles = []
         self._ckpt = [(0, 0, [])]    # 关键帧：[(n_sub, spawn_count, 粒子表副本)]
 
@@ -608,6 +675,9 @@ class SubsystemSim:
         w0 = w_life
         life = _pick(self.life, self.life_var, w0, _rule_of("life"))
         life = max(life, 0.05)
+        # 尺寸与不透明度各取独立盐，否则会与寿命共用同一个随机数
+        w_size = self._w(i, _SALT_SIZE)
+        w_alpha = self._w(i, _SALT_ALPHA)
 
         # 发射点。判定要把方差也算上：大量发射器写成「基准 0 + 方差」，
         # 只看基准会误判成点发射。基准与方差都为 0 的才是真点发射。
@@ -646,8 +716,10 @@ class SubsystemSim:
         # 只能由「方向被旋转」满足）。
         # 有方差时逐粒子取角，否则用构造期算好的固定矩阵。
         if self.emit_var:
-            ey = _pick(self.emit_yaw[0], self.emit_yaw[1], w_pos1, _rule_of("emitter_yaw"))
-            ep = _pick(self.emit_pitch[0], self.emit_pitch[1], w_pos2, _rule_of("emitter_pitch"))
+            w_ey = self._w(i, _SALT_EMIT_YAW)
+            w_ep = self._w(i, _SALT_EMIT_PITCH)
+            ey = _pick(self.emit_yaw[0], self.emit_yaw[1], w_ey, _rule_of("emitter_yaw"))
+            ep = _pick(self.emit_pitch[0], self.emit_pitch[1], w_ep, _rule_of("emitter_pitch"))
             m = _emit_rot_matrix(ep, ey) if (ey or ep) else self.emit_rot
         else:
             m = self.emit_rot
@@ -673,8 +745,9 @@ class SubsystemSim:
         c_g = _pick(0.0, self.color_var_g, w_cg, _rule_of("color_y"))
         c_b = _pick(0.0, self.color_var_b, w_cb, _rule_of("color_z"))
 
+        # 粒子记录：出生时间/寿命/位置/速度/角速度/初始角/寿命权重/基角/颜色偏移/尺寸权重/透明度权重
         self.particles.append([t, life, px, py, pz, d[0] * v, d[1] * v, d[2] * v, angvel, ang0, w0,
-                               b_pitch, b_yaw, c_r, c_g, c_b])    # ---- 物理 ----
+                               b_pitch, b_yaw, c_r, c_g, c_b, w_size, w_alpha])
 
     def _accel(self, p, v, t):
         ax = ay = az = 0.0
@@ -804,6 +877,12 @@ class SubsystemSim:
         # 因此不破坏确定性。
         n_cap = int(MAX_PREVIEW_SECONDS / SUBSTEP)
         n_target = min(int(math.floor(t_target / SUBSTEP + 1e-9)), n_cap)
+        # 触顶：请求时刻超出预览上限时报出来，不让画面静悄悄停在 60 秒那一刻
+        if not self._cap_warned and t_target > MAX_PREVIEW_SECONDS + SUBSTEP:
+            self._cap_warned = True
+            SIM_LOG.warning(
+                "particle subsystem %s: simulated time capped at %.1fs, "
+                "later state is not computed", self.name, MAX_PREVIEW_SECONDS)
         if n_target <= self.n_sub:
             return
 
@@ -880,16 +959,21 @@ class SubsystemSim:
             life = p[1]
             if age < 0.0 or age >= life:
                 continue
-            u = age / life
-            size = _apply_anim(_pick(self.size_base, self.size_var, p[10], _rule_of("size")),
-                               self.size_anim, u)
+            # 尺寸 / 不透明度 / 颜色各用各自动画的 time 轴换算时间（原先全用 age/life）
+            size = _apply_anim(
+                _pick(self.size_base, self.size_var, p[16], _rule_of("size")),
+                self.size_anim, _anim_u(self.size_anim, age, life))
             if size <= 0.0:
                 continue
-            alpha = _apply_anim(_pick(self.alpha_base, self.alpha_var, p[10], _rule_of("alpha")),
-                                self.alpha_anim, u)
-            r = _clamp(_apply_anim(sub.color[0] + p[13], self.anim_r, u), 0.0, 1.0)
-            g = _clamp(_apply_anim(sub.color[1] + p[14], self.anim_g, u), 0.0, 1.0)
-            b = _clamp(_apply_anim(sub.color[2] + p[15], self.anim_b, u), 0.0, 1.0)
+            alpha = _apply_anim(
+                _pick(self.alpha_base, self.alpha_var, p[17], _rule_of("alpha")),
+                self.alpha_anim, _anim_u(self.alpha_anim, age, life))
+            r = _clamp(_apply_anim(sub.color[0] + p[13], self.anim_r,
+                                   _anim_u(self.anim_r, age, life)), 0.0, 1.0)
+            g = _clamp(_apply_anim(sub.color[1] + p[14], self.anim_g,
+                                   _anim_u(self.anim_g, age, life)), 0.0, 1.0)
+            b = _clamp(_apply_anim(sub.color[2] + p[15], self.anim_b,
+                                   _anim_u(self.anim_b, age, life)), 0.0, 1.0)
             a = _clamp(alpha, 0.0, 1.0)
             if a <= 0.0:
                 continue
@@ -927,6 +1011,7 @@ class SystemSim:
                 continue
             self.subs.append(SubsystemSim(system, sub, i, time_offset, self.seed))
         self.enabled = {s.name: True for s in self.subs}
+        self._cap_warned = False
         self.t = 0.0
 
     def reset(self):
@@ -981,4 +1066,10 @@ class SystemSim:
                 else:
                     end = max(end, min(first_spawn, window_end) + s.life + s.life_var)
             d = max(d, end)
+        # 钳到上限：超出的部分永远看不到，而时间轴长度就是这里给出的，必须在此报出
+        if d > MAX_PREVIEW_SECONDS and not self._cap_warned:
+            self._cap_warned = True
+            SIM_LOG.warning(
+                "particle system %s: content lasts %.1fs, preview timeline capped at %.1fs",
+                self.name, d, MAX_PREVIEW_SECONDS)
         return max(1.0, min(d, MAX_PREVIEW_SECONDS))

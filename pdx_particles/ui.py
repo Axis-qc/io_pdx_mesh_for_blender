@@ -356,7 +356,9 @@ def _import_loaded(context, loaded, missing, library):
         entry = scene.io_pdx_particle_entries.add()
         entry.name = system.name
         entry.collection = preview.collection.name
-        max_end = max(max_end, preview.sim.total_duration() + offset)
+        # total_duration() 已经含了 time_offset（子系统的 start 里加过），
+        # 这里不能再加一次，否则 entity 事件偏移会被算两遍、时间轴长约两倍。
+        max_end = max(max_end, preview.sim.total_duration())
         try:
             nested.extend(system.nested_subsystems())
         except Exception:  # noqa: BLE001
@@ -517,6 +519,9 @@ class IOPDX_OT_particle_ref_sphere_hide(Operator):
 
 MAX_LIST_ROWS = 20000   # 近万条填充实测 <10ms，留个上限只为防病态数据
 
+# 对象上的归属标记：清场只删带这个标记的对象，避免误删用户自建的同名对象。
+OWNER_PROP = "io_pdx_owner"
+
 # 索引与当前展示结果（模块级；跨 .blend 不持久化，重开文件会自动重建）
 _INDEX = None
 _INDEX_KEY = None
@@ -528,7 +533,9 @@ _REBUILDING = False     # 重建分类列表期间抑制 enabled 回调（见 _c
 # 所以重建不能在 draw 里做：draw 只比对，发现不一致就注册一个一次性定时器，
 # 真正的重建在 draw 之外执行。
 _LIST_KEY = None
+_LIST_BUILT = False     # 已经为当前索引建过一次列表（空结果也算建成）
 _REBUILD_SCHEDULED = False
+_INDEX_SCHEDULED = False   # 已在 draw 之外排队建索引
 
 # 选帧时的模拟采样次数上限：整条时间轴按步长抽样，避免秒数很长时逐帧推进。
 SAMPLE_BUDGET = 2400
@@ -582,6 +589,47 @@ def _pref_roots():
     return extra, vanilla
 
 
+def _index_is_stale():
+    """当前配置与已建索引是否不一致（不触发构建，供 draw 里判断）。"""
+    extra, vanilla = _pref_roots()
+    return _INDEX is None or _INDEX_KEY != (tuple(extra), vanilla)
+
+
+def _schedule_index_build():
+    """在 draw 之外建索引。
+
+    draw() 里同步建索引会让侧栏首次展开时冻结数秒（实测全库 3.1-3.4 秒），
+    而且没有任何进度提示。这里只排一个一次性定时器，本帧先画「正在建索引」。
+    """
+    global _INDEX_SCHEDULED
+    if _INDEX_SCHEDULED:
+        return
+    _INDEX_SCHEDULED = True
+
+    def _run():
+        global _INDEX_SCHEDULED
+        _INDEX_SCHEDULED = False
+        try:
+            _ensure_index()
+            ctx = bpy.context
+            _rebuild_categories(ctx)
+            _rebuild_asset_list(ctx)
+            _mark_list_current()
+            for win in ctx.window_manager.windows:
+                for area in win.screen.areas:
+                    if area.type == "VIEW_3D":
+                        area.tag_redraw()
+        except Exception as err:  # noqa: BLE001
+            IO_PDX_LOG.error("deferred index build failed: %s", err)
+        return None      # 一次性
+
+    try:
+        bpy.app.timers.register(_run, first_interval=0.0)
+    except Exception as err:  # noqa: BLE001
+        _INDEX_SCHEDULED = False
+        IO_PDX_LOG.error("could not schedule index build: %s", err)
+
+
 def _ensure_index(force=False):
     """按当前配置建索引；配置没变就复用。
 
@@ -627,12 +675,12 @@ def _detail_text(entry):
         return names[0] if names else ""
     if entry.kind == KIND_PARTICLE:
         n = d.get("type") or ""
-        return n if d.get("resolved") else "{0} (no body)".format(n)
+        return n if d.get("resolved") else pdx_i18n.iface("{0} (no body)").format(n)
     bits = []
     if d.get("pdxmesh"):
         bits.append(d["pdxmesh"])
     if d.get("particles"):
-        bits.append("{0} particle(s)".format(len(d["particles"])))
+        bits.append(pdx_i18n.iface("{0} particle(s)").format(len(d["particles"])))
     return "  ".join(bits)
 
 
@@ -684,7 +732,8 @@ def _rebuild_asset_list(context):
         item.vanilla = e.is_vanilla
     total = len(entries)
     scene.io_pdx_asset_index = 0
-    scene.io_pdx_index_status = "{0} shown / {1} matched  ·  index {2} files in {3}s".format(
+    scene.io_pdx_index_status = pdx_i18n.iface(
+        "{0} shown / {1} matched  ·  index {2} files in {3}s").format(
         len(_SHOWN), total, index.stats.get("files", 0), index.stats.get("seconds", 0))
     # 列表换了一批，选中的条目也跟着变，动画列表必须同步重建
     _rebuild_anim_list(context)
@@ -716,7 +765,7 @@ def _rebuild_anim_list(context):
         item.state = a.get("state") or ""
         item.type_name = a.get("type") or ""
         item.detail = (os.path.basename(a.get("file") or "")
-                       if a.get("file") else "no file")
+                       if a.get("file") else pdx_i18n.iface("no file"))
     scene.io_pdx_anim_index = 0
     return len(_ANIM_SHOWN)
 
@@ -776,8 +825,12 @@ def _schedule_rebuild():
 
 def _mark_list_current():
     """把「列表已对应当前索引」记到模块级变量（不能写场景属性，见 _LIST_KEY）。"""
-    global _LIST_KEY
+    global _LIST_KEY, _LIST_BUILT
     _LIST_KEY = _list_token()
+    # 单独记「已经建过一次」：建完结果为空也是建过了，不能靠分类列表非空来判断，
+    # 否则空结果会让 draw 每次都重排定时器，形成自持重绘循环、面板永远停在
+    # "Building list ..."（没配目录、或当前标签页没有条目时都会命中）。
+    _LIST_BUILT = True
 
 
 def _asset_tab_update(self, context):
@@ -1157,47 +1210,56 @@ def _snapshot_objects():
 
 
 def _mark_loaded(context, before):
-    """把本次加载新增的对象记进场景属性，供下次加载前清理。
+    """给本次加载新建的对象打上插件归属标记，供下次加载前清理。
 
-    记在场景属性而不是模块级变量：模块状态跨 .blend 不保留，重开文件后清理
-    清单就丢了，旧对象会一直留在场景里（正是要修的问题）。场景属性跟着文件走。
+    靠名字认自己的对象是不可靠的：Blender 会把被删对象的名字回收给新对象，
+    用户删掉插件对象后自建一个同名对象，下次清理就会把用户的对象删掉。
+    标记写在对象上，跨 .blend 也保留；名字清单只留给面板显示。
     """
     if before is None:
         return
     scene = context.scene
     known = {e.name for e in scene.io_pdx_loaded_objects}
-    for name in _snapshot_objects() - before:
-        if name in known:
+    for obj in list(bpy.data.objects):
+        if obj.name in before:
             continue
-        scene.io_pdx_loaded_objects.add().name = name
+        try:
+            obj[OWNER_PROP] = True
+        except Exception:  # noqa: BLE001
+            continue
+        if obj.name not in known:
+            scene.io_pdx_loaded_objects.add().name = obj.name
 
 
 def _clear_loaded(context):
-    """删掉上一次由本插件加载出来的对象（只删这些）。
+    """删掉本插件加载出来的对象（只删打了归属标记的）。
 
-    用户自己的对象、相机、灯光一律不动：清单里只有加载前后差集。
+    用户自己的对象、相机、灯光一律不动：判据是对象上的归属标记，不是名字。
     顺带清掉这些骨架上的 action 与无人引用的数据块，否则切换几十次之后
     action / mesh / material 会一路堆积。
     """
     global _ACTIVE_ANIM
     scene = context.scene
-    names = [e.name for e in scene.io_pdx_loaded_objects]
     scene.io_pdx_loaded_objects.clear()
-    if not names:
+
+    # 按标记扫全场景而不是按名字清单：用户给对象改过名也能清掉，不会留下残渣。
+    owned = [o for o in bpy.data.objects if o.get(OWNER_PROP)]
+    if not owned:
         return 0
 
     actions = set()
+    materials = set()
     removed = 0
-    for name in names:
-        obj = bpy.data.objects.get(name)
-        if obj is None:
-            continue          # 用户已自己删掉，不算错
+    for obj in owned:
         try:
             if obj.type == "ARMATURE" and obj.animation_data is not None:
                 act = obj.animation_data.action
                 if act is not None:
                     actions.add(act)
             data = obj.data
+            # 网格材质在 remove 之前收集，对象删掉后就找不到它们了
+            if isinstance(data, bpy.types.Mesh):
+                materials.update(m for m in data.materials if m is not None)
             bpy.data.objects.remove(obj, do_unlink=True)
             removed += 1
             # 对象的数据块（mesh/armature）在只有它引用时一并释放
@@ -1207,11 +1269,32 @@ def _clear_loaded(context):
                 elif isinstance(data, bpy.types.Armature):
                     bpy.data.armatures.remove(data)
         except Exception as err:  # noqa: BLE001
-            IO_PDX_LOG.error("failed to remove %s: %s", name, err)
+            IO_PDX_LOG.error("failed to remove %s: %s", obj.name, err)
 
     for act in actions:
+        # 这里必须先摘掉 fake user，否则 users 永远不为 0，action 会一直留着。
+        try:
+            act.use_fake_user = False
+        except Exception:  # noqa: BLE001
+            pass
         if act.users == 0:
             bpy.data.actions.remove(act)
+
+    # 材质与贴图同样要摘 fake user 再按 users 回收，否则切换几十次后一路堆积。
+    for mat in materials:
+        try:
+            mat.use_fake_user = False
+            if mat.users == 0:
+                bpy.data.materials.remove(mat)
+        except Exception:  # noqa: BLE001
+            pass
+    for img in list(bpy.data.images):
+        try:
+            if img.users == 0 and img.use_fake_user:
+                img.use_fake_user = False
+                bpy.data.images.remove(img)
+        except Exception:  # noqa: BLE001
+            pass
     _ACTIVE_ANIM = ""
     return removed
 
@@ -1273,8 +1356,13 @@ def _load_entity(context, entry, index):
     """entity → 导入模型 + 把粒子挂到 node 指定的挂点上。
 
     事件的 particle 是 .gfx 注册名（经 system_for_registration 换算本体），
-    node 是挂点名；名字匹配场景里的 EMPTY（模型导入时由 locator 建出），
-    命中就把粒子挂上去，没写明 node 或找不到对应挂点时留在原点并记日志。
+    node 是挂点名；名字匹配场景里的 EMPTY（模型导入时由 locator 建出），命中就
+    把粒子挂上去。**挂点找不到的粒子一律不装载**并回报给调用方，不再静默留在
+    原点——原版有约 15% 的 event 挂点解析不到，静默会让「粒子全堆在原点」这种
+    偏移无从排查。未写 node 的 event 正常装载（引擎语义就是在 entity 原点播放）。
+
+    返回 (是否有装载成功的物体, 未装载清单)；清单每项形如 "粒子名@挂点名"，
+    本体找不到的形如 "粒子名(no body)"。
     """
     detail = entry.detail
     mesh = detail.get("mesh") or ""
@@ -1289,14 +1377,16 @@ def _load_entity(context, entry, index):
             loaded_any = True
         except Exception as err:  # noqa: BLE001
             IO_PDX_LOG.error("entity mesh import failed: %s (%s)", mesh, err)
+        finally:
+            # 导入中途失败时已经建出的对象也要记上标记，否则它们永远不进清理范围。
+            _mark_loaded(context, before)
 
     scene = context.scene
     scene.io_pdx_particle_entries.clear()
     _clear_previews()
 
     mounts = _mount_points()
-    # entity 自带的 locator 不在 .mesh 里，只导模型不会建出它们；有 node 指向
-    # 这些名字时先补建 EMPTY，否则粒子找不到挂点只能留在原点。
+    # entity 自带的 locator 不在 .mesh 里，只导模型不会建出它们，有 node 指向时需先补建 EMPTY。
     for loc in detail.get("locators") or []:
         lname = loc.get("name") or ""
         if not lname or lname in mounts:
@@ -1306,20 +1396,25 @@ def _load_entity(context, entry, index):
         except Exception as err:  # noqa: BLE001
             IO_PDX_LOG.error("locator create failed: %s (%s)", lname, err)
     events = detail.get("events") or [{"particle": p} for p in detail.get("particles") or []]
-    # 先把 (本体, 挂点名, 起播延迟) 收齐再一次装载：逐个 _import_loaded 会各自
-    # 重挑一遍显示帧并反复重置时间轴范围，多事件 entity 会慢很多且只有最后一个生效。
-    plan, unmatched = [], []
+    # 先把 (本体, 挂点名, 起播延迟) 收齐再一次装载，逐个装载会各自重挑显示帧并反复重置时间轴范围。
+    #
+    # 挂点校验放在装载之前：装载会立刻把对象记进 _ACTIVE，事后剔除只能删对象且会留下空条目。
+    plan, rejected = [], []
     for ev in events:
         pname = ev.get("particle") or ""
         system = _resolve_system(index, pname)
         if system is None:
-            unmatched.append(pname)
+            rejected.append("{0}(no body)".format(pname))
+            continue
+        node = ev.get("node") or ""
+        if node and mounts.get(node) is None:
+            rejected.append("{0}@{1}".format(pname, node))
             continue
         try:
             offset = float(ev.get("time") or 0.0)
         except (TypeError, ValueError):
             offset = 0.0
-        plan.append((system, offset, ev.get("node") or "", pname))
+        plan.append((system, offset, node, pname))
 
     if plan:
         loaded = [(system, offset) for system, offset, _node, _n in plan]
@@ -1339,15 +1434,13 @@ def _load_entity(context, entry, index):
             empty = mounts.get(node)
             if empty is not None:
                 preview.set_mount(empty)
-            else:
-                unmatched.append("{0}@{1}".format(preview.system.name, node))
 
-    if unmatched:
-        IO_PDX_LOG.warning("entity particle/mount not found: %s",
-                           ", ".join(sorted(set(unmatched))))
+    if rejected:
+        IO_PDX_LOG.warning("entity particles not loaded: %s",
+                           ", ".join(sorted(set(rejected))))
     # 记录这次新建的对象（模型、locator EMPTY、粒子对象），下次加载前清掉
     _mark_loaded(context, before)
-    return loaded_any
+    return loaded_any, rejected
 
 
 def _find_rig():
@@ -1445,7 +1538,9 @@ def _import_anim(path, retime_to=None):
 
     kwargs = {"retime_to": retime_to} if retime_to else {}
     import_animfile(path, frame_start=1, **kwargs)
-    act.use_fake_user = True
+    # 不设 fake user：设了之后 users 恒 ≥1，_clear_loaded 里按 users==0 回收的
+    # 逻辑对它永远不成立，每切换一次动画就永久多留一个 action。
+    act.use_fake_user = False
 
     # 时间轴取「动画与粒子的并集」：粒子预览把 frame_end 设到 max_end×fps，
     # 动画导入器又会按动画帧数写一遍，两边互相截短。这里取两者较长的一边，
@@ -1494,7 +1589,9 @@ class IOPDX_OT_asset_anim_load(Operator):
                 except Exception as err:  # noqa: BLE001
                     self.report({"ERROR"}, pdx_i18n.rpt("Mesh import failed: {0}").format(err))
                     return {"CANCELLED"}
-                _mark_loaded(context, before)
+                finally:
+                    # 中途失败时已建出的对象也要记上标记，否则永远不进清理范围。
+                    _mark_loaded(context, before)
             else:
                 self.report({"ERROR"}, "No armature in the scene — load a model first")
                 return {"CANCELLED"}
@@ -1505,7 +1602,8 @@ class IOPDX_OT_asset_anim_load(Operator):
         except Exception as err:  # noqa: BLE001
             self.report({"ERROR"}, pdx_i18n.rpt("Animation import failed: {0}").format(err))
             return {"CANCELLED"}
-        _mark_loaded(context, before)
+        finally:
+            _mark_loaded(context, before)
         _ACTIVE_ANIM = path
         _ANIM_RETIMED_FPS = scene_fps(scene)
         self.report({"INFO"}, pdx_i18n.rpt("Loaded animation {0}").format(os.path.basename(path)))
@@ -1537,7 +1635,9 @@ class IOPDX_OT_asset_load(Operator):
             except Exception as err:  # noqa: BLE001
                 self.report({"ERROR"}, pdx_i18n.rpt("Mesh import failed: {0}").format(err))
                 return {"CANCELLED"}
-            _mark_loaded(context, before)
+            finally:
+                # 中途失败时已建出的对象也要记上标记，否则永远不进清理范围。
+                _mark_loaded(context, before)
             self.report({"INFO"}, pdx_i18n.rpt("Loaded model {0}").format(entry.name))
             return {"FINISHED"}
 
@@ -1547,14 +1647,22 @@ class IOPDX_OT_asset_load(Operator):
             _clear_previews()
             _clear_loaded(context)
             before = _snapshot_objects()
-            if not _load_particle_system(context, typ, index):
+            try:
+                loaded = _load_particle_system(context, typ, index)
+            finally:
+                _mark_loaded(context, before)
+            if not loaded:
                 self.report({"ERROR"}, pdx_i18n.rpt("No body found for type '{0}'").format(typ))
                 return {"CANCELLED"}
-            _mark_loaded(context, before)
             self.report({"INFO"}, pdx_i18n.rpt("Previewing {0}").format(entry.name))
             return {"FINISHED"}
 
-        ok = _load_entity(context, entry, index)
+        ok, rejected = _load_entity(context, entry, index)
+        if rejected:
+            # 明确报错而不是静默：这些粒子根本没装载，不吭声用户只会看到「粒子全堆在原点」这类偏移。
+            self.report({"ERROR"}, pdx_i18n.rpt(
+                "Particles not loaded (missing mount point or body): {0}"
+            ).format(", ".join(sorted(set(rejected)))))
         if not ok:
             self.report({"ERROR"}, pdx_i18n.rpt("Entity '{0}' has no loadable mesh or particle").format(entry.name))
             return {"CANCELLED"}
@@ -1581,6 +1689,8 @@ class IOPDX_PT_PDXparticles(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_options = {"DEFAULT_CLOSED"}
+    # 这是主面板，排在侧栏最上（其余面板 bl_order 顺次往后）
+    bl_order = 0
 
     def draw(self, context):
         layout = self.layout
@@ -1591,12 +1701,16 @@ class IOPDX_PT_PDXparticles(Panel):
         row.prop(scene, "io_pdx_asset_tab", expand=True)
 
         # ---- 索引状态与重建 ----
-        index = _ensure_index()
         # draw() 是只读上下文：写 Scene 属性会抛
         # "Writing to ID classes in this context is not allowed"，异常还会截断
-        # 整个面板（表现为标签页之后一片空白）。所以这里只比对，不写；发现过期
-        # 就登记一个一次性定时器，真正的重建在 draw 之外跑。
-        stale = (not scene.io_pdx_index_categories) or (_LIST_KEY != _list_token())
+        # 整个面板（表现为标签页之后一片空白）。所以这里只比对，不写；重建（含
+        # 首次建索引）一律交给一次性定时器在 draw 之外跑。
+        if _index_is_stale():
+            _schedule_index_build()
+            layout.label(text="Building index ...", icon="TIME")
+            return
+        index = _INDEX
+        stale = (not _LIST_BUILT) or (_LIST_KEY != _list_token())
         if stale:
             _schedule_rebuild()
         row = layout.row(align=True)
@@ -1614,6 +1728,25 @@ class IOPDX_PT_PDXparticles(Panel):
 
         # ---- 搜索 ----
         layout.prop(scene, "io_pdx_asset_filter", text="", icon="VIEWZOOM")
+
+        # 该标签页没有可列出的条目时明确说明，不要留一片空白让人以为还在建列表
+        if not scene.io_pdx_asset_items:
+            box = layout.box()
+            box.label(text="Nothing to list on this tab.", icon="INFO")
+            box.label(text="Switch tab, clear the search, or Rescan.")
+            box.operator("io_pdx_particles.rescan", icon="FILE_REFRESH", text="Rescan")
+
+        # 索引时被跳过的根汇总报出来（目录不存在、没有 gfx、gfx 下无条目）
+        skipped = getattr(index, "skipped", None) or []
+        if skipped:
+            box = layout.box()
+            box.label(text=pdx_i18n.iface("Skipped folders ({0}):").format(len(skipped)),
+                      icon="ERROR")
+            reasons = {}
+            for item in skipped:
+                reasons[item.get("reason", "?")] = reasons.get(item.get("reason", "?"), 0) + 1
+            for reason, count in sorted(reasons.items()):
+                box.label(text=pdx_i18n.iface("{0} x{1}").format(reason, count))
 
         # ---- 分类（可整类禁用）----
         box = layout.box()
@@ -1637,6 +1770,15 @@ class IOPDX_PT_PDXparticles(Panel):
                      text="Load selected")
         layout.operator("io_pdx_particles.import", icon="FILEBROWSER",
                         text="Load from file ...")
+
+        # ---- 文件导入导出：主 UI 原来没有，只能去下面的 File 面板 ----
+        layout.label(text=pdx_i18n.iface("File:"), icon="FILEBROWSER")
+        row = layout.row(align=True)
+        row.operator("io_pdx_mesh.import_mesh", icon="MESH_CUBE", text="Load mesh ...")
+        row.operator("io_pdx_mesh.import_anim", icon="RENDER_ANIMATION", text="Load anim ...")
+        row = layout.row(align=True)
+        row.operator("io_pdx_mesh.export_mesh", icon="MESH_CUBE", text="Save mesh ...")
+        row.operator("io_pdx_mesh.export_anim", icon="RENDER_ANIMATION", text="Save anim ...")
 
         # ---- 骨骼动画（选中条目带的；模型页与实体页都有）----
         # 选中行就加载动画，和粒子的「选中即预览」不同：动画会覆盖骨架当前动作，
@@ -1672,9 +1814,12 @@ class IOPDX_PT_PDXparticles(Panel):
             return
 
         box = layout.box()
-        for preview in _ACTIVE:
+        # 按行号取 entry，不按名字查：同一 entity 里同名粒子可以出现多次，
+        # CollectionProperty.get(name) 恒返回第一个，眼标会控制错对象。
+        for i, preview in enumerate(_ACTIVE):
             row = box.row(align=True)
-            entry = scene.io_pdx_particle_entries.get(preview.system.name)
+            entry = (scene.io_pdx_particle_entries[i]
+                     if i < len(scene.io_pdx_particle_entries) else None)
             icon = "HIDE_OFF" if (entry and entry.visible) else "HIDE_ON"
             row.prop(entry, "visible", text="", icon=icon, toggle=True) if entry else None
             try:
@@ -1745,6 +1890,25 @@ class IOPDX_PT_PDXparticles(Panel):
         row.operator("io_pdx_particles.clear", icon="TRASH", text="Clear")
         layout.label(text="1 unit = 1; scrub timeline / play", icon="TIME")
 
+        # ---- 工具与显示：原来只在下面的 Tools / Display / Setup 面板里 ----
+        box = layout.box()
+        box.label(text=pdx_i18n.iface("PDX materials:"), icon="MATERIAL")
+        row = box.row(align=True)
+        row.operator("io_pdx_mesh.material_create_popup", icon="MATERIAL", text="Create")
+        row.operator("io_pdx_mesh.material_edit_popup", icon="SHADING_TEXTURE", text="Edit")
+        box.label(text=pdx_i18n.iface("PDX bones:"), icon="GROUP_BONE")
+        row = box.row(align=True)
+        op_ignore = row.operator("io_pdx_mesh.ignore_bone", icon="GROUP_BONE", text="Ignore bones")
+        op_ignore.state = True
+        op_unignore = row.operator("io_pdx_mesh.ignore_bone", icon="BONE_DATA", text="Unignore bones")
+        op_unignore.state = False
+        box.label(text=pdx_i18n.iface("PDX meshes:"), icon="MESH_DATA")
+        box.operator("io_pdx_mesh.mesh_index_popup", icon="SORTALPHA", text="Set mesh order")
+        box.prop(scene.io_pdx_settings, "setup_engine")
+        row = box.row(align=True)
+        row.label(text=pdx_i18n.iface("Animation:"))
+        row.prop(scene.render, "fps", text="FPS")
+
 
 # ----------------------------------------------------------------------------------------------------------------------
 # register / unregister
@@ -1780,20 +1944,22 @@ classes = (
 )
 
 
-def _find_stale_handlers():
-    """按函数名 + 来源文件找出本模块遗留的帧处理器。
+def _find_stale_handlers(handler_name="_frame_handler", collection=None):
+    """按函数名 + 来源文件找出本模块遗留的处理器。
 
     两件事都要防：
-    - 重载脚本 / 重装插件会重新 import 本模块，_frame_handler 变成新对象，而列表
-      里留着旧对象。此时按对象身份判断会漏掉旧的，register 再挂一个、unregister
-      又删不掉，最后残留一个引用旧模块空 _ACTIVE 的处理器。
+    - 重载脚本 / 重装插件会重新 import 本模块，处理器函数变成新对象，而列表里
+      留着旧对象。此时按对象身份判断会漏掉旧的，register 再挂一个、unregister
+      又删不掉，最后残留一个引用旧模块状态的对象。
     - 现在处理器是 @persistent 的，会跨文件存活，所以必须能按名字认出来并去重，
       否则重载一次就多一份，越积越多。
     判定用名字 + __module__ 或 co_filename 归属，避免误删别人的同名函数。
     """
+    if collection is None:
+        collection = bpy.app.handlers.frame_change_post
     stale = []
-    for h in list(bpy.app.handlers.frame_change_post):
-        if getattr(h, "__name__", "") != "_frame_handler":
+    for h in list(collection):
+        if getattr(h, "__name__", "") != handler_name:
             continue
         mod = getattr(h, "__module__", "") or ""
         fn = getattr(getattr(h, "__code__", None), "co_filename", "") or ""
@@ -1902,8 +2068,13 @@ def register():
         except ValueError:
             pass
     bpy.app.handlers.frame_change_post.append(_frame_handler)
-    if _load_post_handler not in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.append(_load_post_handler)
+    # load_post 与帧处理器同样要按名去重：只按对象身份判重会漏掉重载前留下的旧对象。
+    for h in _find_stale_handlers("_load_post_handler", bpy.app.handlers.load_post):
+        try:
+            bpy.app.handlers.load_post.remove(h)
+        except ValueError:
+            pass
+    bpy.app.handlers.load_post.append(_load_post_handler)
 
 
 def unregister():
@@ -1912,19 +2083,18 @@ def unregister():
             bpy.app.handlers.frame_change_post.remove(h)
         except ValueError:
             pass
-    for fn in (_load_post_handler,):
+    for h in _find_stale_handlers("_load_post_handler", bpy.app.handlers.load_post):
         try:
-            bpy.app.handlers.load_post.remove(fn)
+            bpy.app.handlers.load_post.remove(h)
         except ValueError:
             pass
     _clear_previews()
-    del bpy.types.Scene.io_pdx_particle_entries
-    del bpy.types.Scene.io_pdx_particle_roots
-    del bpy.types.Scene.io_pdx_particle_root_index
-    if hasattr(bpy.types.Scene, "io_pdx_particle_face_view"):
-        del bpy.types.Scene.io_pdx_particle_face_view
-    del bpy.types.Scene.io_pdx_particle_vanilla_root
-    for name in ("io_pdx_asset_tab", "io_pdx_asset_items", "io_pdx_asset_index",
+    # 全部按存在性删除：注册中途失败过、或重复 unregister 时属性可能不在，
+    # 裸 del 会抛 AttributeError，把一次禁用/重装变成报错。
+    for name in ("io_pdx_particle_entries", "io_pdx_particle_roots",
+                 "io_pdx_particle_root_index", "io_pdx_particle_face_view",
+                 "io_pdx_particle_vanilla_root", "io_pdx_particle_seed",
+                 "io_pdx_asset_tab", "io_pdx_asset_items", "io_pdx_asset_index",
                  "io_pdx_asset_filter", "io_pdx_index_categories",
                  "io_pdx_index_category_index", "io_pdx_index_disabled",
                  "io_pdx_index_mod_only", "io_pdx_index_status",
@@ -1933,4 +2103,7 @@ def unregister():
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception as err:  # noqa: BLE001
+            IO_PDX_LOG.warning("failed to unregister %s: %s", getattr(cls, "__name__", cls), err)

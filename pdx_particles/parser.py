@@ -67,13 +67,32 @@ def _convert_token(tok):
 
 
 def _tokenize(text):
-    # 去注释（# 到行尾）；字符串里不会出现 #
-    lines = []
-    for line in text.splitlines():
-        idx = line.find("#")
-        lines.append(line if idx < 0 else line[:idx])
-    body = "\n".join(lines)
-    return re.findall(r'"[^"]*"|[{}=]|[^\s{}=]+', body)
+    # 逐字符扫描：只有引号外的 # 才是注释起点
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+        elif ch == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+        elif ch == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif ch in "{}=#":
+            out.append(ch)
+            i += 1
+        else:
+            j = i
+            while j < n and not text[j].isspace() and text[j] not in '{}=#"':
+                j += 1
+            out.append(text[i:j])
+            i = j
+    return out
 
 
 def _parse_block(tokens, i):
@@ -92,10 +111,21 @@ def _parse_block(tokens, i):
         if i + 1 < n and tokens[i + 1] == "=":
             key = tok
             i += 2
-            if i < n and tokens[i] == "{":
+            if i >= n:
+                # `key =` 后没有值：记为不带值的键，不再越界取值
+                node.children.append(Node(key))
+                DATA_LOG.warning(
+                    "particle file: missing value for key '%s', treated as empty", key)
+                continue
+            if tokens[i] == "{":
                 sub, i = _parse_block(tokens, i + 1)
                 sub.key = key
                 node.children.append(sub)
+            elif tokens[i] == "}":
+                # `key = }` 是空值：这个 } 属于外层，不消费
+                node.children.append(Node(key))
+                DATA_LOG.warning(
+                    "particle file: empty value for key '%s' before '}'", key)
             else:
                 child = Node(key)
                 child.value = _convert_token(tokens[i])
@@ -120,10 +150,21 @@ def parse_text(text):
         if i + 1 < n and tokens[i + 1] == "=":
             key = tok
             i += 2
-            if i < n and tokens[i] == "{":
+            if i >= n:
+                # `key =` 后没有值：保留键名，不再越界取值
+                out.append(Node(key))
+                DATA_LOG.warning(
+                    "particle file: missing value for key '%s', treated as empty", key)
+                continue
+            if tokens[i] == "{":
                 sub, i = _parse_block(tokens, i + 1)
                 sub.key = key
                 out.append(sub)
+            elif tokens[i] == "}":
+                # `key = }` 是空值：这个 } 属于外层，不消费
+                out.append(Node(key))
+                DATA_LOG.warning(
+                    "particle file: empty value for key '%s' before '}'", key)
             else:
                 child = Node(key)
                 child.value = _convert_token(tokens[i])
@@ -135,7 +176,8 @@ def parse_text(text):
 
 
 def parse_file(path):
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    # utf-8-sig：带 BOM 时把 BOM 当编码标记吃掉，否则首 token 会带上 \ufeff
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
         return parse_text(fh.read())
 
 
@@ -158,6 +200,20 @@ def _as_float(v, default=0.0):
     try:
         return float(v)
     except (TypeError, ValueError):
+        return default
+
+
+def _as_int(v, default=1):
+    """取整数值：非有限值（inf/nan，如 1e400）与非数值一并回退默认值。
+
+    int(inf) 抛 OverflowError、int(nan) 抛 ValueError，两者都会让整份文件解析失败。
+    """
+    f = _as_float(v, float(default))
+    if not math.isfinite(f):
+        return default
+    try:
+        return int(f)
+    except (OverflowError, ValueError):
         return default
 
 
@@ -229,12 +285,14 @@ def _vec3(node, default=(0.0, 0.0, 0.0)):
 # ----------------------------------------------------------------------------------------------------------------------
 
 class PdxAnimation:
-    __slots__ = ("name", "start", "duration", "repeat", "min_value", "max_value", "curve", "op", "axis")
+    __slots__ = ("name", "start", "duration", "repeat", "min_value", "max_value", "curve",
+                 "op", "axis", "op_warned")
 
     def __init__(self, node):
         nm = node.child("name")
         self.name = str(nm.value) if nm is not None and nm.value is not None else ""
         self.start = _pair(node.child("start"))[0]
+        # duration：life 轴按寿命倍数、life_abs 轴按秒；-1 表示「与寿命等长」
         self.duration = _pair(node.child("duration"), 1.0)[0]
         self.repeat = _bool(node.child("repeat"))
         self.min_value = _pair(node.child("minValue"))[0]
@@ -243,9 +301,15 @@ class PdxAnimation:
         raw = list(curve_node.positional) if curve_node is not None else []
         self.curve = []
         for i in range(0, len(raw) - 1, 2):
-            self.curve.append((_as_float(raw[i], 0.0), _as_float(raw[i + 1], 0.0)))
+            # 曲线采样点：x 非有限（如 1e400）或两点乱序都会让求值取到无穷/负跨度
+            cx = _as_float(raw[i], 0.0)
+            cy = _as_float(raw[i + 1], 0.0)
+            if math.isfinite(cx) and math.isfinite(cy):
+                self.curve.append((cx, cy))
+        self.curve.sort()
         op_node = node.child("op")
         self.op = str(op_node.value).strip('"') if op_node is not None and op_node.value else "MUL"
+        self.op_warned = False      # 未知 op 只报一次，避免逐粒子刷屏
         time_node = node.child("time")
         self.axis = str(time_node.value).strip('"') if time_node is not None and time_node.value else "life"
 
@@ -313,7 +377,7 @@ class PdxSubsystem:
         #     真做父子跟随是高风险低收益。
         # 解析出来至少让它在面板上可见（消除静默丢弃），也为将来要做时留好入口。
         self.children = [PdxSubsystem(c) for c in node.child_values("childsystem")]
-        self.max_amount = int(_pair(node.child("max_amount"), 100.0)[0])
+        self.max_amount = _as_int(_pair(node.child("max_amount"), 100.0)[0], 100)
         et = node.child("emitter_type")
         self.emitter_type = str(et.value).strip('"') if et is not None and et.value is not None else "point"
         self.box_x = _pair(node.child("box_emitter_x"))
@@ -340,8 +404,9 @@ class PdxSubsystem:
             s = tex.child("shader")
             self.texture_file = str(f.value).strip('"') if f is not None and f.value is not None else ""
             self.texture_shader = str(s.value).strip('"') if s is not None and s.value is not None else "ParticleAdditive"
-            self.sheet_x = int(_pair(tex.child("x"), 1.0)[0])
-            self.sheet_y = int(_pair(tex.child("y"), 1.0)[0])
+            # 贴图 x/y 可写浮点，故按 float 取整，1e400 这类溢出值回退 1
+            self.sheet_x = _as_int(_pair(tex.child("x"), 1.0)[0], 1)
+            self.sheet_y = _as_int(_pair(tex.child("y"), 1.0)[0], 1)
         else:
             self.texture_file, self.texture_shader, self.sheet_x, self.sheet_y = "", "ParticleAdditive", 1, 1
         self.sheet_anim = _bool(node.child("spritesheet_animation"))
@@ -351,9 +416,10 @@ class PdxSubsystem:
         if color is not None:
             # 三个通道各自也是「值 方差」：原版 572/663/562 个子系统写了非零方差
             # （如 y={ 150 20 }、z={ 80 20 }），只取 [0] 会把每颗粒子的颜色抖动丢掉。
-            cr = _pair(color.child("x"), 255.0)
-            cg = _pair(color.child("y"), 255.0)
-            cb = _pair(color.child("z"), 255.0)
+            # 键名两种写法都有：x/y/z 与 r/g/b，只认前者会把颜色整份丢成白色
+            cr = _pair(color.child("x") or color.child("r"), 255.0)
+            cg = _pair(color.child("y") or color.child("g"), 255.0)
+            cb = _pair(color.child("z") or color.child("b"), 255.0)
             self.color = (cr[0] / 255.0, cg[0] / 255.0, cb[0] / 255.0)
             self.color_var = (cr[1] / 255.0, cg[1] / 255.0, cb[1] / 255.0)
             a = color.child("alpha")

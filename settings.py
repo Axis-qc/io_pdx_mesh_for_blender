@@ -58,11 +58,15 @@ class PDXsettings(object):
     def load_settings_file(self, filepath):
         # default to empty settings dictionary
         settings_dict = {}
-        with open(filepath) as f:
-            try:
-                settings_dict = json.load(f)
-            except Exception:
-                SETTINGS_LOG.error("Failed loading settings file", exc_info=True)
+        # 打开也可能失败（路径被目录占用、ACL 拒绝、只读介质），读不出来就退化成空配置。
+        try:
+            with open(filepath) as f:
+                try:
+                    settings_dict = json.load(f)
+                except Exception:
+                    SETTINGS_LOG.error("Failed loading settings file", exc_info=True)
+        except OSError:
+            SETTINGS_LOG.error("Failed opening settings file", exc_info=True)
 
         self.config_path = filepath
         for k, v in settings_dict.items():

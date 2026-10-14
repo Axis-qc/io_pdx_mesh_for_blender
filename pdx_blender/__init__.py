@@ -125,12 +125,14 @@ def register():
 
 def unregister():
     pdx_particles.unregister()
-    for cls in classes:
-        bpy.utils.unregister_class(cls)
+    for cls in reversed(classes):
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception as err:  # noqa: BLE001
+            IO_PDX_LOG.warning("failed to unregister %s: %s", getattr(cls, "__name__", cls), err)
     pdx_i18n.unregister()
 
-    # remove tool properties from scene
-    del bpy.types.Scene.io_pdx_settings
-    del bpy.types.Scene.io_pdx_material
-    del bpy.types.Scene.io_pdx_group
-    del bpy.types.Scene.io_pdx_export
+    # remove tool properties from scene（按存在性删除：注册中途失败时可能不在）
+    for name in ("io_pdx_settings", "io_pdx_material", "io_pdx_group", "io_pdx_export"):
+        if hasattr(bpy.types.Scene, name):
+            delattr(bpy.types.Scene, name)

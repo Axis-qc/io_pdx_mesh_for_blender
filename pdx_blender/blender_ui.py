@@ -121,7 +121,8 @@ class IOPDX_OT_popup_message(Operator):
             txt_lines.append("")
 
         col = self.layout.column(align=True)
-        col.label(text=txt_lines[0], icon=self.msg_icon)
+        # 空文本（如更新检查失败时的 LATEST_NOTES）会让 txt_lines 为空，取 [0] 会抛 IndexError
+        col.label(text=txt_lines[0] if txt_lines else "", icon=self.msg_icon)
         for line in txt_lines[1:]:
             if line:
                 col.label(text=line)
@@ -767,6 +768,8 @@ class IOPDX_PT_PDXblender_info(PDXUI, Panel):
     bl_label = "Info"
     bl_options = {"HIDE_HEADER"}
     panel_order = 0
+    # 主面板（粒子/模型/实体浏览器）固定在最上，这一组顺次排在它后面
+    bl_order = 1
 
     def draw(self, context):
         self.layout.label(text=pdx_i18n.iface("PDX Blender Tools - v{}").format(github.CURRENT_VERSION), icon="TOOL_SETTINGS")
@@ -774,12 +777,12 @@ class IOPDX_PT_PDXblender_info(PDXUI, Panel):
         row = self.layout.row(align=True)
         split = row.split(factor=0.85, align=True)
         col1, col3 = split.column(align=True), split.column(align=True)
-        # update info appears if we aren't at the latest tag version
-        if github.AT_LATEST is False:
+        # 只有确实查到线上版本、且线上比本地新时才给更新按钮；
+        # 检查失败时 LATEST_VERSION 是 0.0/None，照旧画会谎报「UPDATE - v0.0」。
+        if github.AT_LATEST is False and github.UPDATE_KNOWN:
             split = col1.split(factor=0.4, align=True)
             col1, col2 = split.column(align=True), split.column(align=True)
-            btn_txt = "UPDATE - v{}".format(github.LATEST_VERSION)
-            # 修复Python 3.13兼容性：检查github.LATEST_URL类型
+            btn_txt = pdx_i18n.iface("UPDATE - v{}").format(github.LATEST_VERSION)
             if hasattr(github, 'LATEST_URL') and isinstance(github.LATEST_URL, dict):
                 update_url = github.LATEST_URL.get("blender", github.LATEST_RELEASE)
             else:
@@ -797,6 +800,7 @@ class IOPDX_PT_PDXblender_file(PDXUI, Panel):
     # bl_idname = 'panel.io_pdx_mesh.file'
     bl_label = "File"
     panel_order = 1
+    bl_order = 2
 
     def draw(self, context):
         self.layout.label(text="Import:", icon="IMPORT")
@@ -814,6 +818,7 @@ class IOPDX_PT_PDXblender_tools(PDXUI, Panel):
     # bl_idname = 'panel.io_pdx_mesh.tools'
     bl_label = "Tools"
     panel_order = 2
+    bl_order = 3
 
     def draw(self, context):
         col = self.layout.column(align=True)
@@ -848,6 +853,7 @@ class IOPDX_PT_PDXblender_display(PDXUI, Panel):
     bl_label = "Display"
     bl_options = {"DEFAULT_CLOSED"}
     panel_order = 3
+    bl_order = 4
 
     def draw(self, context):
         col = self.layout.column(align=True)
@@ -874,6 +880,7 @@ class IOPDX_PT_PDXblender_setup(PDXUI, Panel):
     bl_label = "Setup"
     bl_options = {"DEFAULT_CLOSED"}
     panel_order = 4
+    bl_order = 5
 
     def draw(self, context):
         settings = context.scene.io_pdx_settings
@@ -890,6 +897,7 @@ class IOPDX_PT_PDXblender_help(PDXUI, Panel):
     bl_parent_id = "IOPDX_PT_PDXblender_info"
     bl_options = {"DEFAULT_CLOSED"}
     panel_order = 5
+    bl_order = 6
 
     def draw(self, context):
         col = self.layout.column(align=True)
@@ -993,7 +1001,7 @@ class IOPDX_AddonPreferences(AddonPreferences):
             status = getattr(scene, "io_pdx_index_status", "") or ""
         if not status:
             n_extra = len([entry for entry in self.extra_roots if entry.path])
-            status = "{0} game folder, {1} extra folder(s) configured".format(
+            status = pdx_i18n.iface("{0} game folder, {1} extra folder(s) configured").format(
                 "1" if self.vanilla_root else "no", n_extra)
         box.label(text=status, icon="INFO")
 # fmt:on

@@ -60,6 +60,7 @@ _ZH = {
     "Apply material to selected?": "把材质应用到选中对象？",
     "As blendshape": "作为混合变形导出",
     "Building list ...": "正在建立列表 ...",
+    "Building index ...": "正在建立索引 ...",
     "Categories ({0} off):": "分类（已关 {0}）：",
     "Clear": "清空",
     "Clear loaded": "清除已加载",
@@ -104,6 +105,11 @@ _ZH = {
     "Extra folders to index:": "额外索引目录：",
     "Face the viewport": "朝向视口",
     "File": "文件",
+    "File:": "文件：",
+    "UPDATE - v{}": "更新 - v{}",
+    "{0} game folder, {1} extra folder(s) configured": "已配置 {0} 个游戏目录、{1} 个附加目录",
+    "Skipped folders ({0}):": "已跳过的目录（{0} 个）：",
+    "{0} x{1}": "{0} ×{1}",
     "File not found: {0}": "找不到文件：{0}",
     "Filter export by selection": "只导出选中对象",
     "Find the game install folder": "查找游戏安装目录",
@@ -158,6 +164,13 @@ _ZH = {
         "把选中的骨骼动画加载到场景骨架上（按场景帧率重定时，时长不变）",
     "Loaded animation {0}": "已加载动画 {0}",
     "Loaded entity {0} ({1} particle(s))": "已加载实体 {0}（{1} 个粒子）",
+    "{0} (no body)": "{0}（无本体）",
+    "{0} particle(s)": "{0} 个粒子",
+    "no file": "无文件",
+    "Nothing to list on this tab.": "此标签页没有可列出的内容。",
+    "Switch tab, clear the search, or Rescan.": "切换标签页、清空搜索，或重新扫描。",
+    "{0} shown / {1} matched  ·  index {2} files in {3}s":
+        "显示 {0} / 匹配 {1}  ·  索引 {2} 个文件耗时 {3} 秒",
     "Loaded model {0}": "已加载模型 {0}",
     "Loaded {0} particle system(s)": "已加载 {0} 个粒子系统",
     "Loaded: {0}": "已加载：{0}",
@@ -193,6 +206,8 @@ _ZH = {
     "or add a mod folder there, then Rescan.": "或在其中添加 mod 目录，然后重新扫描。",
     "Paradox forums": "Paradox 论坛",
     "Particles": "粒子",
+    "Particles not loaded (missing mount point or body): {0}":
+        "以下粒子未加载（挂点或本体缺失）：{0}",
     "PDX Blender Tools": "PDX Blender 工具",
     "PDX Blender Tools - v{}": "PDX Blender 工具 - v{}",
     "PDX bones:": "PDX 骨骼：",
@@ -330,8 +345,12 @@ def iface(msgid):
 
 
 def rpt(msgid):
-    """Same as iface() for operator reports, so a formatted report obeys the
-    same 'translate reports' preference an unformatted one does."""
+    """Same as iface() for operator reports.
+
+    This one goes through pgettext_rpt, so it honours Blender's "Translate
+    Reports" preference: with that preference switched off the English source
+    text is returned even though the surrounding panel is translated.
+    """
     try:
         return bpy.app.translations.pgettext_rpt(msgid, CTX)
     except Exception:  # noqa: BLE001

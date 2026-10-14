@@ -300,6 +300,13 @@ def _build_src_surface():
                 if kw.arg == "message":
                     note(unwrap_template(kw.value), "report", where)
 
+        # ---- 任何 iface()/rpt() 包裹的串都算源码面 ----
+        # 之前只采集 text=/label= 关键字位置，导致「先存进变量再画」的串
+        # （如列表状态行赋值给 scene 属性）永远进不了源码面，漏译查不出来。
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call) and _cname(n) in ("iface", "rpt") and n.args:
+                note(unwrap_template(n.args[0]), "wrapped", "%s:%d" % (rel, n.lineno))
+
         # ---- layouts labelled "anim:..." style via label() keyword only ----
         for n in ast.walk(tree):
             if isinstance(n, ast.Call) and _cname(n) in ("iface", "rpt") and n.args:

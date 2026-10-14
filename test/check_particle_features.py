@@ -17,6 +17,12 @@
   6. 三轴自转   rotation_speed_pitch / _yaw / _roll 的朝向增量是否符合契约
   7. 回退      时间轴回退是否走关键帧、且与从 0 全量重放逐位一致
   8. 向量化    力场向量化与纯 Python 是否逐位一致
+  9~15. 力场语义、mass、基角扰动、哈希维、二元组规则表等既有契约
+  16. 解析健壮性 越界 / 空值 / BOM / r,g,b 颜色 / inf 尺寸 / 引号内的 #
+  17. 动画      op=ABS、time 轴、start / duration / repeat 是否真的参与求值
+  18. 随机维    size / alpha / 发射体角是否各有独立 salt
+  19. 上限触顶  MAX_QUADS 裁剪与 MAX_PREVIEW_SECONDS 是否报出来
+  20. 活体判定  用户手动删掉预览对象后是否还会抛 ReferenceError
 
 抽样口径：解析层（读 .asset、数键）全量扫，成本秒级；
 模拟层（SystemSim + advance 跑物理）抽样，固定种子可复现——
@@ -26,6 +32,7 @@
 """
 
 import itertools
+import logging
 import math
 import os
 import random
@@ -1977,6 +1984,486 @@ if _cross is not None:
                   min(_rs), max(_rs), _r0, _rv))
 else:
     check("找到 pitch 跨 90 的球面样本", False)
+
+print()
+print("=" * 78)
+print("16. 解析健壮性：越界、空值、BOM、r/g/b 颜色、非有限值、引号内的 #")
+print("=" * 78)
+
+
+def _parse_or_none(txt):
+    try:
+        return P.parse_text(txt)
+    except Exception as _e:  # noqa: BLE001
+        return _e
+
+
+def _parse_file_or_none(path):
+    try:
+        return P.parse_file(path)
+    except Exception as _e:  # noqa: BLE001
+        return _e
+
+
+# 16a `key =` 结尾不再越界（曾 IndexError）
+_r1 = _parse_or_none("a = 1\nb =")
+check("`key =` 结尾不再越界崩溃",
+      isinstance(_r1, list) and [n.key for n in _r1] == ["a", "b"],
+      "结果 {0}".format(_r1 if not isinstance(_r1, list) else [n.key for n in _r1]))
+
+# 16a2 块内 `name =` 紧跟 `}` 不再越界（曾 IndexError）
+_r2 = _parse_or_none("particle = { name = }")
+check("块内 `name =` 紧跟 `}` 不再越界崩溃",
+      isinstance(_r2, list) and len(_r2) == 1 and [c.key for c in _r2[0].children] == ["name"],
+      "结果 {0}".format(_r2 if not isinstance(_r2, list) else [c.key for c in _r2[0].children]))
+
+# 16b `key = }` 是空值：那个 `}` 属于外层，不能被当成字符串吃掉
+# （旧写法返回 a/b/c 三项但 b 的值是 "}"，且块内的 `}` 被吞后兄弟块整片吸入）
+_r3 = _parse_or_none("a = 1 b = } c = 2")
+check("`b = }` 的空值不吞掉闭块（兄弟 c 仍在）",
+      isinstance(_r3, list) and [n.key for n in _r3] == ["a", "b", "c"]
+      and _r3[1].value is None,
+      "结果 {0}".format(_r3 if not isinstance(_r3, list) else
+                        [(n.key, n.value) for n in _r3]))
+
+_r4 = _parse_or_none(
+    "particle = { name = s1 subsystem = { name = } }\n"
+    "particle = { name = s2 subsystem = { name = sub2 } }\n")
+_ok4 = (isinstance(_r4, list) and len(_r4) == 2
+        and all(len(t.child_values("subsystem")) == 1 for t in _r4)
+        and _r4[0].child("name").value == "s1" and _r4[1].child("name").value == "s2")
+check("空值不把后一个顶层块整片吸入前一个块", _ok4,
+      "顶层 {0} 个，子系统数 {1}".format(
+          len(_r4) if isinstance(_r4, list) else _r4,
+          [len(t.child_values("subsystem")) for t in _r4] if isinstance(_r4, list) else None))
+
+# 16c color 的 r/g/b 键名（原版 18 个文件 50 个子系统这么写，曾整份丢成白色）
+_c1 = P.PdxSubsystem(P.parse_text("subsystem = { color = { r = 180 g = 180 b = 255 } }")[0])
+check("color 的 r/g/b 键名被识别（不再丢成白色）",
+      abs(_c1.color[0] - 180.0 / 255.0) < 1e-9 and abs(_c1.color[2] - 1.0) < 1e-9,
+      "解析结果 {0}".format(tuple(round(v, 4) for v in _c1.color)))
+_c2 = P.PdxSubsystem(P.parse_text("subsystem = { color = { x = 10 y = 20 z = 30 } }")[0])
+check("color 的 x/y/z 键名仍然有效（未回归）",
+      abs(_c2.color[0] - 10.0 / 255.0) < 1e-9 and abs(_c2.color[2] - 30.0 / 255.0) < 1e-9,
+      "解析结果 {0}".format(tuple(round(v, 4) for v in _c2.color)))
+# 真样本：arc_emitter_file 的 color 是 r/g/b 写法
+_arc = lib.systems.get("arc_emitter_file")
+_hit = lib.systems.get("hit_effect_shield")
+_rgbs = [sb.color for sb in (_arc.subsystems if _arc else [])]
+check("arc_emitter_file 的 r/g/b 颜色不再是纯白",
+      bool(_rgbs) and all(c != (1.0, 1.0, 1.0) for c in _rgbs),
+      "颜色 {0}".format([tuple(round(v, 3) for v in c) for c in _rgbs[:3]]))
+check("hit_effect_shield 的 r/g/b 颜色不再是纯白",
+      _hit is not None and all(sb.color != (1.0, 1.0, 1.0) for sb in _hit.subsystems),
+      "颜色 {0}".format([tuple(round(v, 3) for v in sb.color)
+                         for sb in (_hit.subsystems if _hit else [])][:3]))
+
+# 16d BOM 文件：带 BOM 时首 token 不能变成 "\ufeffparticle"（否则整份静默作废）
+import tempfile  # noqa: E402
+
+_fd, _bom_path = tempfile.mkstemp(suffix=".asset")
+os.close(_fd)
+try:
+    with open(_bom_path, "wb") as _fh:
+        _fh.write("\ufeffparticle = { name = bom_probe max_amount = 7 }".encode("utf-8"))
+    _bom = _parse_file_or_none(_bom_path)
+    check("带 BOM 的文件不再整份作废",
+          isinstance(_bom, list) and len(_bom) == 1 and _bom[0].key == "particle"
+          and _bom[0].child("name") is not None
+          and _bom[0].child("name").value == "bom_probe",
+          "顶层 {0}".format([(n.key, n.child("name").value if n.child("name") else None)
+                             for n in _bom] if isinstance(_bom, list) else _bom))
+finally:
+    os.unlink(_bom_path)
+
+# 16e max_amount / 贴图尺寸写成 inf（1e400）时回退默认值而不是抛异常
+_fd2, _inf_path = tempfile.mkstemp(suffix=".asset")
+os.close(_fd2)
+try:
+    with open(_inf_path, "w", encoding="utf-8") as _fh:
+        _fh.write("particle = { name = inf_probe subsystem = { name = s "
+                  "max_amount = 1e400 texture = { x = 1e400 y = 1e400 } } }")
+    _inf = _parse_file_or_none(_inf_path)
+    try:
+        _inf_sub = P.PdxSubsystem(_inf[0].child_values("subsystem")[0])
+        _inf_amt, _inf_x, _inf_y = _inf_sub.max_amount, _inf_sub.sheet_x, _inf_sub.sheet_y
+    except Exception as _e2:  # noqa: BLE001
+        _inf_amt, _inf_x, _inf_y = repr(_e2), None, None
+    check("inf 的 max_amount 回退默认值（不再 OverflowError）",
+          _inf_amt == 100, "实测 {0}".format(_inf_amt))
+    check("inf 的贴图尺寸回退 1（不再 OverflowError）",
+          _inf_x == 1 and _inf_y == 1, "实测 x={0} y={1}".format(_inf_x, _inf_y))
+finally:
+    os.unlink(_inf_path)
+check("正常的 max_amount / 贴图尺寸未受影响",
+      P.PdxSubsystem(P.parse_text(
+          "subsystem = { max_amount = 12 texture = { x = 4 y = 4 } }")[0]).max_amount == 12)
+
+# 16f 引号内的 # 不是注释（旧写法在引号中间截断）
+_tok = P._tokenize('name = "a#b" # 真注释\nc = 2')
+check("引号内的 # 不被当成注释起点",
+      _tok == ["name", "=", '"a#b"', "c", "=", "2"], "token {0}".format(_tok))
+check("引号外的 # 仍然去注释",
+      [n.value for n in P.parse_text('name = "a#b" c = 2 # 后面的说明')] == ["a#b", 2.0])
+
+print()
+print("=" * 78)
+print("17. 动画：op=ABS、time 轴、start / duration / repeat 参与求值")
+print("=" * 78)
+print("   time=life 按寿命倍数、time=life_abs 按秒；spawn / system 无法确定，只报不猜。")
+
+
+def _anim(txt):
+    return P.PdxAnimation(P.parse_text("animation = { " + txt + " }")[0])
+
+
+# 17a ABS：三处引用的 size 基准都是 0，只有加法才产生闪光（乘法恒为 0）
+_abs = _anim('name = a op = ABS minValue = 0 maxValue = 4 '
+             'curve = { 0.0 0.0 0.25 0.8 1.0 1.0 }')
+check("op=ABS 走加法（基准 0 时不再被乘成 0）",
+      S._apply_anim(0.0, _abs, 0.25) > 0.0 and S._apply_anim(0.0, _abs, 0.0) == 0.0,
+      "u=0.25 -> {0}".format(S._apply_anim(0.0, _abs, 0.25)))
+# 取绝对值这一步只有「加法结果转负」才验得出来：base=0 时「加完取绝对值」与「只加」同值
+check("op=ABS 确实对叠加结果取绝对值（负结果不被钳成 0）",
+      abs(S._apply_anim(-5.0, _abs, 0.25) - 1.8) < 1e-9
+      and abs(S._apply_anim(0.0, _abs, 0.25) - 3.2) < 1e-9,
+      "-5 + 3.2 -> {0}（应 1.8；只加不取绝对值会得 0）".format(
+          S._apply_anim(-5.0, _abs, 0.25)))
+_absref = []
+for _n2, _sy2 in lib.systems.items():
+    for _sb2 in _sy2.subsystems:
+        _a2 = _sy2.anim_for_channel(_sb2, "size")
+        if _a2 is not None and _a2.op == "ABS":
+            _absref.append((_n2, _sb2.size[0], _a2.name, _a2.max_value))
+check("存在被引用的 op=ABS 动画且 size 基准为 0", len(_absref) > 0,
+      "{0} 处: {1}".format(len(_absref), _absref[:3]))
+check("ABS 引用的粒子确实会被画出来（尺寸非 0）",
+      all(S._apply_anim(0.0, _sy2.anim_for_channel(_sb2, "size"), 0.5) > 0.0
+          for _n2, _sy2 in lib.systems.items() for _sb2 in _sy2.subsystems
+          if _sy2.anim_for_channel(_sb2, "size") is not None
+          and _sy2.anim_for_channel(_sb2, "size").op == "ABS"),
+      "逐项核对")
+
+# 17b 未知 op 不再静默当乘法：走诊断出口报出来
+_unk = _anim('name = zz op = NOPE curve = { 0.0 1.0 1.0 1.0 }')
+_unk_logs = []
+_h_unk = logging.Handler()
+_h_unk.emit = lambda _rec: _unk_logs.append(_rec.getMessage())
+S.SIM_LOG.addHandler(_h_unk)
+try:
+    _unk_val = S._apply_anim(2.0, _unk, 0.5)
+finally:
+    S.SIM_LOG.removeHandler(_h_unk)
+check("未知 op 经诊断出口报出（不再静默）",
+      len(_unk_logs) == 1 and "NOPE" in _unk_logs[0],
+      "日志 {0}，回落值 {1}".format(_unk_logs, _unk_val))
+
+# 17c duration / start / repeat 参与求值
+_life_anim = _anim('name = d time = life duration = 0.05 curve = { 0.0 0.859 1.0 1.0 }')
+check("time=life 的 duration 按寿命倍数（0.05 × 5s = 0.25s 走完）",
+      abs(S._anim_u(_life_anim, 0.25, 5.0) - 1.0) < 1e-9
+      and abs(S._anim_u(_life_anim, 0.125, 5.0) - 0.5) < 1e-9,
+      "u(0.125s, life=5)={0}".format(round(S._anim_u(_life_anim, 0.125, 5.0), 4)))
+check("time=life 的长寿命粒子不会被提前定格（duration=1 仍走满整条寿命）",
+      abs(S._anim_u(_anim('name = d time = life duration = 1 curve = { 0.0 0.0 1.0 1.0 }'),
+                    7.5, 10.0) - 0.75) < 1e-9)
+check("time=life_abs 的 duration 按秒",
+      abs(S._anim_u(_anim('name = d time = life_abs duration = 10 curve = { 0.0 0.0 1.0 1.0 }'),
+                    5.0, 60.0) - 0.5) < 1e-9)
+check("start 之前取曲线起点",
+      S._anim_u(_anim('name = d time = life start = 0.5 duration = 1 '
+                      'curve = { 0.0 0.0 1.0 1.0 }'), 2.0, 10.0) == 0.0)
+check("repeat=yes 走完区间后回绕（不再定格在末端）",
+      abs(S._anim_u(_anim('name = d time = life duration = 0.25 repeat = yes '
+                          'curve = { 0.0 0.0 1.0 1.0 }'), 3.0, 4.0) - 0.0) < 1e-9,
+      "u={0}".format(round(S._anim_u(
+          _anim('name = d time = life duration = 0.25 repeat = yes '
+                'curve = { 0.0 0.0 1.0 1.0 }'), 3.0, 4.0), 4)))
+check("repeat=no 走完即停在末端",
+      abs(S._anim_u(_anim('name = d time = life duration = 0.25 repeat = no '
+                          'curve = { 0.0 0.0 1.0 1.0 }'), 3.0, 4.0) - 1.0) < 1e-9)
+
+# 17d spawn / system 无法确定计时基准：必须报出来，不许静默
+_ax_logs = []
+_h_ax = logging.Handler()
+_h_ax.emit = lambda _rec: _ax_logs.append(_rec.getMessage())
+S.SIM_LOG.addHandler(_h_ax)
+try:
+    _spawn_u = S._anim_u(_anim('name = sp time = spawn duration = 2 curve = { 0.0 0.0 1.0 1.0 }'),
+                         1.0, 4.0)
+    _sys_u = S._anim_u(_anim('name = sy time = system duration = 5 curve = { 0.0 0.0 1.0 1.0 }'),
+                       1.0, 4.0)
+finally:
+    S.SIM_LOG.removeHandler(_h_ax)
+check("time=spawn / system 经诊断出口报出「未按该轴生效」",
+      len([m for m in _ax_logs if "spawn" in m or "system" in m]) >= 1
+      and abs(_spawn_u - 0.25) < 1e-9 and abs(_sys_u - 0.25) < 1e-9,
+      "日志 {0}".format(_ax_logs[:2]))
+
+# 17e 真样本：astral_rift 的 SizeLightning duration=0.05 配 life=5s / 0.1s
+_astral = lib.systems.get("astral_rift_particle")
+if _astral is not None:
+    _lt = next((sb for sb in _astral.subsystems if sb.name == "Lightning"), None)
+    _lt2 = next((sb for sb in _astral.subsystems if sb.name == "Lightning 2"), None)
+    _sz = _astral.anim_for_channel(_lt, "size") if _lt else None
+    check("astral_rift SizeLightning 的 duration=0.05 生效（5s 寿命不再全程只走 1%）",
+          _sz is not None and abs(S._anim_u(_sz, 0.25, 5.0) - 1.0) < 1e-9
+          and abs(S._anim_u(_sz, 0.005, 0.1) - 1.0) < 1e-9,
+          "duration={0}".format(_sz.duration if _sz else None))
+    _ag = _astral.anim_for_channel(_lt, "alpha") if _lt else None
+    check("astral_rift GradientEnergy 的 life_abs duration=5 按秒走",
+          _ag is not None and _ag.axis == "life_abs"
+          and abs(S._anim_u(_ag, 2.5, 5.0) - 0.5) < 1e-9,
+          "axis={0} duration={1}".format(_ag.axis if _ag else None,
+                                         _ag.duration if _ag else None))
+else:
+    check("找到 astral_rift_particle 真样本", False)
+
+# 17f 跳帧 vs 逐帧在时间轴改动后仍然逐位一致（含带 duration/repeat 的样本）
+_tl_bad = 0
+_tl_tot = 0
+for _nm3 in ("astral_rift_particle", "explosion", "hit_effect_shield"):
+    _sy3 = lib.systems.get(_nm3)
+    if _sy3 is None:
+        continue
+    for _T in (2.0, 5.0):
+        _a3 = S.SystemSim(_sy3)
+        _a3.advance(_T)
+        _b3 = S.SystemSim(_sy3)
+        for _k in range(1, int(_T * 60) + 1):
+            _b3.advance(_k / 60.0)
+        _tl_tot += 1
+        if _fp(_a3) != _fp(_b3):
+            _tl_bad += 1
+check("时间轴改动后跳帧与逐帧仍逐位一致", _tl_bad == 0,
+      "{0} 组比对，{1} 组不一致".format(_tl_tot, _tl_bad))
+
+print()
+print("=" * 78)
+print("18. 随机维独立：size / alpha / 发射体角各有独立 salt")
+print("=" * 78)
+
+# 18a 用户报的现象：life={3 3}、size={4 4} 时寿命最长的必然尺寸最大（秩相关 = 1）
+_salt_sys = None
+for _n4, _sy4 in lib.systems.items():
+    for _sb4 in _sy4.subsystems:
+        if (not _sb4.hide and _sb4.life[1] > 0.0 and _sb4.size[2] > 0.0
+                and _sb4.max_amount >= 200):
+            _salt_sys = (_n4, _sb4)
+            break
+    if _salt_sys:
+        break
+if _salt_sys:
+    _n4, _sb4 = _salt_sys
+    _st4 = next((x for x in S.SystemSim(lib.systems[_n4]).subs if x.sub.name == _sb4.name), None)
+    if _st4 is not None:
+        for _i in range(600):
+            _st4.spawn_count = _i
+            _st4._spawn(0.0)
+        _lv = [p[1] for p in _st4.particles]
+        _szv = [S._pick(_st4.size_base, _st4.size_var, p[16], S._rule_of("size"))
+                for p in _st4.particles]
+        _alv = [S._pick(_st4.alpha_base, _st4.alpha_var, p[17], S._rule_of("alpha"))
+                for p in _st4.particles]
+        _rho_ls = abs(_spearman(_lv, _szv))
+        _rho_sa = abs(_spearman(_szv, _alv))
+        print("  样本: {0} / {1}  life={2} size={3}".format(
+            _n4[:34], _sb4.name, _sb4.life, (_sb4.size[0], _sb4.size[2])))
+        print("    |秩相关| life~size={0:.4f}  size~alpha={1:.4f}（旧写法恒为 1.0000）".format(
+            _rho_ls, _rho_sa))
+        check("size 不再与 life 共用同一个随机权重", _rho_ls < 0.3,
+              "|rho|={0:.4f}，{1} 颗".format(_rho_ls, len(_lv)))
+        check("alpha 不再与 size 共用同一个随机权重", _rho_sa < 0.3,
+              "|rho|={0:.4f}".format(_rho_sa))
+        check("寿命权重仍存在 p[10]（回退重放要它）",
+              bool(_st4.particles) and all(
+                  abs(p[10] - _st4._w(_kq, 0)) < 1e-12
+                  for _kq, p in enumerate(_st4.particles)),
+              "{0} 颗逐项核对".format(len(_st4.particles)))
+    else:
+        check("life/size 方差样本进入模拟", False)
+else:
+    check("找到 life 与 size 都带方差的样本", False)
+
+# 18b 新增 salt 与既有维不撞：与 salt=1/2 的秩相关必须低（复用即 1.0）
+_wcol = {}
+for _i in range(400):
+    for _s5 in (1, 2, S._SALT_SIZE, S._SALT_ALPHA, S._SALT_EMIT_YAW, S._SALT_EMIT_PITCH):
+        _wcol.setdefault(_s5, []).append(_st_w._w(_i, _s5))
+_rho_reuse = max(abs(_spearman(_wcol[_s5], _wcol[_s6]))
+                 for _s5 in (S._SALT_SIZE, S._SALT_ALPHA, S._SALT_EMIT_YAW, S._SALT_EMIT_PITCH)
+                 for _s6 in (1, 2))
+_rho_new = max(abs(_spearman(_wcol[_s5], _wcol[_s6]))
+               for _s5, _s6 in itertools.combinations(
+                   (S._SALT_SIZE, S._SALT_ALPHA, S._SALT_EMIT_YAW, S._SALT_EMIT_PITCH), 2))
+print("  新 salt 与既有维 salt=1/2 的最大 |秩相关| = {0:.4f}（复用同一 salt 时为 1.0000）".format(
+    _rho_reuse))
+check("新增 salt 与既有维不共线", _rho_reuse < 0.3, "|rho|={0:.4f}".format(_rho_reuse))
+check("新增 salt 之间互不共线", _rho_new < 0.3, "|rho|={0:.4f}".format(_rho_new))
+
+# 18c 发射体角不再与出生点位置共用 salt（旧写法与半径秩相关 = 1）
+_emit_probe = P.PdxParticleSystem(P.parse_text(
+    'particle = { name = salt_emit_probe subsystem = { name = s1 max_amount = 5000 '
+    'emission = 3000 life = { 5 0 } emitter_type = "sphere" '
+    'sphere_emitter_radius = { 0 5 } sphere_emitter_yaw = { 0 360 } '
+    'sphere_emitter_pitch = { 0 0 } emitter_yaw = { 0 180 } emitter_pitch = { 0 0 } '
+    'velocity = 10 velocity_pitch = { 0 0 } velocity_yaw = { 0 0 } '
+    'size = { 2 0 } alpha = { 255 0 } hide = no } }')[0], "probe")
+_st6 = S.SystemSim(_emit_probe).subs[0]
+for _i in range(600):
+    _st6.spawn_count = _i
+    _st6._spawn(0.0)
+_pos6 = _st6.sub.position
+_rad6, _azi6 = [], []
+for _p6 in _st6.particles:
+    _rx, _ry, _rz = (_p6[2] - _pos6[0], _p6[3] - _pos6[1], _p6[4] - _pos6[2])
+    _rad6.append(math.sqrt(_rx * _rx + _ry * _ry + _rz * _rz))
+    _azi6.append(math.degrees(math.atan2(-_p6[5], _p6[7])))
+_rho_re = abs(_spearman(_rad6, _azi6))
+print("  球面半径 ~ 发射体旋转后的方向角 |秩相关| = {0:.4f}（复用 salt 时为 1.0000）".format(
+    _rho_re))
+check("发射体角与出生点半径不再共用同一个 salt", _rho_re < 0.3,
+      "|rho|={0:.4f}，{1} 颗".format(_rho_re, len(_rad6)))
+
+print()
+print("=" * 78)
+print("19. 上限触顶：MAX_QUADS 裁剪与 MAX_PREVIEW_SECONDS 都要报出来")
+print("=" * 78)
+
+# 19a 超出 MAX_QUADS：画出的数量被裁到上限，且必须有限频告警
+_clip_sys = P.PdxParticleSystem(P.parse_text(
+    'particle = { name = clip_probe subsystem = { name = big max_amount = 10000 '
+    'emission = 2000 life = { 4 0 } size = { 4 0 } alpha = { 255 0 } hide = no } }')[0],
+    "probe")
+_clip_logs = []
+_h_clip = logging.Handler()
+_h_clip.emit = lambda _rec: _clip_logs.append(_rec.getMessage())
+BP.IO_LOG.addHandler(_h_clip)
+try:
+    _pv_clip = BP.PreviewScene(_clip_sys, lib)
+    _sp_clip = _pv_clip.sub_previews[0]
+    _pv_clip.sim.advance(3.0)
+    _alive_clip = len(_sp_clip.sub_sim.snapshot())
+    _drawn_clip = _sp_clip.refresh(None)
+    _logs_first = list(_clip_logs)
+    _sp_clip.refresh(None)          # 第二次刷新不应重复刷屏
+    _logs_second = list(_clip_logs)
+finally:
+    _pv_clip.destroy()
+    BP.IO_LOG.removeHandler(_h_clip)
+print("  存活 {0} 颗 -> 画出 {1} 颗，上限 {2}".format(
+    _alive_clip, _drawn_clip, _sp_clip.capacity))
+check("超出 MAX_QUADS 时画出数量被裁到上限", _drawn_clip == _sp_clip.capacity,
+      "画出 {0}，上限 {1}".format(_drawn_clip, _sp_clip.capacity))
+check("MAX_QUADS 裁剪已报出来（不再静默）",
+      any("MAX_QUADS" in m or "clipped" in m for m in _logs_first),
+      "日志 {0}".format(_logs_first[:1]))
+check("MAX_QUADS 告警限频（第二次刷新不重复报）",
+      len(_logs_second) == len(_logs_first),
+      "第一次 {0} 条，第二次共 {1} 条".format(len(_logs_first), len(_logs_second)))
+_left_clip = [o.name for o in bpy.data.objects if o.name.startswith("pdx_part_big")]
+check("裁剪样本的预览对象已清理", not _left_clip, "{0}".format(_left_clip))
+
+# 19b 超长系统：total_duration 钳到上限，触顶要报出来
+_long_sys = None
+for _n7, _sy7 in lib.systems.items():
+    _sim7 = S.SystemSim(_sy7)
+    if not _sim7.subs:
+        continue
+    _raw7 = max(s.start + (s.duration if s.duration > 0 else 0.0) + s.life + s.life_var
+                for s in _sim7.subs)
+    if _raw7 > S.MAX_PREVIEW_SECONDS + 1.0:
+        _long_sys = (_n7, _sy7)
+        break
+if _long_sys:
+    _n7, _sy7 = _long_sys
+    _cap_logs = []
+    _h_cap = logging.Handler()
+    _h_cap.emit = lambda _rec: _cap_logs.append(_rec.getMessage())
+    S.SIM_LOG.addHandler(_h_cap)
+    try:
+        _sim_cap = S.SystemSim(_sy7)
+        # 时间轴长度就是 total_duration 给出的，用户拖不到上限之外，
+        # 所以超长内容必须在给出时长时报出来，而不是等 advance 触顶。
+        _dur_cap = _sim_cap.total_duration()
+    finally:
+        S.SIM_LOG.removeHandler(_h_cap)
+    print("  超长样本: {0}  建议时长 {1}s（上限 {2}s）".format(
+        _n7[:34], _dur_cap, S.MAX_PREVIEW_SECONDS))
+    check("内容超过 MAX_PREVIEW_SECONDS 时已报出来（不再静默截断时间轴）",
+          len(_cap_logs) > 0, "日志 {0}".format(_cap_logs[:1]))
+    check("total_duration 仍钳在上限内",
+          _sim_cap.total_duration() <= S.MAX_PREVIEW_SECONDS + 1e-9,
+          "{0}".format(_sim_cap.total_duration()))
+    # advance 触顶（时间轴被外部拖到上限之外）也必须报
+    _adv_logs = []
+    _h_adv = logging.Handler()
+    _h_adv.emit = lambda _rec: _adv_logs.append(_rec.getMessage())
+    S.SIM_LOG.addHandler(_h_adv)
+    try:
+        S.SystemSim(_sy7).advance(S.MAX_PREVIEW_SECONDS + 60.0)
+    finally:
+        S.SIM_LOG.removeHandler(_h_adv)
+    check("advance 超过上限时也报出来", len(_adv_logs) > 0, "日志 {0}".format(_adv_logs[:1]))
+else:
+    check("找到原始时长超过上限的样本", False)
+
+print()
+print("=" * 78)
+print("20. 用户手动删除预览对象后不再抛 ReferenceError")
+print("=" * 78)
+print("   Blender 删对象后 is None 为假、bool() 仍为真，只有属性访问才抛 ReferenceError。")
+
+_del_sys = None
+for _n8, _sy8 in lib.systems.items():
+    for _sb8 in _sy8.subsystems:
+        if not _sb8.hide and _sb8.max_amount >= 4 and _sb8.emission[0] >= 2.0:
+            _del_sys = (_n8, _sy8)
+            break
+    if _del_sys:
+        break
+if _del_sys:
+    _n8, _sy8 = _del_sys
+    _pv_del = BP.PreviewScene(_sy8, lib)
+    _sp_del = _pv_del.sub_previews[0]
+    _obj_del = _sp_del.obj
+    _is_none = _obj_del is None
+    _bool_true = bool(_obj_del) is True
+    bpy.data.objects.remove(_obj_del, do_unlink=True)
+    _raises = False
+    try:
+        _obj_del.data
+    except ReferenceError:
+        _raises = True
+    print("  样本: {0}  删除后: is None={1} bool()={2} 属性访问抛 ReferenceError={3}".format(
+        _n8[:34], _is_none, _bool_true, _raises))
+    check("复现前提：删对象后 is None 为假、只有属性访问抛异常",
+          (not _is_none) and _bool_true and _raises)
+
+    def _try(fn):
+        try:
+            fn()
+            return None
+        except Exception as _e:  # noqa: BLE001
+            return _e
+
+    _e_ref = _try(lambda: _sp_del.refresh(None))
+    _e_en = _try(lambda: _pv_del.set_subsystem_enabled(_sp_del.sub_sim.name, True))
+    bpy.data.objects.remove(_pv_del.ref_sphere, do_unlink=True)
+    _e_show = _try(lambda: _pv_del.show_ref_sphere(True))
+    _e_destroy = _try(lambda: _pv_del.destroy())
+    check("删除预览对象后 refresh 不抛异常", _e_ref is None, "{0}".format(_e_ref))
+    check("删除预览对象后 set_subsystem_enabled 不抛异常", _e_en is None, "{0}".format(_e_en))
+    check("删除参照球后 show_ref_sphere 不抛异常", _e_show is None, "{0}".format(_e_show))
+    check("删除预览对象后 destroy 不抛异常", _e_destroy is None, "{0}".format(_e_destroy))
+    _left8 = [o.name for o in bpy.data.objects if o.name.startswith("pdx_part_")]
+    _leftm8 = [m.name for m in bpy.data.meshes if m.name.startswith("pdx_part_")]
+    _leftc8 = [c.name for c in bpy.data.collections if c.name.startswith("pdx_particles_")]
+    check("删除对象后 destroy 仍清干净（对象/网格/集合都不残留）",
+          not _left8 and not _leftm8 and not _leftc8,
+          "对象 {0} 网格 {1} 集合 {2}".format(_left8[:3], _leftm8[:3], _leftc8[:3]))
+else:
+    check("找到可测的预览样本", False)
 
 print()
 print("=" * 78)

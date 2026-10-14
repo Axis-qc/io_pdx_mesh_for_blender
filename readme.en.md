@@ -35,6 +35,8 @@ Animation import is dramatically faster. Keyframes go straight to the action cur
 
 Duplicate bone names no longer break animations. Vanilla skeletons share one name across several bones, and Blender forces unique names by adding a suffix on import, which used to collapse them into one bone when indexing by name; it now matches by name plus occurrence order and restores the original names on export. When making your own models, avoid duplicate bone names in the skeleton.
 
+Duplicate-bone locators no longer drift on an import/export round trip. A locator's `pa` is only a bone name, so with several bones sharing it the locator was positioned against the last one while parented to the first, and export then wrote the difference back into the file (25.54 off on `star_eater`). The first bone of that name is now used consistently.
+
 Fractional playback speed is no longer rounded away (such as 15.06), and is restored on export when the scene fps was not changed.
 
 Locator export no longer depends on the rig's current pose.
@@ -45,9 +47,13 @@ Fixed missing textures. The texture filenames inside a `.mesh` are not necessari
 
 Adapted for Blender 5.x animation data access, and `imp` replaced with `importlib` (removed in Python 3.12).
 
+Fixed several problems that used to interrupt a session. A failed update check, or a repository with no releases, no longer stops the add-on from loading and no longer claims a new version exists; an unreadable settings file degrades to empty settings instead of blocking startup; the release-notes popup no longer errors on empty text; exporting an animation whose timeline frame rate was changed no longer silently alters its duration (the imported frame rate is written back, with a warning). Meshes with n-gons, an empty armature, skeleton-only export with no armature selected, and a failed import no longer raise, and objects left behind by a failed import are cleaned up on the next load.
+
+Fixed the clear-out deleting user objects and leaking datablocks. Clearing the previous load used to look objects up by name, and since Blender recycles a deleted object's name for a new one, a user-created object with the same name could be deleted; ownership is now tracked with a tag on the object itself, so anything you created is left alone. Animations, materials and textures are no longer given a fake user, so switching models or animations repeatedly stops accumulating them.
+
 ### Asset browser and particle preview
 
-The panel lives under `PDX Blender Tools > Particles` in the sidebar and has three tabs: `Models`, `Particles` and `Entity` — a model on its own, a particle system on its own, or a model together with its mount-point particles.
+The main panel sits at the top of the sidebar's `PDX Blender Tools` tab and has three tabs: `Models`, `Particles` and `Entity` — a model on its own, a particle system on its own, or a model together with its mount-point particles. The import/export buttons, material and bone tools, and display and frame-rate settings all live in that same panel; the `Info` / `File` / `Tools` / `Display` / `Setup` / `Help` sub-panels remain below it for the layout you may be used to.
 
 First set the game folder (there is a `Detect` button) and your own mod folders under `Edit > Preferences > Add-ons > IO PDX Mesh`. After that you search, pick and load from the panel instead of browsing folders by hand.
 
@@ -59,17 +65,19 @@ Selecting a model or entity lists the skeletal animations that go with it (entit
 
 Supported: billboards and fixed orientation, point/sphere/box emitters, emitter rotation, per-particle variance, pulsed emission, three-axis spin, size/alpha/colour animation curves, textures and sprite sheets, and the `point` / `planar` / `vortex` / `spin` / `turbulence` / `friction` force fields.
 
+The particle side fixed a batch of silent errors: malformed data (`key =` at end of line, a missing value before `}`) no longer raises or swallows the following subsystems; colours written as `r/g/b` are no longer discarded to plain white; files with a BOM no longer become inert; the animation `op="ABS"` is no longer treated as something other than "add, then take the absolute value" (three size curves have a base of 0, where getting this wrong filters out every particle); an animation's `start` / `duration` / `repeat` / `time` now take part in evaluation, see [使用注意事项.md](使用注意事项.md) for how the `time` axis changes the units; `size` and `life` draw independent random numbers, so the largest particle is no longer always the longest-lived; and deleting a preview object by hand no longer makes clearing or the reference sphere raise. The `time=spawn` / `time=system` axes have no determinable time base, so they keep their old meaning and log a note that the axis is not applied rather than guessing.
+
 Billboard particles face the viewport camera, not a camera object placed in the scene (the scene camera is used only when there is no viewport); the `Face the viewport` toggle turns this off. Particles with `billboard=no` keep their own fixed orientation and never follow the camera.
 
 Particles share the model's axes, so a preview lines up with an imported ship fore/aft and up/down.
 
 Import picks the busiest frame automatically. The `Seed` field controls per-particle randomness (lifetime, speed, spawn position, orientation, colour); the same seed always reproduces the same result, and the refresh button next to it reloads after a change. The default 0 staggers subsystems by index.
 
-Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered; `local_space` has no effect on the preview; an entity's `attach` chain is not expanded, so only the selected entity loads; the state machine (`state_time` / `looping` / `next_state`) is not simulated and events only start after their `time`. The `Entity` tab places particles on the mount point named by the entity's `node` field; mount points come from the model where it has them, and `locator` blocks written in the entity itself are created as needed. When there is no `node`, or the name does not match, particles stay at the origin and a note goes to the log.
+Known limits: `childsystem` nested subsystems are parsed and reported in the log but not rendered; `local_space` has no effect on the preview; an entity's `attach` chain is not expanded, so only the selected entity loads; the state machine (`state_time` / `looping` / `next_state`) is not simulated and events only start after their `time`. The `Entity` tab places particles on the mount point named by the entity's `node` field; mount points come from the model where it has them, and `locator` blocks written in the entity itself are created as needed. When the mount point or the body cannot be found, that particle is **not loaded** and a red error lists the names, instead of silently piling up at the origin. Events without a `node` still play at the entity origin as before.
 
 The interface is localised. All UI text is keyed by its English source string in `pdx_i18n.py` and follows Blender's interface language: Chinese when Blender is in Chinese, the English original otherwise. Simplified Chinese ships today; another language is one more key in the same table.
 
-`version` is 0.99.1, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
+`version` is 1.0.0, with `current_git_tag` left at 0.91 so the built-in updater still treats the upstream 0.91 release as its reference.
 
 ### Usage notes
 

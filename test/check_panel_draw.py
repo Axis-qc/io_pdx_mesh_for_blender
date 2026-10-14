@@ -87,6 +87,28 @@ def main():
     ui._LIST_KEY = None
     ui._REBUILD_SCHEDULED = False
 
+    # ---- 0. 首次打开时不在这里同步建索引，只排定时器 ----
+    # 同步建索引实测要 3.1-3.4 秒（全库），会让侧栏首次展开冻住。
+    ui._INDEX = None
+    ui._INDEX_KEY = None
+    ui._INDEX_SCHEDULED = False
+    ui._LIST_BUILT = False
+    try:
+        ui.IOPDX_PT_PDXparticles.draw(make_panel_self(), bpy.context)
+        check("first open defers the index build instead of blocking", ui._INDEX_SCHEDULED is True)
+        check("first open leaves the index unbuilt", ui._INDEX is None)
+    except Exception:
+        check("first open defers the index build instead of blocking", False,
+              traceback.format_exc().strip().splitlines()[-1])
+
+    # 后续步骤需要一个已建好的索引：同步建一次并标记成当前
+    # （上面排的那个定时器在测试进程里不会跑到，这里显式建并复位标志）
+    ui._INDEX_SCHEDULED = False
+    ui._ensure_index()
+    ui._rebuild_categories(bpy.context)
+    ui._rebuild_asset_list(bpy.context)
+    ui._mark_list_current()
+
     # ---- 1. 首次打开：draw 必须不抛异常 ----
     try:
         ui.IOPDX_PT_PDXparticles.draw(make_panel_self(), bpy.context)

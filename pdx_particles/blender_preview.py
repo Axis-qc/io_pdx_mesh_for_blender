@@ -404,7 +404,10 @@ class SubsystemPreview:
         self.library = library
         self.obj = None
         self.mesh = None
+        self.mesh_name = ""
+        self.mat_name = None
         self.capacity = 0
+        self._cap_warned = False
         self._build(collection)
 
     # ---- 一次性构建 ----
@@ -443,6 +446,8 @@ class SubsystemPreview:
 
         self.obj = obj
         self.mesh = mesh
+        self.mesh_name = mesh.name
+        self.mat_name = mat.name if mat is not None else None
 
     def _material(self, sub):
         tex_path = None
@@ -534,6 +539,13 @@ class SubsystemPreview:
     # ---- 每帧刷新 ----
 
     def refresh(self, cam_basis=None):
+        # 对象/网格被用户手动删掉后只剩失效引用，此后每帧都会在访问上抛异常
+        try:
+            self.mesh.vertices
+        except ReferenceError:
+            self.obj = None
+            self.mesh = None
+            return 0
         sim = self.sub_sim
         sub = sim.sub
         snap = sim.snapshot()
@@ -567,6 +579,13 @@ class SubsystemPreview:
         do_sheet = (sheet_x * sheet_y) > 1
 
         n = min(len(snap), cap)
+        # 超出容量：粒子被裁掉而日志里什么都没有，用户会以为是模拟本身没发够
+        if len(snap) > cap and not self._cap_warned:
+            self._cap_warned = True
+            IO_LOG.warning(
+                "particle subsystem %s: %d particles clipped to capacity %d (MAX_QUADS=%d); "
+                "raise MAX_QUADS to draw all of them",
+                self.sub_sim.name, len(snap), cap, MAX_QUADS)
 
         # 组数组：numpy 向量化，无 numpy 时回退纯 Python。拼数组是 refresh 的大头
         # （实测占 77%，比 foreach_set 本身贵）。
@@ -578,10 +597,15 @@ class SubsystemPreview:
                 snap, n, cap, right, up, sheet_x, sheet_y, do_sheet, per_basis)
 
         mesh = self.mesh
-        mesh.vertices.foreach_set("co", coords)
-        mesh.color_attributes["Col"].data.foreach_set("color", colors)
-        mesh.uv_layers[0].data.foreach_set("uv", uvs)
-        mesh.update()
+        try:
+            mesh.vertices.foreach_set("co", coords)
+            mesh.color_attributes["Col"].data.foreach_set("color", colors)
+            mesh.uv_layers[0].data.foreach_set("uv", uvs)
+            mesh.update()
+        except ReferenceError:
+            self.obj = None
+            self.mesh = None
+            return 0
         return n
 
 
@@ -619,8 +643,12 @@ class PreviewScene:
         self.ref_sphere = sph
 
     def show_ref_sphere(self, show):
-        self.ref_sphere.hide_viewport = not show
-        self.ref_sphere.hide_render = not show
+        # 用户手动删掉参照球后这里只剩一个失效引用，属性访问会抛 ReferenceError
+        try:
+            self.ref_sphere.hide_viewport = not show
+            self.ref_sphere.hide_render = not show
+        except ReferenceError:
+            self.ref_sphere = None
 
     def set_mount(self, empty):
         """把整个预览挂到一个挂点对象上（entity 的 node 字段指的那根）。
@@ -701,7 +729,11 @@ class PreviewScene:
                     sp.refresh(self._view_basis())
         for sp in self.sub_previews:
             if sp.sub_sim.name == name:
-                sp.obj.hide_viewport = not enabled
+                # 对象被用户手动删掉后这里只剩失效引用，属性赋值会抛 ReferenceError
+                try:
+                    sp.obj.hide_viewport = not enabled
+                except ReferenceError:
+                    sp.obj = None
 
     def destroy(self):
         """删对象/网格/材质/贴图/集合（只删本预览创建的）。"""
@@ -709,20 +741,32 @@ class PreviewScene:
         mats = set()
         meshes = set()
         for sp in self.sub_previews:
-            if sp.obj is None:
-                continue
-            for slot in sp.obj.data.materials:
-                if slot:
-                    mats.add(slot.name)
-                    if slot.use_nodes:
-                        for node in slot.node_tree.nodes:
-                            if node.type == "TEX_IMAGE" and node.image:
-                                images.add(node.image.name)
-            meshes.add(sp.obj.data.name)
-            bpy.data.objects.remove(sp.obj, do_unlink=True)
+            # 名字要在构建时记下：对象被删后 sp.obj.data 会抛异常，那时就取不到名字了
+            if sp.mesh_name:
+                meshes.add(sp.mesh_name)
+            if sp.mat_name:
+                mats.add(sp.mat_name)
+            sp.mesh_name = ""
+            sp.mat_name = None
+            if sp.obj is not None:
+                try:
+                    for slot in sp.obj.data.materials:
+                        if slot and slot.use_nodes:
+                            for node in slot.node_tree.nodes:
+                                if node.type == "TEX_IMAGE" and node.image:
+                                    images.add(node.image.name)
+                    bpy.data.objects.remove(sp.obj, do_unlink=True)
+                except ReferenceError:
+                    pass
+            sp.obj = None
+            sp.mesh = None
         if self.ref_sphere is not None:
-            meshes.add(self.ref_sphere.data.name)
-            bpy.data.objects.remove(self.ref_sphere, do_unlink=True)
+            try:
+                meshes.add(self.ref_sphere.data.name)
+                bpy.data.objects.remove(self.ref_sphere, do_unlink=True)
+            except ReferenceError:
+                pass
+            self.ref_sphere = None
         for n in meshes:
             m = bpy.data.meshes.get(n)
             if m and m.users == 0:

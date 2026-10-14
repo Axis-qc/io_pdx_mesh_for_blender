@@ -391,6 +391,84 @@ def main():
               "n={0}".format(len([o for o in bpy.data.objects
                                   if o.type == "ARMATURE"])))
 
+    from mathutils import Vector
+
+    import io_pdx_mesh.pdx_data as pdx_data
+
+    # ---------------- 7. 重名骨挂点往返 ----------------
+    print("\n== 6. 重名骨挂点往返 ==")
+    # 挂点的 pa 只写名字，同一骨架里可能有多根同名骨，取哪一根必须与引擎一致：按名扫描取首个匹配。
+    scan = [c for c in candidates if c and os.path.isfile(c)]
+    scan += [e.path for e in models if e.path and e.path not in scan]
+    # 优先用 star_eater_01：三根 cube1 分属三根 rotator、位置差 25.54，最容易暴露位置与父骨错位。
+    scan.sort(key=lambda p: 0 if "star_eater_01" in os.path.basename(p) else 1)
+    dupe_mesh = None
+    for cand in scan[:1200]:
+        try:
+            asset = pdx_data.read_meshfile(cand)
+        except Exception:  # noqa: BLE001
+            continue
+        names = [b.tag for sh in asset.find("object") for b in (sh.find("skeleton") or [])]
+        dupes = {n for n in names if names.count(n) > 1}
+        if not dupes:
+            continue
+        # 挂点必须真的指向一根重名骨，否则测不出位置与父骨错位。
+        locs = asset.find("locator") or []
+        if any((getattr(pdx_data.PDXData(loc), "pa", None) or [None])[0] in dupes
+               for loc in locs):
+            dupe_mesh = cand
+            break
+
+    check("found a mesh with duplicate bone names used by a locator",
+          dupe_mesh is not None, os.path.basename(dupe_mesh) if dupe_mesh else "-")
+
+    if dupe_mesh:
+        import tempfile
+        from io_pdx_mesh.pdx_blender.blender_import_export import export_meshfile
+
+        def locator_world_positions():
+            return {o.name: list(o.matrix_world.translation)
+                    for o in bpy.context.scene.objects if o.type == "EMPTY"}
+
+        reset_scene(ui)
+        import_meshfile(dupe_mesh)
+        before_locs = locator_world_positions()
+        check("duplicate-bone mesh imported its locators", len(before_locs) > 0,
+              "n={0}".format(len(before_locs)))
+
+        # 相对实际父骨的局部偏移必须等于文件里的 p，取错骨就会不等。
+        rig = next((o for o in bpy.data.objects if o.type == "ARMATURE"), None)
+        file_p = {}
+        for loc in (pdx_data.read_meshfile(dupe_mesh).find("locator") or []):
+            d = pdx_data.PDXData(loc)
+            file_p[d.name] = Vector((d.p[0], d.p[2], d.p[1]))
+        worst = 0.0
+        for o in bpy.context.scene.objects:
+            if o.type != "EMPTY" or o.parent_bone not in rig.data.bones:
+                continue
+            if o.name not in file_p:
+                continue
+            bone_mat = rig.matrix_world @ rig.data.bones[o.parent_bone].matrix_local
+            worst = max(worst, ((bone_mat.inverted_safe() @ o.matrix_world).translation
+                                - file_p[o.name]).length)
+        check("locator offset matches the file relative to its parent bone",
+              worst < 1e-3, "max_dev={0:.6f}".format(worst))
+
+        out = os.path.join(tempfile.gettempdir(), "io_pdx_dupebone_rt.mesh")
+        export_meshfile(out, exp_mesh=False, exp_skel=True, exp_locs=True)
+        reset_scene(ui)
+        import_meshfile(out)
+        after_locs = locator_world_positions()
+
+        common = [k for k in before_locs if k in after_locs]
+        drift = max(((Vector(before_locs[k]) - Vector(after_locs[k])).length
+                     for k in common), default=None)
+        check("duplicate-bone round trip keeps every locator in place",
+              len(common) == len(before_locs) and drift is not None and drift < 1e-3,
+              "n={0}/{1} max_drift={2}".format(
+                  len(common), len(before_locs),
+                  "-" if drift is None else "{0:.6f}".format(drift)))
+
     print("\n{0} passed / {1} failed".format(len(PASS), len(FAIL)))
     if FAIL:
         print("failed:", ", ".join(FAIL))

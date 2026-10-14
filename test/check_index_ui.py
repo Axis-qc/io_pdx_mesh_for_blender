@@ -63,6 +63,23 @@ def check(name, cond, detail=""):
                                 "  — " + detail if detail else ""))
 
 
+def _mesh_locator_names(meshpath):
+    """读一个 .mesh 里所有 locator 的名字（用于判断 event 的 node 能否解析）。
+
+    entity 的 event 挂点有两个来源：entity 自带 locator 与 pdxmesh 指向的
+    .mesh 的 locator。两处都没有就是「解析不到」，插件现在会拒载该粒子。
+    """
+    try:
+        from io_pdx_mesh import pdx_data
+        elem = pdx_data.read_meshfile(meshpath)
+        locs = elem.find("locator")
+        if locs is None:
+            return set()
+        return {pdx_data.PDXData(x).name for x in locs}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def main():
     print("index/UI smoke check")
     print("game:", GAME)
@@ -344,6 +361,74 @@ def main():
                                                  tuple(round(v, 3) for v in want)))
         else:
             check("entity particle objects exist", False, "no pdx_part_* objects")
+
+    # ---- 12. 缺挂点的粒子不加载并报错（0.99.2）----
+    # 原版约 15% 的 event 挂点在 entity 自带 locator 与 .mesh locator 里都找不到，以前静默留在原点。
+    print("\n-- 缺挂点的粒子不加载 --")
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    _ensure_addon_registered()
+    UI._INDEX = None
+    index = UI._ensure_index()
+
+    # 挑一个事件 node 在两处都解析不到的 entity 作为反例
+    bad = None
+    for e in index.entries:
+        if e.kind != "entity":
+            continue
+        d = e.detail or {}
+        for ev in d.get("events") or []:
+            node = ev.get("node")
+            if not node or not ev.get("particle"):
+                continue
+            own = {l.get("name") for l in d.get("locators") or []}
+            mesh_locs = set()
+            mp = d.get("mesh")
+            if mp and os.path.isfile(mp):
+                mesh_locs = _mesh_locator_names(mp)
+            if node not in own and node not in mesh_locs:
+                bad = (e, node, ev.get("particle"))
+                break
+        if bad:
+            break
+
+    if bad is None:
+        check("found an entity whose mount point cannot resolve", False,
+              "no unresolved-mount entity in vanilla data")
+    else:
+        ent, node, particle = bad
+        loaded_any, rejected = UI._load_entity(bpy.context, ent, index)
+        check("unresolved mount is reported, not silent",
+              any(node in r for r in rejected),
+              "entity={0} node={1} rejected={2}".format(ent.name, node, sorted(set(rejected))))
+        check("unresolved-mount particle is not loaded",
+              not any(o.name.startswith("pdx_part_") for o in bpy.data.objects),
+              "particle objects={0}".format(
+                  [o.name for o in bpy.data.objects if o.name.startswith("pdx_part_")]))
+
+    # node 为空的事件不该被拒（引擎语义就是在 entity 原点播放）
+    print("\n-- node 为空照常加载 --")
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    _ensure_addon_registered()
+    UI._INDEX = None
+    index = UI._ensure_index()
+    fake = type("E", (), {})()
+    fake.name = "<probe-no-node>"
+    fake.kind = "entity"
+    fake.detail = {
+        "mesh": "",
+        "locators": [],
+        "events": [{"particle": "plasma_cannon_medium_hit_effect", "node": ""}],
+    }
+    loaded_any, rejected = UI._load_entity(bpy.context, fake, index)
+    check("an event without a node is still loaded", loaded_any and not rejected,
+          "loaded_any={0} rejected={1}".format(loaded_any, sorted(set(rejected))))
+
+    # 本体找不到也要报（同属「这个粒子没加载」）
+    fake.detail["events"] = [{"particle": "no_such_particle_xyz", "node": ""}]
+    loaded_any, rejected = UI._load_entity(bpy.context, fake, index)
+    check("a missing body is reported too",
+          any("no body" in r for r in rejected),
+          "rejected={0}".format(sorted(set(rejected))))
 
     print("\n{0} passed / {1} failed".format(len(PASS), len(FAIL)))
     if FAIL:

@@ -14,6 +14,7 @@ lists of models, particles and entities.
  author : Axis-qc (fork of ross-g/io_pdx_mesh 0.91.2)
 """
 
+import logging
 import os
 import time
 
@@ -29,6 +30,15 @@ _SKIP_DIRS = {"__pycache__", ".git", ".svn"}
 _MESH_EXT = ".mesh"
 _GFX_EXT = ".gfx"
 _ASSET_EXT = ".asset"
+
+INDEX_LOG = logging.getLogger("io_pdx.particles.index")
+
+
+def _note_skip(skipped, root, reason):
+    """记下一个被跳过的根与原因：日志一条，同时留给界面显示。"""
+    INDEX_LOG.warning("asset root skipped: %s (%s)", root, reason)
+    if skipped is not None:
+        skipped.append({"root": root, "reason": reason})
 
 
 def _norm(path):
@@ -50,20 +60,25 @@ def _category_of(root, file_path):
     """文件所在目录（相对 gfx/）作为分类名。"""
     gfx = os.path.join(root, "gfx")
     rel = _rel_under(gfx, os.path.dirname(os.path.abspath(file_path)))
-    return rel if rel else "(gfx root)"
+    return rel if rel and rel != "." else "(gfx root)"
 
 
-def _iter_gfx_files(root):
+def _iter_gfx_files(root, skipped=None):
     """递归列出 root/gfx 下的 .mesh / .gfx / .asset。"""
     gfx = os.path.join(root, "gfx")
     if not os.path.isdir(gfx):
+        _note_skip(skipped, root, "no gfx folder")
         return
+    n = 0
     for dirpath, dirnames, filenames in os.walk(gfx):
         dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
         for fn in sorted(filenames):
             ext = os.path.splitext(fn)[1].lower()
             if ext in (_MESH_EXT, _GFX_EXT, _ASSET_EXT):
+                n += 1
                 yield os.path.join(dirpath, fn), ext
+    if not n:
+        _note_skip(skipped, root, "no indexed files under gfx")
 
 
 def _text_of(node, key):
@@ -110,12 +125,21 @@ class PDXIndex(object):
 
     def __init__(self, roots, vanilla_root=""):
         self.roots = []
+        self.skipped = []
+        seen = set()
         for r in roots:
             if not r:
                 continue
             a = os.path.abspath(r)
-            if os.path.isdir(a) and a not in self.roots:
-                self.roots.append(a)
+            key = _norm(a)
+            if not os.path.isdir(a):
+                _note_skip(self.skipped, a, "not a folder")
+                continue
+            if key in seen:
+                _note_skip(self.skipped, a, "duplicate of an earlier root")
+                continue
+            seen.add(key)
+            self.roots.append(a)
         self.vanilla_root = _norm(vanilla_root) if vanilla_root else ""
         self.entries = []
         self.stats = {}
@@ -147,7 +171,7 @@ class PDXIndex(object):
 
         for root in self.roots:
             is_vanilla = self._is_vanilla(root)
-            for path, ext in _iter_gfx_files(root):
+            for path, ext in _iter_gfx_files(root, self.skipped):
                 n_files += 1
                 if ext == _MESH_EXT:
                     mesh_files.append((path, root, is_vanilla))
@@ -346,8 +370,10 @@ class PDXIndex(object):
         # 注册项的 type 指向本体；本体分类优先（更贴近用户找的位置）
         body_cat = {}
         for name, system in self.library.systems.items():
-            body_cat[name] = _category_of(_root_of(system.source_file, self.roots),
-                                          system.source_file)
+            src_root = _root_of(system.source_file, self.roots)
+            if not src_root:
+                _note_skip(self.skipped, system.source_file, "outside every indexed root")
+            body_cat[name] = _category_of(src_root, system.source_file)
         for name, typ, scale, src, root, is_vanilla in regs:
             has_body = typ in self.library.systems
             category = body_cat.get(typ) or _category_of(root, src)
@@ -430,7 +456,7 @@ class PDXIndex(object):
                 continue
             if mod_only and e.is_vanilla:
                 continue
-            if require_particle and not e.detail.get("has_particle", True):
+            if require_particle and not e.detail.get("has_particle", False):
                 continue
             if require_content:
                 d = e.detail
@@ -443,11 +469,13 @@ class PDXIndex(object):
 
 
 def _root_of(file_path, roots):
-    """文件属于哪个已索引根（取最长匹配，兼容嵌套）。"""
+    """文件属于哪个已索引根（取最长匹配，兼容嵌套）；不属于任何根时返回 ""。"""
     best = ""
-    target = os.path.abspath(file_path)
+    target = _norm(file_path)
     for r in roots:
         ra = os.path.abspath(r)
-        if target.startswith(ra + os.sep) and len(ra) > len(best):
+        if target.startswith(_norm(ra) + os.sep) and len(ra) > len(best):
             best = ra
-    return best or (roots[0] if roots else "")
+    if not best and roots:
+        INDEX_LOG.warning("file outside every indexed root: %s", file_path)
+    return best
