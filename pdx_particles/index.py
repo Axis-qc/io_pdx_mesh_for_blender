@@ -167,6 +167,10 @@ class PDXIndex(object):
         # guardians_02_technosphere_* 全库不存在，官方靠 .gfx 的 meshsettings
         # 覆盖成正确名），引擎以 gfx 为准，这里照抄该语义。
         self.mesh_tex_overrides = {}
+        # entity 名 → {shape 名: 覆盖}。换色模型（star_eater 全物种版本）的
+        # meshsettings 写在 .asset 的 entity 块里而不是 .gfx，entity 自己的
+        # 优先于 pdxmesh 上的。
+        self.entity_tex_overrides = {}
 
     # ---------------------------------------------------------------- build
 
@@ -361,6 +365,22 @@ class PDXIndex(object):
                         xyz = [0.0, 0.0, 0.0]
                     locators.append({"name": lname, "position": xyz})
                 simple = [p["particle"] for p in particles]
+                # entity 块自己的 meshsettings（star_eater 换色即此形态），
+                # shape 名支持 "a|b|cShape" 路径式，收录时全路径与末段都记。
+                if name:
+                    for ms in top.child_values("meshsettings"):
+                        shape = _text_of(ms, "name")
+                        if not shape:
+                            continue
+                        entry = self.entity_tex_overrides.setdefault(name, {})
+                        for key in (shape, shape.split("|")[-1]):
+                            slot = entry.setdefault(key, {})
+                            for k, dst in (("texture_diffuse", "diffuse"),
+                                           ("texture_normal", "normal"),
+                                           ("texture_specular", "specular")):
+                                v = _text_of(ms, k)
+                                if v:
+                                    slot[dst] = v
                 entities.append((name, _text_of(top, "pdxmesh"), particles, simple,
                                  locators, anims, path, root, is_vanilla))
 
@@ -438,6 +458,12 @@ class PDXIndex(object):
                 KIND_PARTICLE, name, keys, src, category, root, is_vanilla,
                 {"type": typ, "scale": scale, "resolved": has_body}))
 
+    def _merged_overrides(self, pdxmesh, entity_name):
+        """pdxmesh 的 gfx 覆盖 + entity 自己的覆盖，后者优先（star_eater 换色）。"""
+        merged = dict(self.mesh_tex_overrides.get(pdxmesh) or {})
+        merged.update(self.entity_tex_overrides.get(entity_name) or {})
+        return merged
+
     def _build_entities(self, entities, pdxmesh_defs):
         for (name, pdxmesh, particles, simple, locators, state_anims,
              src, root, is_vanilla) in entities:
@@ -466,7 +492,7 @@ class PDXIndex(object):
                 KIND_ENTITY, name, keys, src, _category_of(root, src),
                 root, is_vanilla,
                 {"pdxmesh": pdxmesh, "mesh": mesh,
-                 "tex_overrides": dict(self.mesh_tex_overrides.get(pdxmesh) or {}),
+                 "tex_overrides": self._merged_overrides(pdxmesh, name),
                  "particles": simple,
                  "events": particles, "locators": locators,
                  "animations": anims,
