@@ -85,7 +85,9 @@ _ZH = {
     "Donate": "捐赠",
     "Edit": "编辑",
     "Edit a PDX material": "编辑 PDX 材质",
-    "Emitters (what actually loaded):": "发射器（实际加载的）：",
+    "Emitters ({0}, what actually loaded):": "发射器（{0} 个，实际加载的）：",
+    "Emitters": "发射器",
+    "Expand the emitter diagnostics list": "展开发射器诊断列表",
     "Enable all": "全部启用",
     "End frame": "结束帧",
     "Engine": "引擎",
@@ -129,7 +131,6 @@ _ZH = {
     "Leave empty or press Detect to find it automatically":
         "游戏安装目录；仅用于解析 mod 未自带的贴图。留空或点「自动检测」自动查找",
     "Help": "帮助",
-    "Hide": "隐藏",
     "Hidden": "隐藏",
     "Hide this folder's entries from the asset list. The folder is still indexed "
     "and still used to resolve textures":
@@ -139,7 +140,6 @@ _ZH = {
         "在资产列表中隐藏游戏目录的条目。目录仍参与索引，并继续用于解析贴图",
     "Hide on bones": "在骨骼上隐藏",
     "Hide on empties": "在空物体上隐藏",
-    "Hide the reference sphere": "隐藏参考球",
     "Ignore / Unignore selected bones": "忽略 / 取消忽略选中骨骼",
     "Ignore bones": "忽略骨骼",
     "Import file Path": "导入文件路径",
@@ -238,7 +238,6 @@ _ZH = {
         "重新解析源文件并重建预览",
     "Rebuild the asset index (run after installing or updating mods)":
         "重建资产索引（安装或更新 mod 后运行）",
-    "Reference sphere": "参考球",
     "Reload": "重载",
     "Reload from source": "从源文件重载",
     "Reloaded {0}/{1} file(s)": "已重载 {0}/{1} 个文件",
@@ -274,9 +273,6 @@ _ZH = {
     "Show on empties": "在空物体上显示",
     "Show only entries whose name, pdxmesh name or particle name contains this":
         "只显示名称、pdxmesh 名或粒子名包含该字串的条目",
-    "Show ref sphere": "显示参考球",
-    "Show wireframe sphere at planet scale (r=30 units) for size reference":
-        "显示行星尺度的线框球（半径 30 单位）作为大小参照",
     "Skeleton": "骨架",
     "Sort all vertex data by id during export": "导出时按 id 排序所有顶点数据",
     "Sort vertices": "排序顶点",

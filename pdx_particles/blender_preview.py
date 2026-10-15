@@ -672,7 +672,7 @@ class SubsystemPreview:
 
 
 class PreviewScene:
-    """一个粒子系统的完整预览（collection + 各子系统对象 + 参照球）。"""
+    """一个粒子系统的完整预览（collection + 各子系统对象）。"""
 
     def __init__(self, system, library, time_offset=0.0, seed=0):
         self.system = system
@@ -680,7 +680,6 @@ class PreviewScene:
         self.sim = SystemSim(system, time_offset, seed)
         self.collection = None
         self.sub_previews = []
-        self.ref_sphere = None
         self.last_count = 0
         self._last_view_key = None
         self._build()
@@ -692,25 +691,6 @@ class PreviewScene:
         self.collection = coll
         for sub_sim in self.sim.subs:
             self.sub_previews.append(SubsystemPreview(sub_sim, coll, self.library))
-        # 参照球（线框，半径 30 局部单位 = 星球量级中值）
-        mesh = bpy.data.meshes.new("pdx_ref_sphere")
-        verts, faces = _uv_sphere(30.0, 24, 12)
-        mesh.from_pydata(verts, [], faces)
-        mesh.update()
-        sph = bpy.data.objects.new("pdx_ref_sphere", mesh)
-        coll.objects.link(sph)
-        sph.display_type = "WIRE"
-        sph.hide_render = True
-        sph.hide_viewport = True  # 默认关
-        self.ref_sphere = sph
-
-    def show_ref_sphere(self, show):
-        # 用户手动删掉参照球后这里只剩一个失效引用，属性访问会抛 ReferenceError
-        try:
-            self.ref_sphere.hide_viewport = not show
-            self.ref_sphere.hide_render = not show
-        except ReferenceError:
-            self.ref_sphere = None
 
     def set_mount(self, empty):
         """把整个预览挂到一个挂点对象上（entity 的 node 字段指的那根）。
@@ -729,12 +709,6 @@ class PreviewScene:
             try:
                 sp.obj.parent = empty
                 sp.obj.matrix_parent_inverse = inv
-            except ReferenceError:
-                pass
-        if self.ref_sphere is not None:
-            try:
-                self.ref_sphere.parent = empty
-                self.ref_sphere.matrix_parent_inverse = inv
             except ReferenceError:
                 pass
 
@@ -833,13 +807,6 @@ class PreviewScene:
                     pass
             sp.obj = None
             sp.mesh = None
-        if self.ref_sphere is not None:
-            try:
-                meshes.add(self.ref_sphere.data.name)
-                bpy.data.objects.remove(self.ref_sphere, do_unlink=True)
-            except ReferenceError:
-                pass
-            self.ref_sphere = None
         for n in meshes:
             m = bpy.data.meshes.get(n)
             if m and m.users == 0:
@@ -859,34 +826,3 @@ class PreviewScene:
                 pass
             self.collection = None
         self.sub_previews = []
-
-
-def _uv_sphere(radius, segments, rings):
-    """不依赖 ops 的 UV 球拓扑（避免后台/错误上下文 poll 失败）。"""
-    verts = []
-    # 顶行
-    verts.append((0.0, 0.0, radius))
-    for j in range(1, rings):
-        phi = math.pi * j / rings
-        for i in range(segments):
-            theta = 2.0 * math.pi * i / segments
-            verts.append((
-                radius * math.sin(phi) * math.cos(theta),
-                radius * math.sin(phi) * math.sin(theta),
-                radius * math.cos(phi),
-            ))
-    verts.append((0.0, 0.0, -radius))
-    faces = []
-    last = len(verts) - 1
-    for i in range(segments):
-        faces.append((0, 1 + i, 1 + (i + 1) % segments))
-    for j in range(rings - 2):
-        base0 = 1 + j * segments
-        base1 = base0 + segments
-        for i in range(segments):
-            i2 = (i + 1) % segments
-            faces.append((base0 + i, base1 + i, base1 + i2, base0 + i2))
-    base0 = 1 + (rings - 2) * segments
-    for i in range(segments):
-        faces.append((last, base0 + (i + 1) % segments, base0 + i))
-    return verts, faces

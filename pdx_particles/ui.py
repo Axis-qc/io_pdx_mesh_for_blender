@@ -535,32 +535,6 @@ class IOPDX_OT_particle_clear(Operator):
         return {"FINISHED"}
 
 
-class IOPDX_OT_particle_ref_sphere(Operator):
-    """Show the reference sphere (planet-size wireframe, r=30)"""
-    bl_idname = "io_pdx_particles.ref_sphere"
-    bl_label = "Reference sphere"
-    bl_description = "Show wireframe sphere at planet scale (r=30 units) for size reference"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        for preview in _ACTIVE:
-            preview.show_ref_sphere(True)
-        return {"FINISHED"}
-
-
-class IOPDX_OT_particle_ref_sphere_hide(Operator):
-    """Hide the reference sphere"""
-    bl_idname = "io_pdx_particles.ref_sphere_hide"
-    bl_label = "Reference sphere"
-    bl_description = "Hide the reference sphere"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        for preview in _ACTIVE:
-            preview.show_ref_sphere(False)
-        return {"FINISHED"}
-
-
 # ----------------------------------------------------------------------------------------------------------------------
 # 全局索引（模型 / 粒子 / 实体）
 # ----------------------------------------------------------------------------------------------------------------------
@@ -1915,9 +1889,20 @@ class IOPDX_PT_PDXparticles(Panel):
         # 各特征分别走不同代码路径（发射器形状、位置偏移、立牌朝向、动画通道），
         # 任何一处没加载，光看视口很难判断是哪一项。这里直接列出解析后真正生效的
         # 值，便于逐项核对，而不用去猜。
-        diag = layout.box()
-        diag.label(text="Emitters (what actually loaded):", icon="INFO")
+        # 多发射器粒子会有几十行，默认折叠成一行摘要头，点开才展开。
+        n_total = 0
         for preview in _ACTIVE:
+            try:
+                n_total += len(preview.sim.subs)
+            except ReferenceError:
+                pass
+        head = layout.row(align=True)
+        head.prop(scene, "io_pdx_particle_diag_expanded",
+                  text=pdx_i18n.iface("Emitters ({0}, what actually loaded):").format(n_total),
+                  icon="TRIA_RIGHT" if not scene.io_pdx_particle_diag_expanded else "TRIA_DOWN",
+                  toggle=True)
+        diag = layout.box() if scene.io_pdx_particle_diag_expanded else None
+        for preview in _ACTIVE if diag is not None else ():
             diag.label(text=preview.system.name)
             try:
                 subs = preview.sim.subs
@@ -1954,9 +1939,6 @@ class IOPDX_PT_PDXparticles(Panel):
                         ", ".join(sorted(sub.unknown_keys))[:40]), icon="ERROR")
 
         col = layout.column(align=True)
-        row = col.row(align=True)
-        row.operator("io_pdx_particles.ref_sphere", text="Show ref sphere")
-        row.operator("io_pdx_particles.ref_sphere_hide", text="Hide")
         layout.prop(scene, "io_pdx_particle_face_view", icon="ORIENTATION_VIEW")
         row = layout.row(align=True)
         row.operator("io_pdx_particles.reload", icon="FILE_REFRESH", text="Reload")
@@ -2053,8 +2035,6 @@ classes = (
     IOPDX_OT_import_particle,
     IOPDX_OT_particle_reload,
     IOPDX_OT_particle_clear,
-    IOPDX_OT_particle_ref_sphere,
-    IOPDX_OT_particle_ref_sphere_hide,
     IOPDX_OT_particle_add_root,
     IOPDX_OT_particle_remove_root,
     IOPDX_OT_particle_detect_game,
@@ -2139,6 +2119,12 @@ def register():
                     "(off = keep using the scene camera / fixed fallback)",
         default=True,
     )
+    # 发射器诊断子列表折叠：默认收起，多发射器粒子（几十行）不再撑爆面板。
+    bpy.types.Scene.io_pdx_particle_diag_expanded = BoolProperty(  # type: ignore
+        name="Emitters",
+        description="Expand the emitter diagnostics list",
+        default=False,
+    )
     bpy.types.Scene.io_pdx_particle_shade = EnumProperty(  # type: ignore
         name="Quad shading",
         description="How particle quads are shaded: blended, dithered or fully opaque",
@@ -2221,6 +2207,7 @@ def unregister():
     # 裸 del 会抛 AttributeError，把一次禁用/重装变成报错。
     for name in ("io_pdx_particle_entries", "io_pdx_particle_roots",
                  "io_pdx_particle_root_index", "io_pdx_particle_face_view",
+                 "io_pdx_particle_diag_expanded",
                  "io_pdx_particle_shade",
                  "io_pdx_particle_vanilla_root", "io_pdx_particle_seed",
                  "io_pdx_asset_tab", "io_pdx_asset_items", "io_pdx_asset_index",

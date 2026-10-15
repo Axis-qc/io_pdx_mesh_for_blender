@@ -2452,12 +2452,9 @@ if _del_sys:
 
     _e_ref = _try(lambda: _sp_del.refresh(None))
     _e_en = _try(lambda: _pv_del.set_subsystem_enabled(_sp_del.sub_sim.name, True))
-    bpy.data.objects.remove(_pv_del.ref_sphere, do_unlink=True)
-    _e_show = _try(lambda: _pv_del.show_ref_sphere(True))
     _e_destroy = _try(lambda: _pv_del.destroy())
     check("删除预览对象后 refresh 不抛异常", _e_ref is None, "{0}".format(_e_ref))
     check("删除预览对象后 set_subsystem_enabled 不抛异常", _e_en is None, "{0}".format(_e_en))
-    check("删除参照球后 show_ref_sphere 不抛异常", _e_show is None, "{0}".format(_e_show))
     check("删除预览对象后 destroy 不抛异常", _e_destroy is None, "{0}".format(_e_destroy))
     _left8 = [o.name for o in bpy.data.objects if o.name.startswith("pdx_part_")]
     _leftm8 = [m.name for m in bpy.data.meshes if m.name.startswith("pdx_part_")]
