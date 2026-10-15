@@ -165,6 +165,22 @@ def main():
         p = with_mesh[0].detail["mesh"]
         check("resolved mesh exists on disk", os.path.isfile(p), p)
 
+    # ---- 5b. pdxmesh file 跨根回退：mod 只定义引用、mesh 在原版 ----
+    # 用户 mod lev_drake.gfx（若在扫描范围内）指向原版巨龙 mesh，是这条
+    # 回退的真实样本；不在就只验证「所有解析出的 mesh 都真实存在」。
+    cross = [e for e in qe
+             if e.detail.get("mesh")
+             and idx.vanilla_root
+             and idx.vanilla_root.lower() in e.detail["mesh"].lower()]
+    if cross:
+        check("mod-referenced vanilla mesh resolved across roots",
+              all(os.path.isfile(e.detail["mesh"]) for e in cross),
+              "{0} e.g. {1}".format(len(cross), cross[0].detail["mesh"]))
+    else:
+        check("all resolved entity meshes exist on disk",
+              all(os.path.isfile(e.detail["mesh"]) for e in with_mesh),
+              "{0} checked".format(len(with_mesh)))
+
     # ---- 6. UI 注册（需要插件已加载）----
     scene = bpy.context.scene
     for prop in ("io_pdx_asset_tab", "io_pdx_asset_items", "io_pdx_asset_index",

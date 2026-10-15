@@ -206,6 +206,17 @@ class PDXIndex(object):
     def _is_hidden(self, root):
         return _norm(root) in self.hidden_roots
 
+    def _fallback_roots(self, root):
+        """pdxmesh file 跨根回退顺序：vanilla 根优先，其余根殿后，跳过本根。"""
+        out = []
+        for r in ([self.vanilla_root] if self.vanilla_root else []):
+            if r and _norm(r) != _norm(root) and os.path.isdir(r):
+                out.append(r)
+        for r in self.roots:
+            if _norm(r) != _norm(root) and _norm(r) not in {_norm(x) for x in out}:
+                out.append(r)
+        return out
+
     def _scan_gfx(self, path, root, is_vanilla, pdxmesh_defs, regs):
         try:
             tops = parse_file(path)
@@ -216,7 +227,18 @@ class PDXIndex(object):
                 name = _text_of(blk, "name")
                 rel = _text_of(blk, "file")
                 if name and rel:
-                    abs_mesh = os.path.normpath(os.path.join(root, rel.replace("\\", os.sep)))
+                    # file 相对「定义所在的根」拼路径，但 mod 常只定义引用、
+                    # mesh 文件本体在原版（如 lev_drake_mesh 指向原版巨龙 mesh）。
+                    # 本根没有就按 vanilla_root → 其余根的顺序回退找同一相对路径，
+                    # 找不到才放弃；否则模型与挂点全部加载失败。
+                    rel_local = rel.replace("\\", os.sep)
+                    abs_mesh = os.path.normpath(os.path.join(root, rel_local))
+                    if not os.path.isfile(abs_mesh):
+                        for alt in self._fallback_roots(root):
+                            cand = os.path.normpath(os.path.join(alt, rel_local))
+                            if os.path.isfile(cand):
+                                abs_mesh = cand
+                                break
                     pdxmesh_defs.setdefault(name, (abs_mesh, root, is_vanilla))
                 # animation = { id = "...", type = "..." }：id 是 entity state 里
                 # 用的状态别名，type 才指向 .asset 的动画注册名。同一个 pdxmesh 可
