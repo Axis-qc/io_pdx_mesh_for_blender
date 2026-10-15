@@ -50,6 +50,9 @@ import bpy  # noqa: E402
 from io_pdx_mesh.pdx_particles import parser as P  # noqa: E402
 from io_pdx_mesh.pdx_particles import simulator as S  # noqa: E402
 from io_pdx_mesh.pdx_particles import blender_preview as BP  # noqa: E402
+from io_pdx_mesh.pdx_blender.blender_import_export import (  # noqa: E402
+    blender_to_game as _blender_to_game,
+)
 
 GAME = os.environ.get(
     "IO_PDX_TEST_GAME", r"G:\SteamLibrary\steamapps\common\Stellaris")
@@ -490,12 +493,12 @@ print("=" * 78)
 print("D2. billboard=no 固定朝向姿态（pdx_axis_probe 四格实机读数）")
 print("=" * 78)
 print("   默认 U=+X、V=+Y；yaw 绕世界 +Y；pitch 绕面片自身长轴自转（实为 roll）。")
-print("   Blender 与引擎经 (x,z,y) 交换（镜像），所以引擎正向旋转在 Blender 里取负号。")
+print("   Blender 与引擎经 (x,-z,y) 旋转映射，角度符号原样保留，不取负。")
 
 
 def _eng_space(v):
-    """Blender 向量 → 引擎向量：(bx,by,bz) -> (bx,bz,by)。"""
-    return (v[0], v[2], v[1])
+    """Blender 向量 → 引擎向量。用被测模块的逆映射，不另写一份。"""
+    return _blender_to_game(v)
 
 
 def _quad_normal(r, u):
@@ -504,7 +507,7 @@ def _quad_normal(r, u):
             r[0] * u[1] - r[1] * u[0])
 
 
-# 四格实机读数：箭头（贴图 U）指向 + 是否水平
+# 四格实机读数：箭头（贴图 U）指向 + 是否水平。箭头用引擎空间读，水平看引擎 y 轴。
 _fix_cases = (
     (0.0, 0.0, (1.0, 0.0, 0.0), False),
     (90.0, 0.0, (0.0, 0.0, -1.0), False),
@@ -2464,6 +2467,63 @@ if _del_sys:
           "对象 {0} 网格 {1} 集合 {2}".format(_left8[:3], _leftm8[:3], _leftc8[:3]))
 else:
     check("找到可测的预览样本", False)
+
+# ---------------------------------------------------------------- 面片透明度三档
+print()
+print("=" * 78)
+print("21. 面片透明度三档（blended / dithered / opaque）")
+print("=" * 78)
+
+_probe_pv = None
+for _nm, _sy in lib.systems.items():
+    if any((not s.hide) and s.max_amount >= 4 for s in _sy.subsystems):
+        _probe_pv = _sy
+        _probe_pv_name = _nm
+        break
+
+if _probe_pv is not None:
+    # 本脚本不注册插件，Scene 上没有 io_pdx_particle_shade，current_shade_mode()
+    # 兜底返回 blended，所以建出来的预览就是默认档。三档转换走 set_shade_mode，
+    # 不依赖场景属性；「属性 → 建材质」那段联动在 check_panel_draw.py 里验
+    # （那里真的注册了插件）。
+    def _alpha_state(pv):
+        _sp = pv.sub_previews[0]
+        _mat = _sp.obj.data.materials[0]
+        _bsdf = next(n for n in _mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED")
+        _a = _bsdf.inputs["Alpha"]
+        return (len(_a.links) > 0,
+                None if _a.links else round(float(_a.default_value), 4),
+                getattr(_mat, "surface_render_method", None) or
+                getattr(_mat, "blend_method", None))
+
+    _pv21 = BP.PreviewScene(_probe_pv, lib)
+    _bl = _alpha_state(_pv21)
+    check("默认档接 alpha 且用 BLENDED 混合",
+          _bl[0] and (_bl[2] in ("BLENDED", "BLEND")),
+          "linked={0} mode={1}".format(_bl[0], _bl[2]))
+
+    _n21 = _pv21.set_shade_mode(BP.SHADE_OPAQUE)
+    _op = _alpha_state(_pv21)
+    check("opaque 档断开 alpha 并钉成 1.0",
+          (not _op[0]) and _op[1] == 1.0,
+          "linked={0} alpha={1}".format(_op[0], _op[1]))
+
+    _pv21.set_shade_mode(BP.SHADE_DITHERED)
+    _di = _alpha_state(_pv21)
+    check("dithered 档仍按 alpha 镂空（区别于 opaque）",
+          _di[0] and _di[1] is None,
+          "linked={0} mode={1}".format(_di[0], _di[2]))
+
+    _pv21.set_shade_mode(BP.SHADE_BLENDED)
+    _back = _alpha_state(_pv21)
+    check("切回 blended 可逆（alpha 重新接上）",
+          _back[0] and _back[2] in ("BLENDED", "BLEND"),
+          "linked={0} mode={1}".format(_back[0], _back[2]))
+    check("就地切换覆盖到全部子系统", _n21 > 0 and _n21 == len(_pv21.sub_previews),
+          "改了 {0}/{1} 个".format(_n21, len(_pv21.sub_previews)))
+    _pv21.destroy()
+else:
+    check("找到可测的面片材质样本", False)
 
 print()
 print("=" * 78)

@@ -16,6 +16,7 @@ draw()**，于是「draw 里写 Scene 属性」这种必现错误全套测试都
 import os
 import sys
 import traceback
+import types
 
 sys.dont_write_bytecode = True
 
@@ -191,6 +192,50 @@ def main():
         scene.io_pdx_particle_vanilla_root = old_vanilla
         ui._INDEX = None
         ui._INDEX_KEY = None
+
+    # ---- 8. 全局设置必须与「加载了什么」无关 ----
+    # FakeLayout 把 label/prop/operator 全吞掉，所以「这块到底画没画」用它是测不到的：
+    # FPS 与引擎一度被放在主面板的 `if not _ACTIVE: return` 之后，没加载粒子时
+    # 整个消失而测试全绿。这里换成记录型 layout，按调用参数判定。
+    class _Rec(object):
+        def __init__(self, sink):
+            self.sink = sink
+
+        def __getattr__(self, name):
+            def f(*a, **kw):
+                if name in ("label", "operator", "prop"):
+                    if kw.get("text"):
+                        self.sink.append(kw["text"])
+                    if len(a) > 1 and isinstance(a[1], str):
+                        self.sink.append(a[1])
+                return _Rec(self.sink)
+            return f
+
+    def _drawn_text(panel_cls):
+        sink = []
+        panel_cls.draw(types.SimpleNamespace(layout=_Rec(sink)), bpy.context)
+        return sink
+
+    old_active = list(ui._ACTIVE)
+    try:
+        ui._ACTIVE = []                       # 没加载任何粒子
+        txt = _drawn_text(ui.IOPDX_PT_PDXsettings)
+        check("settings panel draws with nothing loaded", len(txt) > 0,
+              "n={0}".format(len(txt)))
+        check("settings panel exposes the scene fps", "fps" in txt, "drawn={0}".format(txt))
+        check("settings panel exposes the engine", "setup_engine" in txt)
+        check("settings panel exposes material/bone/mesh tools",
+              "Create" in txt and "Ignore bones" in txt and "Set mesh order" in txt,
+              "drawn={0}".format(txt))
+        check("settings panel exposes the quad shading switch",
+              "io_pdx_particle_shade" in txt, "drawn={0}".format(txt))
+        # 主面板不该再重复画这些
+        main_txt = _drawn_text(ui.IOPDX_PT_PDXparticles)
+        check("main panel no longer duplicates the global settings",
+              "fps" not in main_txt and "setup_engine" not in main_txt,
+              "main n={0}".format(len(main_txt)))
+    finally:
+        ui._ACTIVE = old_active
 
     print("\n{0} passed / {1} failed".format(len(PASS), len(FAIL)))
     if FAIL:

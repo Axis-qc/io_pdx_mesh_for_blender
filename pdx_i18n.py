@@ -98,13 +98,11 @@ _ZH = {
     "Export PDX animation": "导出 PDX 动画",
     "Export PDX mesh": "导出 PDX 网格",
     "Export related armatures": "导出相关骨架",
-    "Export:": "导出:",
     "Exports a plain text file along with binary": "除二进制外再导出一份纯文本",
     "Exports only uniform scale animation data, newer games support non-uniformly "
     "scaled bones": "只导出等比缩放的动画数据；较新的游戏支持非等比缩放的骨骼",
     "Extra folders to index:": "额外索引目录：",
     "Face the viewport": "朝向视口",
-    "File": "文件",
     "File:": "文件：",
     "UPDATE - v{}": "更新 - v{}",
     "{0} game folder, {1} extra folder(s) configured": "已配置 {0} 个游戏目录、{1} 个附加目录",
@@ -145,7 +143,6 @@ _ZH = {
     "Import PDX animation": "导入 PDX 动画",
     "Import PDX mesh": "导入 PDX 网格",
     "Import skeleton": "导入骨架",
-    "Import:": "导入:",
     "Indexed {0} files in {1}s": "已索引 {0} 个文件，用时 {1} 秒",
     "Info": "信息",
     "Join materials": "合并材质",
@@ -205,11 +202,17 @@ _ZH = {
         "什么都没找到 — 请设置游戏目录或添加 mod 目录",
     "or add a mod folder there, then Rescan.": "或在其中添加 mod 目录，然后重新扫描。",
     "Paradox forums": "Paradox 论坛",
+    "Particles:": "粒子：",
     "Particles": "粒子",
     "Particles not loaded (missing mount point or body): {0}":
         "以下粒子未加载（挂点或本体缺失）：{0}",
+    "Quad shading": "面片着色",
+    "Quads": "面片",
+    "How particle quads are shaded: blended, dithered or fully opaque":
+        "粒子面片的着色方式：混合、抖动镂空或完全不透明",
     "PDX Blender Tools": "PDX Blender 工具",
     "PDX Blender Tools - v{}": "PDX Blender 工具 - v{}",
+    "PDX Tools": "PDX 工具",
     "PDX bones:": "PDX 骨骼：",
     "PDX materials:": "PDX 材质：",
     "PDX meshes:": "PDX 网格：",
@@ -253,7 +256,7 @@ _ZH = {
     "Set mesh index on PDX meshes": "设置 PDX 网格的序号",
     "Set mesh order": "设置网格顺序",
     "Settings:": "设置：",
-    "Setup": "配置",
+    "Settings": "设置",
     "Shader": "着色器",
     "Show / hide local axis": "显示 / 隐藏局部轴",
     "Show on bones": "在骨骼上显示",
@@ -273,7 +276,6 @@ _ZH = {
     "Start frame": "起始帧",
     "Tab": "标签页",
     "This entry has no skeletal animation": "该条目没有骨骼动画",
-    "Tools": "工具",
     "Turn billboard particles toward the 3D viewport camera (off = keep using the "
     "scene camera / fixed fallback)":
         "让立牌粒子朝向 3D 视口镜头（关闭则继续使用场景相机 / 固定回退）",
@@ -301,6 +303,9 @@ _ZH = {
     "Decr": "降序",
     "Empty": "空物体",
     "Armature": "骨架",
+    "Blended": "混合",
+    "Dithered": "抖动",
+    "Opaque": "不透明",
     # Enum item descriptions
     "Load a .mesh on its own": "单独加载 .mesh",
     "Preview a particle system on its own": "单独预览粒子系统",
@@ -309,6 +314,12 @@ _ZH = {
     "Ascending id sort": "按 id 升序排序",
     "Blender native order": "Blender 原生顺序",
     "Descending id sort": "按 id 降序排序",
+    "Semi-transparent, closest to how the effect looks in game":
+        "半透明，最接近实机观感",
+    "Still cut out by alpha, but dithered edges and no blending order":
+        "仍按 alpha 镂空，但边缘是抖动硬边，不做混合排序",
+    "Ignore alpha: each quad becomes a solid square, easiest to see position and size":
+        "忽略 alpha：每片面片成实心方块，最容易看清位置与大小",
 }
 
 # Registered under every context a site can legitimately be drawn in; extra

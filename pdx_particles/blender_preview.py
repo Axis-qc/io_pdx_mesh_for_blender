@@ -8,9 +8,10 @@ Build/refresh Blender preview objects for a simulated PDX particle system.
    场景摄像机；billboard=no 的固定朝向粒子不跟随镜头，姿态由 particle_yaw（绕世界 +Y）
    与 particle_pitch（绕面片长轴自转）决定，两者为 0 时贴图 U=+X、V=+Y、法线 +Z。
    billboard=yes 恒正面朝镜头并完全忽略这两个字段（pdx_axis_probe 实机定案）。
- - 坐标映射：模拟空间 (x, y, z) → Blender (x, z, y)，与 mesh 导入的 SPACE_MATRIX
-   同一套（交换 Y/Z）。粒子空间 -Z 是前方 → Blender -Y 是前方，与导入模型的
-   船头方向（-Y）一致；粒子上方 +Y → Blender +Z。
+ - 坐标映射：游戏世界 (x, y, z) → Blender (x, -z, y)，走 game_to_blender()。
+   粒子空间 -Z 是前方 → Blender -Y 是前方，与导入模型的船头方向（-Y）一致；
+   粒子上方 +Y → Blender +Z。别用 mesh 导入的 SPACE_MATRIX：那条规则吃的是
+   pdxmesh 模型空间，两个空间的 z 约定不同，换用会让坐标整体镜像。
  - 材质：ParticleAdditive → 发光叠加观感；ParticleAlphaBlend → 普通透明混合。
  - 不复现父级/entity 挂载缩放，只保证粒子系统内部尺寸比例。
 
@@ -31,10 +32,16 @@ except Exception:  # noqa: BLE001
     _NP = None
 
 from .simulator import SystemSim, scene_fps
+from ..pdx_blender.blender_import_export import game_to_blender
 
 IO_LOG = logging.getLogger("io_pdx.particles")
 
 MAX_QUADS = 4000
+
+# 面片透明度三档。材质建好后再改档位不重建对象，只就地改材质（见 apply_shading）
+SHADE_BLENDED = "blended"   # 半透明混合，最接近实机观感
+SHADE_DITHERED = "dithered"  # 仍按 alpha 镂空，但边缘是抖动硬边，不做混合排序
+SHADE_OPAQUE = "opaque"     # alpha 固定为 1，面片成实心方块
 
 # 面片四个角的 (su, sv)，与纯 Python 版保持同序，避免顶点绕序变化
 _CORNERS = ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0))
@@ -183,18 +190,18 @@ def _fixed_quad_basis(yaw_deg, pitch_deg):
       particle_pitch：绕**面片自身长轴（贴图 U 轴）**自转，不改变指向，只翻平面。
                       （名字叫 pitch，实际是 roll —— 曾按「绕 right 抬起」实现，已证伪）
 
-    本函数返回**Blender 空间**的基向量。引擎与 Blender 经 (x, z, y) 交换（SPACE_MATRIX），
-    该映射行列式为 -1（镜像），所以**引擎里的正向旋转在 Blender 里符号相反**：
+    本函数返回**Blender 空间**的基向量。引擎世界 → Blender 是 (x, -z, y)，这是纯
+    旋转（行列式 +1），所以角度符号原样保留：
       引擎 U=+X → Blender (1, 0, 0)   ；
       引擎 V=+Y → Blender (0, 0, 1)   ；
-      引擎绕 +Y 转 +θ → Blender 绕 +Z 转 **-θ**；
-      绕长轴自转同理，取 **-pitch**。
+      引擎绕 +Y 转 +θ → Blender 绕 +Z 转 **+θ**；
+      绕长轴自转同理，取 **+pitch**。
 
     如实机读数逐条自洽（z1/z2/z3/z7 四格）：
       yaw=0,  pitch=0   → 箭头 +X                       （z1）
-      yaw=90, pitch=0   → 箭头 -Y（引擎 -Z）             （z2）
-      yaw=0,  pitch=90  → 箭头 +X、面片水平（法线 +Z）    （z3）
-      yaw=90, pitch=90  → 箭头 -Y、面片水平               （z7）
+      yaw=90, pitch=0   → 箭头 +Y（引擎 -Z）             （z2）
+      yaw=0,  pitch=90  → 箭头 +X、面片水平（法线 -Z）    （z3）
+      yaw=90, pitch=90  → 箭头 +Y、面片水平（法线 -Z）    （z7）
     注意 yaw 与 pitch 的旋转都作用于**两个基向量**，且 pitch 的转轴是 yaw 之后的当前
     长轴，才能同时满足 z2 与 z7。
 
@@ -209,12 +216,12 @@ def _fixed_quad_basis(yaw_deg, pitch_deg):
     up = (0.0, 0.0, 1.0)
     if yaw_deg:
         axis = (0.0, 0.0, 1.0)
-        ang = -math.radians(yaw_deg)
+        ang = math.radians(yaw_deg)
         right = _rot_about(axis, right, ang)
         up = _rot_about(axis, up, ang)
     if pitch_deg:
         # 绕当前长轴（= right）自转；right 与转轴平行，保持不变
-        up = _rot_about(right, up, -math.radians(pitch_deg))
+        up = _rot_about(right, up, math.radians(pitch_deg))
     return right, up
 
 
@@ -222,12 +229,14 @@ def _quad_basis_arrays(yaw_rad, pitch_rad):
     """_fixed_quad_basis 的向量化版：逐粒子 (n,) 弧度 → (n,3) 的 right / up。
 
     取的是上面写的闭式解，避免逐粒子调 _rot_about（那要 6 次罗德里格斯）。
+    推导：right 是 +X 绕 +Z 转 yaw → (cos y, sin y, 0)；up 先把 +Z 绕 +Z 转 yaw
+    （不变），再绕 right 转 pitch，得 (sin y·sin p, -cos y·sin p, cos p)。
     """
     np = _NP
     cy, sy = np.cos(yaw_rad), np.sin(yaw_rad)
     cp, sp = np.cos(pitch_rad), np.sin(pitch_rad)
-    right = np.stack([cy, -sy, np.zeros_like(cy)], axis=1)
-    up = np.stack([sy * sp, cy * sp, cp], axis=1)
+    right = np.stack([cy, sy, np.zeros_like(cy)], axis=1)
+    up = np.stack([sy * sp, -cy * sp, cp], axis=1)
     return right, up
 
 
@@ -253,9 +262,9 @@ def _build_arrays_py(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet,
               right_i[2] * s + up_i[2] * c)
         # 1 局部单位 = 1 Blender 米：size 直读，size=1 即 1x1 标准面片
         half = size * 0.5
-        # 坐标映射：与 mesh 导入同一套 (x, z, y)（见 SPACE_MATRIX）。
-        # 粒子空间 -Z 是前方，映射后 Blender -Y 是前方，与导入的模型船头一致。
-        bx, by, bz = x, z, y
+        # 坐标映射：粒子空间 -Z 是前方，映射后 Blender -Y 是前方，与导入的模型
+        # 船头一致。
+        bx, by, bz = game_to_blender((x, y, z))
         vbase = i * 12
         for (su, sv), k in zip(_CORNERS, range(4)):
             o = vbase + k * 3
@@ -352,8 +361,8 @@ def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet,
         u2 = R[None, :] * s[:, None] + U[None, :] * c[:, None]
 
     half = size * 0.5
-    # 坐标映射：与纯 Python 版一致，同 mesh 导入的 (x, z, y)
-    base = np.stack([px, pz, py], axis=1)                      # (n,3)
+    # 坐标映射：与纯 Python 版同一套规则，按分量喂进去即可（三个都是 (n,) 数组）
+    base = np.stack(game_to_blender((px, py, pz)), axis=1)     # (n,3)
     su = np.asarray([c0 for c0, _ in _CORNERS], dtype=np.float64)[None, :, None]
     sv = np.asarray([c1 for _, c1 in _CORNERS], dtype=np.float64)[None, :, None]
     off = (r2[:, None, :] * su + u2[:, None, :] * sv) * half[:, None, None]
@@ -389,6 +398,31 @@ def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet,
     return coords.reshape(-1), colors.reshape(-1), uvs.reshape(-1)
 
 
+def _set_blend_mode(mat, mode):
+    """按档位设置材质的混合方式（兼容 4.x 的 blend_method 与 5.x 的 surface_render_method）。"""
+    if mode == SHADE_BLENDED:
+        new_mode, old_mode = "BLENDED", "BLEND"
+    else:
+        # 抖动与不透明都不需要混合排序；不透明档的 alpha 已钉成 1，
+        # 用 DITHERED 只是顺带免掉排序开销。
+        new_mode, old_mode = "DITHERED", "HASHED"
+    if hasattr(mat, "surface_render_method"):
+        mat.surface_render_method = new_mode
+    else:
+        try:
+            mat.blend_method = old_mode
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def current_shade_mode():
+    """当前面片透明度档位（场景属性）。取不到场景时用半透明档。"""
+    try:
+        return bpy.context.scene.io_pdx_particle_shade or SHADE_BLENDED
+    except Exception:  # noqa: BLE001
+        return SHADE_BLENDED
+
+
 def _set_input(node, names, value):
     """按候选名列表给节点赋值（兼容 4.x/5.x Principled 插槽改名）。"""
     for n in names:
@@ -406,6 +440,8 @@ class SubsystemPreview:
         self.mesh = None
         self.mesh_name = ""
         self.mat_name = None
+        # 顶点色/纹理算出的 alpha 输出，供切换档位时就地重接（opaque 档要断开它）
+        self.alpha_source = None
         self.capacity = 0
         self._cap_warned = False
         self._build(collection)
@@ -462,16 +498,11 @@ class SubsystemPreview:
                     "add the Stellaris install folder as Vanilla root",
                     sub.texture_file, self.sub_sim.name)
         additive = sub.texture_shader != "ParticleAlphaBlend"
+        shade = current_shade_mode()
 
         mat = bpy.data.materials.new("pdx_mat_{0}".format(self.sub_sim.name))
         mat.use_nodes = True
-        if hasattr(mat, "surface_render_method"):
-            mat.surface_render_method = "BLENDED"
-        else:
-            try:
-                mat.blend_method = "BLEND"
-            except Exception:  # noqa: BLE001
-                pass
+        _set_blend_mode(mat, shade)
         mat.use_backface_culling = False
 
         nt = mat.node_tree
@@ -531,10 +562,41 @@ class SubsystemPreview:
         _set_input(bsdf, ["Emission Strength"], 2.0 if additive else 0.4)
         links.new(rgb_out, bsdf.inputs["Base Color"])
         links.new(rgb_out, bsdf.inputs["Emission Color"] if "Emission Color" in bsdf.inputs else bsdf.inputs["Emission"])
-        links.new(alpha_out, bsdf.inputs["Alpha"])
+        self._link_alpha(links, alpha_out, bsdf, shade)
         if out is not None:
             links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+        self.alpha_source = alpha_out
         return mat
+
+    @staticmethod
+    def _link_alpha(links, alpha_out, bsdf, shade):
+        """按档位决定 Alpha 接谁：opaque 档用常量 1，其余接顶点色/纹理算出的 alpha。
+
+        不透明档不接 alpha_out，而是把常量写进插槽——接一个 1.0 的 Math 节点也能
+        达到同样效果，但常量不占节点、也不会被误当成可调通道。
+        """
+        sock = bsdf.inputs["Alpha"]
+        for lk in list(sock.links):
+            links.remove(lk)
+        if shade == SHADE_OPAQUE:
+            sock.default_value = 1.0
+        else:
+            links.new(alpha_out, sock)
+
+    def set_shade_mode(self, shade):
+        """就地改档位，不重建对象。返回是否改动成功。"""
+        try:
+            mat = self.obj.data.materials[0]
+        except (ReferenceError, AttributeError, IndexError):
+            return False
+        if mat is None:
+            return False
+        _set_blend_mode(mat, shade)
+        bsdf = next((n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        if bsdf is None:
+            return False
+        self._link_alpha(mat.node_tree.links, self.alpha_source, bsdf, shade)
+        return True
 
     # ---- 每帧刷新 ----
 
@@ -675,6 +737,17 @@ class PreviewScene:
                 self.ref_sphere.matrix_parent_inverse = inv
             except ReferenceError:
                 pass
+
+    def set_shade_mode(self, shade):
+        """把档位应用到本预览的所有子系统材质，不重建对象。"""
+        n = 0
+        for sp in self.sub_previews:
+            try:
+                if sp.set_shade_mode(shade):
+                    n += 1
+            except ReferenceError:
+                pass
+        return n
 
     def refresh(self):
         """按当前场景帧驱动模拟并刷新所有网格。

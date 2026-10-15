@@ -53,7 +53,7 @@ git clone https://github.com/Axis-qc/io_pdx_mesh_for_blender.git
 
 ### 资源浏览器与粒子预览
 
-面板在侧栏 `PDX Blender Tools` 最上方（主面板），分 `Models` / `Particles` / `Entity` 三个入口，对应「单独导模型」「单独看粒子」「模型和挂点粒子一起」。导入导出按钮、材质与骨骼工具、显示与帧率设置也都收在同一个面板里，在它下面还有 `Info` / `File` / `Tools` / `Display` / `Setup` / `Help` 几个分面板，习惯旧布局的可以从那里进。
+侧栏 `PDX Blender Tools` 下是 `Info`（最上）、`PDX Tools`、`Display`、`Help`、`Settings` 五个面板。`PDX Tools` 是主入口，分 `Models` / `Particles` / `Entity` 三个标签页，对应「单独导模型」「单独看粒子」「模型和挂点粒子一起」，里面是索引、搜索、条目列表与粒子预览；场景帧率、引擎、材质、骨骼与网格顺序在 `Settings` 里。
 
 先在 `编辑 > 偏好设置 > 插件 > IO PDX Mesh` 里配好游戏目录（有 `Detect` 按钮自动找）和自己的 mod 目录，之后面板里搜索、选中、加载即可，不用翻文件夹。
 

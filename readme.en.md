@@ -53,7 +53,7 @@ Fixed the clear-out deleting user objects and leaking datablocks. Clearing the p
 
 ### Asset browser and particle preview
 
-The main panel sits at the top of the sidebar's `PDX Blender Tools` tab and has three tabs: `Models`, `Particles` and `Entity` — a model on its own, a particle system on its own, or a model together with its mount-point particles. The import/export buttons, material and bone tools, and display and frame-rate settings all live in that same panel; the `Info` / `File` / `Tools` / `Display` / `Setup` / `Help` sub-panels remain below it for the layout you may be used to.
+The `PDX Blender Tools` sidebar holds five panels: `Info` (topmost), `PDX Tools`, `Display`, `Help` and `Settings`. `PDX Tools` is the main entry point with three tabs — `Models`, `Particles` and `Entity`, for a model on its own, a particle system on its own, or a model together with its mount-point particles; it holds the index, search, item list and particle preview. Scene frame rate, engine, materials, bones and mesh order live under `Settings`.
 
 First set the game folder (there is a `Detect` button) and your own mod folders under `Edit > Preferences > Add-ons > IO PDX Mesh`. After that you search, pick and load from the panel instead of browsing folders by hand.
 

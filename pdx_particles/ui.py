@@ -39,7 +39,13 @@ from .index import (
     PDXIndex,
 )
 from .simulator import scene_fps
-from .blender_preview import PreviewScene, view_rotation_key
+from .blender_preview import (
+    SHADE_BLENDED,
+    SHADE_DITHERED,
+    SHADE_OPAQUE,
+    PreviewScene,
+    view_rotation_key,
+)
 
 # 活动预览列表（模块级；跨 .blend 不持久化，重开文件后重新导入即可）
 _ACTIVE = []
@@ -127,6 +133,48 @@ def _clear_previews():
         except Exception as err:  # noqa: BLE001
             IO_PDX_LOG.error("particle preview destroy failed: %s", err)
     _ACTIVE.clear()
+
+
+def _shade_update(self, context):
+    """切档位后立刻应用到已加载的粒子材质，并重画。
+
+    材质是加载时一次性建的，若只改属性就得重载一次才看得到，所以这里就地重接
+    Alpha（不重建预览对象，代价只有几个材质节点的改动）。
+    """
+    shade = getattr(self, "io_pdx_particle_shade", SHADE_BLENDED)
+    for preview in list(_ACTIVE):
+        try:
+            preview.set_shade_mode(shade)
+        except Exception as err:  # noqa: BLE001
+            IO_PDX_LOG.error("particle shade switch failed: %s", err)
+    _tag_view3d_redraw()
+
+
+def _tag_view3d_redraw():
+    """把 3D 视口标记为待重画（改材质不会自动触发重绘）。"""
+    try:
+        wm = bpy.context.window_manager
+    except Exception:  # noqa: BLE001
+        return
+    for win in wm.windows:
+        screen = getattr(win, "screen", None)
+        if screen is None:
+            continue
+        for area in screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
+
+
+def _shade_items():
+    """面片透明度三档。每项的文字与说明都要进 i18n 词表（自省会读到）。"""
+    return (
+        (SHADE_BLENDED, "Blended",
+         "Semi-transparent, closest to how the effect looks in game"),
+        (SHADE_DITHERED, "Dithered",
+         "Still cut out by alpha, but dithered edges and no blending order"),
+        (SHADE_OPAQUE, "Opaque",
+         "Ignore alpha: each quad becomes a solid square, easiest to see position and size"),
+    )
 
 
 def _view_follow_enabled():
@@ -1683,14 +1731,14 @@ def _import_one(context, system, library):
 # ----------------------------------------------------------------------------------------------------------------------
 
 class IOPDX_PT_PDXparticles(Panel):
-    bl_label = "Particles"
+    bl_label = "PDX Tools"
     bl_translation_context = pdx_i18n.CTX
     bl_category = "PDX Blender Tools"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_options = {"DEFAULT_CLOSED"}
-    # 这是主面板，排在侧栏最上（其余面板 bl_order 顺次往后）
-    bl_order = 0
+    # 排在 Info 之后（Info 的 bl_order=1 固定在最上）
+    bl_order = 2
 
     def draw(self, context):
         layout = self.layout
@@ -1890,24 +1938,52 @@ class IOPDX_PT_PDXparticles(Panel):
         row.operator("io_pdx_particles.clear", icon="TRASH", text="Clear")
         layout.label(text="1 unit = 1; scrub timeline / play", icon="TIME")
 
-        # ---- 工具与显示：原来只在下面的 Tools / Display / Setup 面板里 ----
+
+class IOPDX_PT_PDXsettings(Panel):
+    """全局设置与工具：与「当前加载了什么」无关，单独一面板装。
+
+    FPS 与引擎直接决定预览的时间基准，材质/骨骼/网格顺序则作用于场景里的数据。
+    这些放主面板尾部时会被「没加载粒子就 return」挡掉，所以拆出来。
+    """
+
+    bl_label = "Settings"
+    bl_translation_context = pdx_i18n.CTX
+    bl_category = "PDX Blender Tools"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_options = {"DEFAULT_CLOSED"}
+    # 排在最后：Info 与主面板在上，Display/Help 居中，设置收尾
+    bl_order = 5
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+
+        box = layout.box()
+        box.label(text=pdx_i18n.iface("Animation:"), icon="TIME")
+        row = box.row(align=True)
+        row.prop(scene.render, "fps", text="FPS")
+        box.prop(scene.io_pdx_settings, "setup_engine")
+
+        box = layout.box()
+        box.label(text=pdx_i18n.iface("Particles:"), icon="PARTICLE_POINT")
+        box.prop(scene, "io_pdx_particle_shade", text="Quads")
+
         box = layout.box()
         box.label(text=pdx_i18n.iface("PDX materials:"), icon="MATERIAL")
         row = box.row(align=True)
         row.operator("io_pdx_mesh.material_create_popup", icon="MATERIAL", text="Create")
         row.operator("io_pdx_mesh.material_edit_popup", icon="SHADING_TEXTURE", text="Edit")
+
         box.label(text=pdx_i18n.iface("PDX bones:"), icon="GROUP_BONE")
         row = box.row(align=True)
         op_ignore = row.operator("io_pdx_mesh.ignore_bone", icon="GROUP_BONE", text="Ignore bones")
         op_ignore.state = True
         op_unignore = row.operator("io_pdx_mesh.ignore_bone", icon="BONE_DATA", text="Unignore bones")
         op_unignore.state = False
+
         box.label(text=pdx_i18n.iface("PDX meshes:"), icon="MESH_DATA")
         box.operator("io_pdx_mesh.mesh_index_popup", icon="SORTALPHA", text="Set mesh order")
-        box.prop(scene.io_pdx_settings, "setup_engine")
-        row = box.row(align=True)
-        row.label(text=pdx_i18n.iface("Animation:"))
-        row.prop(scene.render, "fps", text="FPS")
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -1941,6 +2017,7 @@ classes = (
     IOPDX_OT_asset_load,
     IOPDX_OT_asset_anim_load,
     IOPDX_PT_PDXparticles,
+    IOPDX_PT_PDXsettings,
 )
 
 
@@ -2012,6 +2089,14 @@ def register():
         description="Turn billboard particles toward the 3D viewport camera "
                     "(off = keep using the scene camera / fixed fallback)",
         default=True,
+    )
+    bpy.types.Scene.io_pdx_particle_shade = EnumProperty(  # type: ignore
+        name="Quad shading",
+        description="How particle quads are shaded: blended, dithered or fully opaque",
+        translation_context=pdx_i18n.CTX,
+        items=_shade_items(),
+        default=SHADE_BLENDED,
+        update=_shade_update,
     )
     bpy.types.Scene.io_pdx_particle_vanilla_root = StringProperty(  # type: ignore
         name="Vanilla root",
@@ -2093,6 +2178,7 @@ def unregister():
     # 裸 del 会抛 AttributeError，把一次禁用/重装变成报错。
     for name in ("io_pdx_particle_entries", "io_pdx_particle_roots",
                  "io_pdx_particle_root_index", "io_pdx_particle_face_view",
+                 "io_pdx_particle_shade",
                  "io_pdx_particle_vanilla_root", "io_pdx_particle_seed",
                  "io_pdx_asset_tab", "io_pdx_asset_items", "io_pdx_asset_index",
                  "io_pdx_asset_filter", "io_pdx_index_categories",

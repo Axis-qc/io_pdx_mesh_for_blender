@@ -796,64 +796,12 @@ class IOPDX_PT_PDXblender_info(PDXUI, Panel):
         popup.msg_width = 450
 
 
-class IOPDX_PT_PDXblender_file(PDXUI, Panel):
-    # bl_idname = 'panel.io_pdx_mesh.file'
-    bl_label = "File"
-    panel_order = 1
-    bl_order = 2
-
-    def draw(self, context):
-        self.layout.label(text="Import:", icon="IMPORT")
-        row = self.layout.row(align=True)
-        row.operator("io_pdx_mesh.import_mesh", icon="MESH_CUBE", text="Load mesh ...")
-        row.operator("io_pdx_mesh.import_anim", icon="RENDER_ANIMATION", text="Load anim ...")
-
-        self.layout.label(text="Export:", icon="EXPORT")
-        row = self.layout.row(align=True)
-        row.operator("io_pdx_mesh.export_mesh", icon="MESH_CUBE", text="Save mesh ...")
-        row.operator("io_pdx_mesh.export_anim", icon="RENDER_ANIMATION", text="Save anim ...")
-
-
-class IOPDX_PT_PDXblender_tools(PDXUI, Panel):
-    # bl_idname = 'panel.io_pdx_mesh.tools'
-    bl_label = "Tools"
-    panel_order = 2
-    bl_order = 3
-
-    def draw(self, context):
-        col = self.layout.column(align=True)
-
-        col.label(text="PDX materials:")
-        row = col.row(align=True)
-        row.operator("io_pdx_mesh.material_create_popup", icon="MATERIAL", text="Create")
-        row.operator("io_pdx_mesh.material_edit_popup", icon="SHADING_TEXTURE", text="Edit")
-        col.separator()
-
-        col.label(text="PDX bones:")
-        row = col.row(align=True)
-        op_ignore_bone = row.operator("io_pdx_mesh.ignore_bone", icon="GROUP_BONE", text="Ignore bones")
-        op_ignore_bone.state = True
-        op_unignore_bone = row.operator("io_pdx_mesh.ignore_bone", icon="BONE_DATA", text="Unignore bones")
-        op_unignore_bone.state = False
-        col.separator()
-
-        # col.label(text='PDX animations:')
-        # row = col.row(align=True)
-        # row.operator('io_pdx_mesh.popup_message', icon='IPO_BEZIER', text='Create')
-        # row.operator('io_pdx_mesh.popup_message', icon='NORMALIZE_FCURVES', text='Edit')
-        # col.separator()
-
-        col.label(text="PDX meshes:")
-        row = col.row(align=True)
-        row.operator("io_pdx_mesh.mesh_index_popup", icon="SORTALPHA", text="Set mesh order")
-
-
 class IOPDX_PT_PDXblender_display(PDXUI, Panel):
     # bl_idname = 'panel.io_pdx_mesh.display'
     bl_label = "Display"
     bl_options = {"DEFAULT_CLOSED"}
-    panel_order = 3
-    bl_order = 4
+    panel_order = 1
+    bl_order = 3
 
     def draw(self, context):
         col = self.layout.column(align=True)
@@ -875,29 +823,13 @@ class IOPDX_PT_PDXblender_display(PDXUI, Panel):
         op_hide_loc_axis.data_type = "EMPTY"
 
 
-class IOPDX_PT_PDXblender_setup(PDXUI, Panel):
-    # bl_idname = 'panel.io_pdx_mesh.setup'
-    bl_label = "Setup"
-    bl_options = {"DEFAULT_CLOSED"}
-    panel_order = 4
-    bl_order = 5
-
-    def draw(self, context):
-        settings = context.scene.io_pdx_settings
-
-        self.layout.prop(settings, "setup_engine")
-        row = self.layout.row(align=True)
-        row.label(text="Animation:")
-        row.prop(context.scene.render, "fps", text="FPS")
-
-
 class IOPDX_PT_PDXblender_help(PDXUI, Panel):
     # bl_idname = 'panel.io_pdx_mesh.help'
     bl_label = "Help"
     bl_parent_id = "IOPDX_PT_PDXblender_info"
     bl_options = {"DEFAULT_CLOSED"}
-    panel_order = 5
-    bl_order = 6
+    panel_order = 2
+    bl_order = 4
 
     def draw(self, context):
         col = self.layout.column(align=True)
