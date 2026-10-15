@@ -434,15 +434,23 @@ else:
                     _e1[2] * _e2[0] - _e1[0] * _e2[2],
                     _e1[0] * _e2[1] - _e1[1] * _e2[0])
 
+        # 视线 _vd 指向「看进屏幕」；历史实现法线 = 列0×列1 = +视线方向（背面朝镜头，
+        # 靠关背面剔除兜着）。2025 修为 right 取反：法线 = -视线，点积应为 +1。
         _R = r3d.view_rotation.to_matrix()
         _vd = (_R @ mathutils.Vector((0.0, 0.0, -1.0))).normalized()
         _n = _normal_now()
         _ln = math.sqrt(sum(x * x for x in _n)) or 1e-9
         _dot = sum(_n[i] * _vd[i] for i in range(3)) / _ln
         print("  样本: {0} / {1}".format(_nm, _sb.name))
-        print("    面法线与视线点积: {0:.4f} (-1.0 = 正对镜头)".format(_dot))
-        check("billboard 面片正对活动视口镜头", _dot < -0.9,
+        print("    面法线与视线点积: {0:.4f} (+1.0 = 正对镜头)".format(_dot))
+        check("billboard 面片正对活动视口镜头", _dot > 0.9,
               "点积 {0:.4f}".format(_dot))
+        # 翻面后的镜像补偿：UV 的 u 应已取反（首顶点 u=1，第二顶点 u=0）
+        _uvs = [0.0] * (len(_sp.mesh.uv_layers[0].data) * 2)
+        _sp.mesh.uv_layers[0].data.foreach_get("uv", _uvs)
+        check("billboard 翻面后 UV 镜像补偿生效",
+              _uvs[0] > _uvs[2],
+              "u = {0:.2f},{1:.2f}".format(_uvs[0], _uvs[2]))
         _pv.destroy()
     else:
         check("找到可测的视口朝向样本", False)

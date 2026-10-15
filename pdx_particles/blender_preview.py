@@ -241,8 +241,12 @@ def _quad_basis_arrays(yaw_rad, pitch_rad):
 
 
 def _build_arrays_py(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet,
-                     per_particle_basis=False):
-    """纯 Python 组数组（numpy 不可用时的回退，逻辑与向量化版逐项对应）。"""
+                     per_particle_basis=False, flip_u=False):
+    """纯 Python 组数组（numpy 不可用时的回退，逻辑与向量化版逐项对应）。
+
+    flip_u=True：UV 的 u 取反（u → 1-u）。billboard 的 right 取反后贴图会左右
+    镜像，用这个补回。
+    """
     coords = [0.0] * (cap * 12)
     colors = [0.0] * (cap * 16)
     uvs = [0.0] * (cap * 8)
@@ -293,17 +297,19 @@ def _build_arrays_py(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet,
             u0, v0, du, dv = 0.0, 0.0, 1.0, 1.0
         for (su, sv), k in zip(_UV_CORNERS, range(4)):
             o = ubase + k * 2
-            uvs[o] = u0 + su * du
+            uu = 1.0 - (u0 + su * du) if flip_u else (u0 + su * du)
+            uvs[o] = uu
             uvs[o + 1] = v0 + sv * dv
     return coords, colors, uvs
 
 
 def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet,
-                    per_particle_basis=False):
+                    per_particle_basis=False, flip_u=False):
     """numpy 向量化组数组，与纯 Python 版逐位等价。
 
     per_particle_basis=True 时，arr[:, 12]/arr[:, 13] 是每颗粒子的面片基角
     （弧度），right/up 由它们逐粒子重算；否则沿用外部传入的共享基向量。
+    flip_u=True：UV 的 u 取反（u → 1-u），billboard 翻面后的镜像补偿。
     """
     np = _NP
     # snap 是 list[tuple]，转成 (n,14) 一次成型；多余容量留 0（与纯 Python 版
@@ -392,7 +398,10 @@ def _build_arrays_np(snap, n, cap, right, up, sheet_x, sheet_y, do_sheet,
 
     usu = np.asarray([u for u, _ in _UV_CORNERS], dtype=np.float64)[None, :]
     vsv = np.asarray([v for _, v in _UV_CORNERS], dtype=np.float64)[None, :]
-    uvs[:n, :, 0] = u0[:, None] + usu * du[:, None]
+    u_all = u0[:, None] + usu * du[:, None]
+    if flip_u:
+        u_all = 1.0 - u_all
+    uvs[:n, :, 0] = u_all
     uvs[:n, :, 1] = v0[:, None] + vsv * dv[:, None]
 
     return coords.reshape(-1), colors.reshape(-1), uvs.reshape(-1)
@@ -629,7 +638,11 @@ class SubsystemPreview:
             per_basis = bool(sub.particle_pitch[1] or sub.particle_yaw[1])
             right, up = _fixed_quad_basis(sub.particle_yaw[0], sub.particle_pitch[0])
         elif cam_basis is not None:
-            right, up = cam_basis
+            # 视口 basis = view_rotation 矩阵列 0/1，right × up = 列 2，即面片法线
+            # 指向「看进屏幕的方向」——从镜头看是背面。取反 right 让法线正对镜头；
+            # 贴图随之左右镜像，靠 UV 的 u 取反补回（billboard 分支里 su 反号，
+            # 见 _CORNERS 的用法），顶点位置与贴图内容都不变，只是正面转到镜头侧。
+            right, up = (-cam_basis[0][0], -cam_basis[0][1], -cam_basis[0][2]), cam_basis[1]
         else:
             # 既无视口也无摄像机：面向 -Y 立起（Blender 默认视向），up 取世界 +Z
             right, up = (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)
@@ -653,10 +666,12 @@ class SubsystemPreview:
         # （实测占 77%，比 foreach_set 本身贵）。
         if _NP is not None and n > 0:
             coords, colors, uvs = _build_arrays_np(
-                snap, n, cap, right, up, sheet_x, sheet_y, do_sheet, per_basis)
+                snap, n, cap, right, up, sheet_x, sheet_y, do_sheet, per_basis,
+                flip_u=(cam_basis is not None and sub.billboard))
         else:
             coords, colors, uvs = _build_arrays_py(
-                snap, n, cap, right, up, sheet_x, sheet_y, do_sheet, per_basis)
+                snap, n, cap, right, up, sheet_x, sheet_y, do_sheet, per_basis,
+                flip_u=(cam_basis is not None and sub.billboard))
 
         mesh = self.mesh
         try:
