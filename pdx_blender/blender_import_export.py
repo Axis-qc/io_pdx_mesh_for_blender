@@ -1759,9 +1759,10 @@ def import_meshfile(meshpath, imp_mesh=True, imp_skel=True, imp_locs=True, join_
                 # create the material
                 if pdx_material:
                     IO_PDX_LOG.info("creating material - {0}".format(pdx_material.shader[0]))
-                    # gfx meshsettings 覆盖内嵌贴图名（按 shape 名查）。
-                    ov = (tex_overrides.get(kwargs.get("pdxmesh_name") or "")
-                          or {}).get(node.tag) or {}
+                    # gfx meshsettings 覆盖内嵌贴图名。tex_overrides 是
+                    # {shape 名: {diffuse/normal/specular: 文件名}}（调用方已按
+                    # pdxmesh 选好那份），按 shape 名（node.tag）查。
+                    ov = tex_overrides.get(node.tag) or {}
                     if ov.get("diffuse"):
                         pdx_material.diff = [ov["diffuse"]]
                     if ov.get("normal"):

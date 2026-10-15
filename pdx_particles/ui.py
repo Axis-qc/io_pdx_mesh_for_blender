@@ -1347,21 +1347,19 @@ def _clear_loaded(context):
     return removed
 
 
-def _load_mesh_path(path, reuse_skeleton=False, tex_overrides=None, pdxmesh_name=None):
+def _load_mesh_path(path, reuse_skeleton=False, tex_overrides=None):
     """导入 .mesh（复用模型导入流程）。
 
     延迟 import：pdx_blender 包在导入期会回头 import 本模块，模块级互相引用会成环。
     reuse_skeleton=False：场景里可能留着上一个模型的同名骨架，复用它会让新网格
     静默蒙皮到旧骨架上（不报错、动起来不对），浏览器加载必须新建。
-    tex_overrides：.gfx meshsettings 的贴图覆盖层（mesh 内嵌贴图名不可信，
-    technosphere.mesh 即实例），按 pdxmesh 名 + shape 名覆盖 diff/n/spec。
+    tex_overrides：.gfx meshsettings 的贴图覆盖层 {shape 名: {diffuse/normal/specular}}。
+    mesh 内嵌贴图名不可信（technosphere.mesh 即实例），按 shape 名改写后再解析。
     """
     from ..pdx_blender.blender_import_export import import_meshfile
     kwargs = {"reuse_skeleton": reuse_skeleton}
     if tex_overrides:
         kwargs["tex_overrides"] = tex_overrides
-    if pdxmesh_name:
-        kwargs["pdxmesh_name"] = pdxmesh_name
     import_meshfile(path, **kwargs)
 
 
@@ -1429,8 +1427,7 @@ def _load_entity(context, entry, index):
     if mesh and os.path.isfile(mesh):
         try:
             _load_mesh_path(mesh, reuse_skeleton=False,
-                            tex_overrides=detail.get("tex_overrides") or {},
-                            pdxmesh_name=detail.get("pdxmesh") or "")
+                            tex_overrides=detail.get("tex_overrides") or {})
             loaded_any = True
         except Exception as err:  # noqa: BLE001
             IO_PDX_LOG.error("entity mesh import failed: %s (%s)", mesh, err)
