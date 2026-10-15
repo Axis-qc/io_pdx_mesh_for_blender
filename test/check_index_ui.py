@@ -144,10 +144,18 @@ def main():
               before - after == cats[victim],
               "{0}-{1}={2} vs {3}".format(before, after, before - after, cats[victim]))
 
-    # ---- 4. mod_only ----
+    # ---- 4. mod_only / hidden_roots ----
+    # mod_only 参数仍在 query 签名上（向后兼容），但界面开关已由偏好里
+    # 的按根隐藏取代：这里改验 hidden_roots 过滤真的把原版根条目挡掉。
     n_mod = len(idx.query(IX.KIND_MODEL, mod_only=True))
     check("mod_only excludes game content", n_mod == 0,
           "mods_only={0} (single vanilla root)".format(n_mod))
+    n_all = len(idx.query(IX.KIND_MODEL))
+    n_hidden = len(IX.PDXIndex(idx.roots, vanilla_root=idx.vanilla_root,
+                               hidden_roots=idx.roots).query(IX.KIND_MODEL))
+    check("hidden_roots filters every entry of the hidden root",
+          n_hidden == 0 and n_all > 0,
+          "all={0} hidden={1}".format(n_all, n_hidden))
 
     # ---- 5. entity 能解析出 mesh ----
     with_mesh = [e for e in qe if e.detail.get("mesh")]
@@ -161,8 +169,11 @@ def main():
     scene = bpy.context.scene
     for prop in ("io_pdx_asset_tab", "io_pdx_asset_items", "io_pdx_asset_index",
                  "io_pdx_asset_filter", "io_pdx_index_categories",
-                 "io_pdx_index_disabled", "io_pdx_index_mod_only"):
+                 "io_pdx_index_disabled"):
         check("scene prop {0}".format(prop), hasattr(scene, prop))
+    # io_pdx_index_mod_only 已删除：按根隐藏取代了它，偏好里才是开关的家
+    check("scene prop io_pdx_index_mod_only removed",
+          not hasattr(scene, "io_pdx_index_mod_only"))
 
     tabs = [i.identifier for i in scene.bl_rna.properties["io_pdx_asset_tab"].enum_items]
     check("three tabs registered", set(tabs) == {"model", "particle", "entity"},
@@ -297,7 +308,6 @@ def main():
         if scene.io_pdx_index_disabled[i].kind == "model":
             scene.io_pdx_index_disabled.remove(i)
     UI._rebuild_categories(bpy.context)
-    scene.io_pdx_index_mod_only = False
     scene.io_pdx_asset_filter = "test_object"
     UI._rebuild_asset_list(bpy.context)
     if len(scene.io_pdx_asset_items):

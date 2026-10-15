@@ -612,35 +612,40 @@ def _addon_prefs():
 
 
 def _pref_roots():
-    """从插件偏好取 (额外索引目录, 原版根)，带回退。
+    """从插件偏好取 (额外索引目录, 原版根, 隐藏根集合)，带回退。
 
     偏好由 IOPDX_AddonPreferences 提供（blender_ui.py）；旧版把根放在场景属性
     与 settings.json 里，这里一并读入，老配置不会因为改版而失效。
+    隐藏根仍参与索引与贴图解析，只是其条目不进列表。
     """
-    extra, vanilla = [], ""
+    extra, vanilla, hidden = [], "", set()
     prefs = _addon_prefs()
     if prefs is not None:
         for entry in getattr(prefs, "extra_roots", []):
             p = bpy.path.abspath(entry.path) if entry.path else ""
             if p and os.path.isdir(p) and p not in extra:
                 extra.append(p)
+                if getattr(entry, "hidden", False):
+                    hidden.add(os.path.normpath(p))
         v = getattr(prefs, "vanilla_root", "") or ""
         if v:
             v = bpy.path.abspath(v)
             if os.path.isdir(v):
                 vanilla = v
+                if getattr(prefs, "vanilla_hidden", False):
+                    hidden.add(os.path.normpath(v))
     for p in _roots():
         if p not in extra and p != vanilla:
             extra.append(p)
     if not vanilla:
         vanilla = _vanilla_root()
-    return extra, vanilla
+    return extra, vanilla, hidden
 
 
 def _index_is_stale():
     """当前配置与已建索引是否不一致（不触发构建，供 draw 里判断）。"""
-    extra, vanilla = _pref_roots()
-    return _INDEX is None or _INDEX_KEY != (tuple(extra), vanilla)
+    extra, vanilla, hidden = _pref_roots()
+    return _INDEX is None or _INDEX_KEY != (tuple(extra), vanilla, tuple(sorted(hidden)))
 
 
 def _schedule_index_build():
@@ -685,13 +690,13 @@ def _ensure_index(force=False):
     才能覆盖原版同名资源。
     """
     global _INDEX, _INDEX_KEY
-    extra, vanilla = _pref_roots()
-    key = (tuple(extra), vanilla)
+    extra, vanilla, hidden = _pref_roots()
+    key = (tuple(extra), vanilla, tuple(sorted(hidden)))
     if force or _INDEX is None or _INDEX_KEY != key:
         roots = list(extra)
         if vanilla and vanilla not in roots:
             roots.append(vanilla)
-        _INDEX = PDXIndex(roots, vanilla_root=vanilla).build()
+        _INDEX = PDXIndex(roots, vanilla_root=vanilla, hidden_roots=hidden).build()
         _INDEX_KEY = key
         IO_PDX_LOG.info("asset index: %s", _INDEX.stats)
     return _INDEX
@@ -767,7 +772,6 @@ def _rebuild_asset_list(context):
         kind,
         text=scene.io_pdx_asset_filter or "",
         disabled=_disabled_for(scene, kind),
-        mod_only=scene.io_pdx_index_mod_only,
         require_content=require_content,
     )
     _SHOWN = entries[:MAX_LIST_ROWS]
@@ -1143,6 +1147,28 @@ class IOPDX_OT_particle_remove_root(Operator):
             return {"CANCELLED"}
         roots.remove(idx)
         scene.io_pdx_particle_root_index = max(0, idx - 1)
+        return {"FINISHED"}
+
+
+class IOPDX_OT_open_prefs(Operator):
+    """Open this add-on's preferences (game folder and extra folders live there)"""
+    bl_idname = "io_pdx_mesh.open_prefs"
+    bl_label = "Open Preferences"
+    bl_description = ("Open the add-on preferences where the game folder and extra "
+                      "index folders are configured")
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        import bpy
+        # 先确保展示的是本插件那一条，打开的窗口不会停在插件列表顶部。
+        try:
+            context.preferences.active_section = "ADDONS"
+        except Exception:  # noqa: BLE001 - 属性名随版本变过，打不开就退回普通调用
+            pass
+        try:
+            bpy.ops.preferences.addon_show(module=__package__.rsplit(".", 1)[0])
+        except Exception:  # noqa: BLE001
+            bpy.ops.screen.userpref_show()
         return {"FINISHED"}
 
 
@@ -1806,7 +1832,6 @@ class IOPDX_PT_PDXparticles(Panel):
         rows.template_list("IOPDX_UL_index_categories", "", scene,
                            "io_pdx_index_categories", scene, "io_pdx_index_category_index",
                            rows=5)
-        box.prop(scene, "io_pdx_index_mod_only", text="Mod only")
         box.label(text="Untick a category to hide it", icon="INFO")
 
         # ---- 条目列表 ----
@@ -1985,6 +2010,29 @@ class IOPDX_PT_PDXsettings(Panel):
         box.label(text=pdx_i18n.iface("PDX meshes:"), icon="MESH_DATA")
         box.operator("io_pdx_mesh.mesh_index_popup", icon="SORTALPHA", text="Set mesh order")
 
+        # 加载路径只读展示 + 引导到偏好设置。偏好属性不允许从侧栏面板直接改
+        #（改了也无法可靠保存），所以这里只显示当前生效的根，修改引导去偏好。
+        box = layout.box()
+        box.label(text=pdx_i18n.iface("Load paths:"), icon="FILE_FOLDER")
+        from ..pdx_blender.blender_ui import get_addon_preferences
+        prefs = get_addon_preferences()
+        if prefs is None:
+            box.label(text=pdx_i18n.iface("Preferences unavailable"), icon="ERROR")
+        else:
+            vanilla = getattr(prefs, "vanilla_root", "") or ""
+            if vanilla:
+                box.label(text=pdx_i18n.iface("Game folder:") + " " + vanilla, icon="FILE_FOLDER")
+            else:
+                box.label(text=pdx_i18n.iface("Game folder not set"), icon="ERROR")
+            n_extra = 0
+            for entry in prefs.extra_roots:
+                if entry.path:
+                    n_extra += 1
+                    box.label(text=entry.path, icon="FILE_FOLDER")
+            if n_extra == 0:
+                box.label(text=pdx_i18n.iface("No extra folders configured"), icon="INFO")
+            box.operator("io_pdx_mesh.open_prefs", icon="PREFERENCES", text="Open Preferences")
+
 
 # ----------------------------------------------------------------------------------------------------------------------
 # register / unregister
@@ -2010,6 +2058,7 @@ classes = (
     IOPDX_OT_particle_add_root,
     IOPDX_OT_particle_remove_root,
     IOPDX_OT_particle_detect_game,
+    IOPDX_OT_open_prefs,
     IOPDX_OT_particle_add_vanilla,
     IOPDX_OT_index_rescan,
     IOPDX_OT_index_all_categories,
@@ -2137,12 +2186,6 @@ def register():
     bpy.types.Scene.io_pdx_index_categories = CollectionProperty(type=IndexCategory)
     bpy.types.Scene.io_pdx_index_category_index = IntProperty(default=0)
     bpy.types.Scene.io_pdx_index_disabled = CollectionProperty(type=DisabledCategory)
-    bpy.types.Scene.io_pdx_index_mod_only = BoolProperty(  # type: ignore
-        name="Mod only",
-        description="Hide entries that come from the game install and keep only mod content",
-        default=False,
-        update=_asset_filter_update,
-    )
     bpy.types.Scene.io_pdx_index_status = StringProperty(default="")  # type: ignore
     # 帧处理器：先清掉同名残留（重载/重装会留下引用旧模块的旧对象），再挂当前的。
     # append 前用 _find_stale_handlers 去重是必要的：处理器现在是 @persistent 的，
@@ -2183,7 +2226,7 @@ def unregister():
                  "io_pdx_asset_tab", "io_pdx_asset_items", "io_pdx_asset_index",
                  "io_pdx_asset_filter", "io_pdx_index_categories",
                  "io_pdx_index_category_index", "io_pdx_index_disabled",
-                 "io_pdx_index_mod_only", "io_pdx_index_status",
+                 "io_pdx_index_status",
                  "io_pdx_anim_items", "io_pdx_anim_index",
                  "io_pdx_loaded_objects"):
         if hasattr(bpy.types.Scene, name):

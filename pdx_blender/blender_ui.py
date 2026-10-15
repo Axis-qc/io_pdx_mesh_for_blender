@@ -879,13 +879,21 @@ class PDXIndexRoot(PropertyGroup):
         subtype="DIR_PATH",
         default="",
     )
+    hidden: BoolProperty(
+        name="Hidden",
+        description="Hide this folder's entries from the asset list. The folder is "
+                    "still indexed and still used to resolve textures",
+        default=False,
+    )
 
 
 class IOPDX_UL_index_root_list(UIList):
-    """Extra index folders; the path is edited inline in the row."""
+    """Extra index folders; the path and a hide toggle are edited inline in the row."""
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        layout.prop(item, "path", text="", emboss=False, icon="FILE_FOLDER")
+        row = layout.row(align=True)
+        row.prop(item, "path", text="", emboss=False, icon="FILE_FOLDER")
+        row.prop(item, "hidden", text="", icon="HIDE_OFF")
 
 
 class IOPDX_AddonPreferences(AddonPreferences):
@@ -906,6 +914,12 @@ class IOPDX_AddonPreferences(AddonPreferences):
     extra_root_index: IntProperty(
         default=0,
     )
+    vanilla_hidden: BoolProperty(
+        name="Hidden",
+        description="Hide the game folder's entries from the asset list. The folder is "
+                    "still indexed and still used to resolve textures",
+        default=False,
+    )
 
     def draw(self, context):
         layout = self.layout
@@ -915,6 +929,8 @@ class IOPDX_AddonPreferences(AddonPreferences):
         row = box.row(align=True)
         row.prop(self, "vanilla_root", text="")
         row.operator("io_pdx_mesh.detect_game_root", icon="VIEWZOOM", text="Detect")
+        row.prop(self, "vanilla_hidden", icon="HIDE_OFF", icon_only=True,
+                 toggle=True)
 
         box.separator()
         box.label(text="Extra folders to index:", icon="FILE_FOLDER")

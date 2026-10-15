@@ -130,8 +130,13 @@ _ZH = {
         "游戏安装目录；仅用于解析 mod 未自带的贴图。留空或点「自动检测」自动查找",
     "Help": "帮助",
     "Hide": "隐藏",
-    "Hide entries that come from the game install and keep only mod content":
-        "隐藏来自游戏安装目录的条目，只保留 mod 内容",
+    "Hidden": "隐藏",
+    "Hide this folder's entries from the asset list. The folder is still indexed "
+    "and still used to resolve textures":
+        "在资产列表中隐藏该目录的条目。目录仍参与索引，并继续用于解析贴图",
+    "Hide the game folder's entries from the asset list. The folder is still "
+    "indexed and still used to resolve textures":
+        "在资产列表中隐藏游戏目录的条目。目录仍参与索引，并继续用于解析贴图",
     "Hide on bones": "在骨骼上隐藏",
     "Hide on empties": "在空物体上隐藏",
     "Hide the reference sphere": "隐藏参考球",
@@ -147,6 +152,13 @@ _ZH = {
     "Info": "信息",
     "Join materials": "合并材质",
     "Legacy keyframe method": "旧版关键帧方式",
+    "Load paths:": "加载路径：",
+    "Open Preferences": "打开偏好设置",
+    "Open the add-on preferences where the game folder and extra index folders are "
+    "configured": "打开插件偏好设置，游戏目录与额外索引目录在那里配置",
+    "Preferences unavailable": "偏好设置不可用",
+    "Game folder not set": "未设置游戏目录",
+    "No extra folders configured": "未配置额外目录",
     "Load anim ...": "加载动画 ...",
     "Load animation": "加载动画",
     "Load from file ...": "从文件加载 ...",
@@ -182,7 +194,6 @@ _ZH = {
     "Mesh import failed: {0}": "网格导入失败：{0}",
     "Mesh index list actions": "网格序号列表操作",
     "Meshes": "网格",
-    "Mod only": "仅 mod",
     "No armature in the scene — load a model first":
         "场景里没有骨架 — 请先加载模型",
     "No body found for type '{0}'": "类型 '{0}' 找不到对应本体",

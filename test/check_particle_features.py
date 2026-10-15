@@ -2527,6 +2527,56 @@ else:
 
 print()
 print("=" * 78)
+print("22. mesh 贴图多根回退（mod mesh 引用原版贴图）")
+print("=" * 78)
+
+# 真实场景：mesh 在 mod 根，贴图只在原版根。模拟法：不真建 mod 根，
+# 直接构造两个临时根，一个含 mesh+gfx，另一个只含贴图，验证跨根能解析到。
+# 不用 tempfile.mkdtemp：实测它给出的目录带限制 ACL，连它自己建子目录都会被拒。
+from io_pdx_mesh.pdx_blender import blender_import_export as BIE  # noqa: E402
+
+try:
+    _tmp22 = os.path.join(bpy.app.tempdir, "pdx_tex22")
+    if os.path.isdir(_tmp22):
+        import shutil  # noqa: E402
+        shutil.rmtree(_tmp22, ignore_errors=True)
+    _root_a = os.path.join(_tmp22, "mod")       # mesh 所在根（没有这张贴图）
+    _root_b = os.path.join(_tmp22, "game")      # 贴图所在根
+    _dir_a = os.path.join(_root_a, "gfx", "models", "mymod")
+    _dir_b = os.path.join(_root_b, "gfx", "models", "vanilla")
+    os.makedirs(_dir_a); os.makedirs(_dir_b)
+    _mesh_a = os.path.join(_dir_a, "test.mesh")
+    open(_mesh_a, "w").close()
+    _dds_b = os.path.join(_dir_b, "cross_root_diff.dds")
+    open(_dds_b, "w").close()
+    # 同名 .dds 也先写好再建索引：索引按根缓存，建完再补文件测不出来。
+    _dds_a = os.path.join(_dir_a, "same_name.dds")
+    open(_dds_a, "w").close()
+
+    # get_texture_index 只扫 mesh 自己的根 + 偏好配置根。这里临时把偏好根
+    # 指向 _root_b：monkeypatch _configured_texture_roots 最省事且不动 bpy。
+    _orig_roots = BIE._configured_texture_roots
+    BIE._configured_texture_roots = lambda: [_root_b]
+    try:
+        _idx22 = BIE.get_texture_index(_mesh_a)
+        _hit = _idx22.get("cross_root_diff.dds")
+        check("mod 根没有的贴图能从配置的另一个根解析到",
+              bool(_hit) and os.path.dirname(_hit[0]) == _dir_b,
+              "hit={0}".format(_hit))
+        # 本根优先：同名 .dds 两根都有时应取 mesh 自己根里的那份
+        _hitb = _idx22.get("same_name.dds")
+        check("两根同名时 mesh 自己根的优先",
+              bool(_hitb) and len(_hitb) == 1 and os.path.dirname(_hitb[0]) == _dir_a,
+              "hit={0}".format(_hitb))
+    finally:
+        BIE._configured_texture_roots = _orig_roots
+        BIE._TEXTURE_INDEX_CACHE.pop(_root_a, None)
+        BIE._TEXTURE_INDEX_CACHE.pop(_root_b, None)
+except Exception as exc22:  # noqa: BLE001
+    check("多根回退测试自身执行", False, repr(exc22))
+
+print()
+print("=" * 78)
 print("结果: {0} passed, {1} failed".format(len(PASS), len(FAIL)))
 if FAIL:
     print("失败项:")

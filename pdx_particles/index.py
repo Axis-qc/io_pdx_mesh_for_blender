@@ -123,7 +123,7 @@ class IndexEntry(object):
 class PDXIndex(object):
     """一次扫描建三类索引。roots 前面的优先（mod 放前面）。"""
 
-    def __init__(self, roots, vanilla_root=""):
+    def __init__(self, roots, vanilla_root="", hidden_roots=()):
         self.roots = []
         self.skipped = []
         seen = set()
@@ -141,6 +141,9 @@ class PDXIndex(object):
             seen.add(key)
             self.roots.append(a)
         self.vanilla_root = _norm(vanilla_root) if vanilla_root else ""
+        # 隐藏根：参与索引与贴图解析，但其条目默认不进列表（query 滤掉）。
+        self.hidden_roots = {_norm(os.path.abspath(r))
+                             for r in hidden_roots if r and os.path.isdir(r)}
         self.entries = []
         self.stats = {}
         self.built_at = 0.0
@@ -199,6 +202,9 @@ class PDXIndex(object):
         if not self.vanilla_root:
             return False
         return _norm(root) == self.vanilla_root
+
+    def _is_hidden(self, root):
+        return _norm(root) in self.hidden_roots
 
     def _scan_gfx(self, path, root, is_vanilla, pdxmesh_defs, regs):
         try:
@@ -455,6 +461,9 @@ class PDXIndex(object):
             if disabled and e.category in disabled:
                 continue
             if mod_only and e.is_vanilla:
+                continue
+            # 隐藏根：条目仍在索引里（贴图解析、动画表共用），只是不列出
+            if self._is_hidden(e.root):
                 continue
             if require_particle and not e.detail.get("has_particle", False):
                 continue

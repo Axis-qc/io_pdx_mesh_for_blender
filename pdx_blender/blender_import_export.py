@@ -757,10 +757,48 @@ elsewhere silently failed to load and showed up as magenta.
 
 We keep that first lookup (it is correct for the common case) and then fall back to
 an index of every .dds under the 'gfx' tree of the game/mod root the mesh belongs to.
-The index is built once per root and cached for the session.
+When the mesh belongs to a mod, its root often does not ship textures the vanilla
+game does, so the roots configured in the add-on preferences (game folder + extra
+folders) are searched afterwards. Each root is indexed once per session and cached.
 """
 
 _TEXTURE_INDEX_CACHE = {}
+
+
+def _configured_texture_roots():
+    """Roots from the add-on preferences used as texture fallback, in search order.
+
+    Returns the vanilla game root first, then the extra index folders, with
+    non-existing or duplicated entries dropped. Read through bpy lazily so the
+    module stays importable in headless test scripts (no bpy context needed).
+    """
+    roots = []
+    try:
+        from .. import __package__ as _base_package
+        from .. import IO_PDX_INFO
+        addons = bpy.context.preferences.addons
+        for key in (_base_package, IO_PDX_INFO.get("id", "")):
+            if not key:
+                continue
+            addon = addons.get(key)
+            prefs = getattr(addon, "preferences", None) if addon is not None else None
+            if prefs is None:
+                continue
+            vanilla = getattr(prefs, "vanilla_root", "") or ""
+            if vanilla:
+                vanilla = bpy.path.abspath(vanilla)
+                if os.path.isdir(vanilla) and vanilla not in roots:
+                    roots.append(vanilla)
+            for entry in getattr(prefs, "extra_roots", []):
+                p = getattr(entry, "path", "") or ""
+                if p:
+                    p = bpy.path.abspath(p)
+                    if os.path.isdir(p) and p not in roots:
+                        roots.append(p)
+            break
+    except Exception:  # noqa: BLE001 - preferences unavailable, fallback is optional
+        pass
+    return roots
 
 
 def infer_asset_root(meshpath):
@@ -777,21 +815,42 @@ def infer_asset_root(meshpath):
         directory = parent
 
 
-def get_texture_index(meshpath):
-    """basename(lower) -> [full paths] for every .dds under <root>/gfx. Cached per root."""
-    root = infer_asset_root(meshpath)
-    if root is None:
-        return {}
-    cached = _TEXTURE_INDEX_CACHE.get(root)
-    if cached is not None:
-        return cached
+def _index_gfx_tree(root):
+    """basename(lower) -> [full paths] for every .dds under <root>/gfx."""
     index = {}
     for dirpath, _dirnames, filenames in os.walk(os.path.join(root, "gfx")):
         for filename in filenames:
             if filename.lower().endswith(".dds"):
                 index.setdefault(filename.lower(), []).append(os.path.join(dirpath, filename))
-    _TEXTURE_INDEX_CACHE[root] = index
-    IO_PDX_LOG.debug("indexed {0} textures under {1}".format(len(index), root))
+    return index
+
+
+def get_texture_index(meshpath):
+    """basename(lower) -> [full paths], searched across the mesh root and configured roots.
+
+    The mesh's own asset root is searched first so mod-local textures win; the
+    preferences-configured game root and extra folders follow as fallback. Each
+    root's index is built once and cached for the session.
+    """
+    own_root = infer_asset_root(meshpath)
+    search_roots = []
+    if own_root is not None:
+        search_roots.append(own_root)
+    for root in _configured_texture_roots():
+        if root != own_root:
+            search_roots.append(root)
+    if not search_roots:
+        return {}
+
+    index = {}
+    for root in search_roots:
+        cached = _TEXTURE_INDEX_CACHE.get(root)
+        if cached is None:
+            cached = _index_gfx_tree(root)
+            _TEXTURE_INDEX_CACHE[root] = cached
+            IO_PDX_LOG.debug("indexed {0} textures under {1}".format(len(cached), root))
+        for name, paths in cached.items():
+            index.setdefault(name, []).extend(paths)
     return index
 
 
