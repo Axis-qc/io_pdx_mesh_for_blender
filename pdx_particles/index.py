@@ -161,6 +161,12 @@ class PDXIndex(object):
         # 动画注册名 → .anim 绝对路径（.asset 里 animation = { name, file }，
         # file 相对该 .asset 所在目录）
         self.anim_defs = {}
+        # ---- 贴图覆盖层 ----
+        # pdxmesh 名 → {shape 名: {"diffuse":…, "normal":…, "specular":…}}
+        # .mesh 内嵌材质的贴图名不可信（technosphere.mesh 写的
+        # guardians_02_technosphere_* 全库不存在，官方靠 .gfx 的 meshsettings
+        # 覆盖成正确名），引擎以 gfx 为准，这里照抄该语义。
+        self.mesh_tex_overrides = {}
 
     # ---------------------------------------------------------------- build
 
@@ -240,6 +246,20 @@ class PDXIndex(object):
                                 abs_mesh = cand
                                 break
                     pdxmesh_defs.setdefault(name, (abs_mesh, root, is_vanilla))
+                # meshsettings = { name = "<shape 名>" texture_diffuse/normal/specular }：
+                # 对 mesh 内嵌材质的贴图名覆盖层，同一条 pdxmesh 可有多条（按 shape 名）。
+                if name:
+                    for ms in blk.child_values("meshsettings"):
+                        shape = _text_of(ms, "name")
+                        if not shape:
+                            continue
+                        entry = self.mesh_tex_overrides.setdefault(name, {}).setdefault(shape, {})
+                        for key, dst in (("texture_diffuse", "diffuse"),
+                                         ("texture_normal", "normal"),
+                                         ("texture_specular", "specular")):
+                            v = _text_of(ms, key)
+                            if v:
+                                entry[dst] = v
                 # animation = { id = "...", type = "..." }：id 是 entity state 里
                 # 用的状态别名，type 才指向 .asset 的动画注册名。同一个 pdxmesh 可
                 # 有多条（实测 3087 条分布在 1150 个 pdxmesh 上）。
@@ -361,10 +381,16 @@ class PDXIndex(object):
             stem = os.path.splitext(os.path.basename(path))[0]
             pdxnames = sorted(by_mesh.get(key, []))
             keys = [stem.lower()] + [n.lower() for n in pdxnames]
+            # 贴图覆盖层跟随 pdxmesh 名；一个 mesh 被多条 pdxmesh 引用时合并
+            # （后面的覆盖先面的，与引擎后扫描覆盖同序）。
+            merged_ov = {}
+            for name in pdxnames:
+                merged_ov.update(self.mesh_tex_overrides.get(name) or {})
             # 这个模型能被哪些动画驱动：把每个 pdxmesh 名上的 id 映射摊平。
             self.entries.append(IndexEntry(
                 KIND_MODEL, stem, keys, path, _category_of(root, path),
                 root, is_vanilla, {"pdxmesh": pdxnames,
+                                   "tex_overrides": merged_ov,
                                    "animations": self._anims_of(pdxnames)}))
 
     def _anims_of(self, pdxmesh_names):
@@ -439,7 +465,9 @@ class PDXIndex(object):
             self.entries.append(IndexEntry(
                 KIND_ENTITY, name, keys, src, _category_of(root, src),
                 root, is_vanilla,
-                {"pdxmesh": pdxmesh, "mesh": mesh, "particles": simple,
+                {"pdxmesh": pdxmesh, "mesh": mesh,
+                 "tex_overrides": dict(self.mesh_tex_overrides.get(pdxmesh) or {}),
+                 "particles": simple,
                  "events": particles, "locators": locators,
                  "animations": anims,
                  "has_particle": bool(simple), "has_anim": bool(anims)}))

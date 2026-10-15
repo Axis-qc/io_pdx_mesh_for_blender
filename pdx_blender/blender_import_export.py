@@ -1687,6 +1687,11 @@ def import_meshfile(meshpath, imp_mesh=True, imp_skel=True, imp_locs=True, join_
     # 场景里已有同名骨架时是否复用它。默认 True，保持命令行与面板「Import」的
     # 既有行为；资源浏览器传 False，避免新网格蒙皮到上一个模型留下的骨架上。
     reuse_skeleton = kwargs.get("reuse_skeleton", True)
+    # .gfx meshsettings 的贴图覆盖层：{pdxmesh 名: {shape 名: {diffuse/normal/specular: 文件名}}}。
+    # mesh 内嵌材质的贴图名不可信（technosphere.mesh 写的贴图全库不存在，官方靠
+    # gfx 覆盖），引擎以 gfx 为准；索引层收集后经资源浏览器传入，直接用导入面板
+    # 时没有覆盖层，维持原行为。
+    tex_overrides = kwargs.get("tex_overrides") or {}
 
     start = time.time()
     IO_PDX_LOG.info("importing - {0}".format(meshpath))
@@ -1754,6 +1759,15 @@ def import_meshfile(meshpath, imp_mesh=True, imp_skel=True, imp_locs=True, join_
                 # create the material
                 if pdx_material:
                     IO_PDX_LOG.info("creating material - {0}".format(pdx_material.shader[0]))
+                    # gfx meshsettings 覆盖内嵌贴图名（按 shape 名查）。
+                    ov = (tex_overrides.get(kwargs.get("pdxmesh_name") or "")
+                          or {}).get(node.tag) or {}
+                    if ov.get("diffuse"):
+                        pdx_material.diff = [ov["diffuse"]]
+                    if ov.get("normal"):
+                        pdx_material.n = [ov["normal"]]
+                    if ov.get("specular"):
+                        pdx_material.spec = [ov["specular"]]
                     create_material(pdx_material, mesh, os.path.split(meshpath)[0],
                                     meshpath=meshpath, texture_index=texture_index)
 
